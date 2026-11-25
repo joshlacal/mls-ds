@@ -3560,7 +3560,7 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     assert_eq!(st_conv_ok, StatusCode::OK, "{conv_ok_body}");
 
     // A later enrollment after every old device is revoked is a restore, not
-    // a brand-new account. It must start pending and wait for its own notice.
+    // a brand-new account. It starts pending, so it reads nothing foreign.
     for target in [alice_d1.device_id, alice_d2.device_id] {
         let signed_revoke = alice_d2.revocation_wrapper(target, 1);
         let (status, body) = http::send(
@@ -3583,33 +3583,9 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     )
     .await;
     assert_eq!(d3_early, StatusCode::UNAUTHORIZED);
-    {
-        let mut tx = pool.begin().await.unwrap();
-        sqlx::query("SET LOCAL session_replication_role = replica")
-            .execute(&mut *tx)
-            .await
-            .unwrap();
-        sqlx::query(
-            "UPDATE chat.device_promotion_audit \
-                SET recorded_at = clock_timestamp() - interval '73 hours' \
-              WHERE user_did = $1 AND device_id = $2 AND event_kind = 'pending_notice'",
-        )
-        .bind(&alice_acct.did)
-        .bind(alice_d3.device_id)
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-        tx.commit().await.unwrap();
-    }
-    let (d3_still_pending, _) = http::send(
-        router.clone(),
-        alice_d3.dpop_get_request(
-            "blue.catbird.chat.getDevices",
-            &format!("userDids={}", bob_acct.did),
-        ),
-    )
-    .await;
-    assert_eq!(d3_still_pending, StatusCode::UNAUTHORIZED);
+    // No active sibling is left to see a notice or approve. A chained head
+    // proves the recovery secret (code or backup passkey), so the restore
+    // promotes at once instead of stranding the account behind the hold.
     let (alice_ep2, _) =
         build_epoch_public_for_device(&alice_d3, 2, [0x33_u8; 32], Some(alice_link1), None);
     let (d3_restore_status, d3_restore_body) = http::send(
@@ -3627,6 +3603,68 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     .await
     .unwrap();
     assert_eq!(d3_final_status, "active");
+    let d3_promotions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chat.device_promotion_audit \
+          WHERE user_did = $1 AND device_id = $2 AND event_kind = 'recovery_promoted'",
+    )
+    .bind(&alice_acct.did)
+    .bind(alice_d3.device_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(d3_promotions, 1);
+
+    // A genesis head proves no recovery secret. Even with every old device
+    // revoked (here by self-revocation), it still waits for the notice hold.
+    let dave_acct = AccountIdentity::create().await;
+    let dave_d1 = DeviceIdentity::build(&dave_acct, "Dave Signed-Out Mac", 2);
+    let dave_d2 = DeviceIdentity::build(&dave_acct, "Dave Replacement", 2);
+    let (dv1_status, dv1_body) = http::send(router.clone(), dave_d1.enroll_request()).await;
+    assert_eq!(dv1_status, StatusCode::OK, "{dv1_body}");
+    let dave_self_revoke = dave_d1.revocation_wrapper(dave_d1.device_id, 1);
+    let (dv1_rev_status, dv1_rev_body) = http::send(
+        router.clone(),
+        dave_d1.dpop_signed_post_request("blue.catbird.chat.revokeDevice", &dave_self_revoke),
+    )
+    .await;
+    assert_eq!(dv1_rev_status, StatusCode::OK, "{dv1_rev_body}");
+    let (dv2_status, dv2_body) = http::send(router.clone(), dave_d2.enroll_request()).await;
+    assert_eq!(dv2_status, StatusCode::OK, "{dv2_body}");
+    assert_eq!(dv2_body["device"]["status"], "pending_approval");
+    let (dave_genesis, _) = build_epoch_public_for_device(&dave_d2, 0, [0x55_u8; 32], None, None);
+    let (dv_early_status, dv_early_body) = http::send(
+        router.clone(),
+        dave_d2.labyrinth_post_request(
+            "publishEpochHead",
+            &json!({ "epoch": dave_genesis.clone() }),
+        ),
+    )
+    .await;
+    assert_eq!(dv_early_status, StatusCode::UNAUTHORIZED, "{dv_early_body}");
+    {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL session_replication_role = replica")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE chat.device_promotion_audit \
+                SET recorded_at = clock_timestamp() - interval '73 hours' \
+              WHERE user_did = $1 AND device_id = $2 AND event_kind = 'pending_notice'",
+        )
+        .bind(&dave_acct.did)
+        .bind(dave_d2.device_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    let (dv_aged_status, dv_aged_body) = http::send(
+        router.clone(),
+        dave_d2.labyrinth_post_request("publishEpochHead", &json!({ "epoch": dave_genesis })),
+    )
+    .await;
+    assert_eq!(dv_aged_status, StatusCode::OK, "{dv_aged_body}");
 
     // A never-initialized Labyrinth account has no prior head to chain. The
     // same full-loss gate admits explicit genesis only after the notice hold.

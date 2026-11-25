@@ -71,11 +71,50 @@ pub(crate) fn parse_stored(text: &str) -> LabyrinthResult<EpochPublic> {
     })
 }
 
+/// The pending device's durable notice must be at least the configured hold old.
+async fn require_pending_notice_hold(
+    conn: &mut PgConnection,
+    did: &str,
+    device_id: Uuid,
+    at: DateTime<Utc>,
+) -> LabyrinthResult<()> {
+    let notice_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT recorded_at FROM chat.device_promotion_audit \
+          WHERE user_did = $1 AND device_id = $2 AND event_kind = 'pending_notice'",
+    )
+    .bind(did)
+    .bind(device_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let cutoff = chrono::Duration::try_hours(
+        crate::chat_protocol::device_activity::pending_device_hold_hours(),
+    )
+    .and_then(|hold| at.checked_sub_signed(hold));
+    if !matches!((notice_at, cutoff), (Some(notice), Some(cutoff)) if notice <= cutoff) {
+        return Err(LabyrinthError::not_authorized(
+            "pending device recovery hold is not complete",
+        ));
+    }
+    Ok(())
+}
+
+/// Promote a pending device whose fresh `publishEpochHead` just succeeded.
+///
+/// `chained_proof` is true when the head extends an existing chain with a
+/// verified `prevSig`, which only a holder of the account's recovery secret
+/// (recovery code or backup passkey) can produce.
+///
+/// The 72-hour hold exists so a sibling still in use can see and deny the
+/// pending device. An awake sibling always vetoes, and a dormant one keeps the
+/// full hold. When no active sibling is left at all (every earlier device
+/// revoked), nobody can see the notice or approve, so a chained proof
+/// promotes at once. A genesis head proves nothing and keeps the hold.
 async fn promote_pending_device(
     conn: &mut PgConnection,
     did: &str,
     device_id: Uuid,
     at: DateTime<Utc>,
+    chained_proof: bool,
 ) -> LabyrinthResult<()> {
     // Enrollment and sibling revocation take this principal lock before device
     // rows. Authentication already holds the pending requester row, so NOWAIT
@@ -114,22 +153,12 @@ async fn promote_pending_device(
         ));
     }
 
-    let notice_at: Option<DateTime<Utc>> = sqlx::query_scalar(
-        "SELECT recorded_at FROM chat.device_promotion_audit \
-          WHERE user_did = $1 AND device_id = $2 AND event_kind = 'pending_notice'",
-    )
-    .bind(did)
-    .bind(device_id)
-    .fetch_optional(&mut *conn)
-    .await?;
-    let cutoff = chrono::Duration::try_hours(
-        crate::chat_protocol::device_activity::pending_device_hold_hours(),
-    )
-    .and_then(|hold| at.checked_sub_signed(hold));
-    if !matches!((notice_at, cutoff), (Some(notice), Some(cutoff)) if notice <= cutoff) {
-        return Err(LabyrinthError::not_authorized(
-            "pending device recovery hold is not complete",
-        ));
+    // No active sibling remains to see the notice or to approve, so the hold
+    // would only strand the account. A chained head proves the recovery
+    // secret (recovery code or backup passkey), which is the authority left.
+    let no_active_sibling = siblings.is_empty();
+    if !(no_active_sibling && chained_proof) {
+        require_pending_notice_hold(conn, did, device_id, at).await?;
     }
 
     let promoted = sqlx::query(
@@ -265,7 +294,7 @@ pub async fn record_head(
     .execute(&mut *conn)
     .await?;
     if caller.status == "pending_approval" {
-        promote_pending_device(conn, did, caller.device_id, at).await?;
+        promote_pending_device(conn, did, caller.device_id, at, latest.is_some()).await?;
     }
     Ok(())
 }
