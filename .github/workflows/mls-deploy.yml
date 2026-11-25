@@ -38,7 +38,7 @@ env:
   # Single source for every sibling checkout below. Repin these together when
   # the candidate sibling commits are final.
   CATBIRD_ATPROTO_REV: "807a2dd8788ffa17a95c45f8a307b1fb9668b3ea"
-  CATBIRD_MLS_REV: "d63fab61808d6f5f1623c70637153defb76f28a3"
+  CATBIRD_MLS_REV: "50b8c8111c622828cd0e038113e1a0effd5360b7"
   LABYRINTH_REV: "6755444af36dd2c6d0daecab9808ac2d05d2e206"
   # jacquard is a git dependency on tangled.org, whose fetches can stall
   # for hours under libgit2 (Nov 21: lint hung 3 h). Fetch with the git
