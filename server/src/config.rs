@@ -21,11 +21,15 @@
 //! See `docs/program/decisions/ADR-008-auto-reset-protocol-binding.md` §D1
 //! and the spec referenced above for the rationale.
 
+use http::{header, HeaderName, HeaderValue, Method};
 use std::{
     fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
+    time::Duration,
 };
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use url::Url;
 
 const DEFAULT_SERVER_HOST: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 const DEFAULT_SERVER_PORT: u16 = 8080;
@@ -81,6 +85,146 @@ impl ServerBindConfig {
 
     pub fn socket_addr(self) -> SocketAddr {
         SocketAddr::new(self.host, self.port)
+    }
+}
+
+/// Federated CORS policy for browser clients calling delivery service XRPC endpoints.
+///
+/// Delivery services authenticate requests with explicit bearer service-auth JWTs and
+/// device-signed headers rather than ambient browser cookies, so the default policy
+/// allows any origin (`Access-Control-Allow-Origin: *`, never `Allow-Credentials: true`),
+/// matching ATProto PDS and AppView servers. Operators hosting private delivery services
+/// may restrict origins via `CORS_ALLOWED_ORIGINS=https://a.example,https://b.example`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CorsOriginPolicy {
+    Any,
+    AllowList(Vec<HeaderValue>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CorsConfig {
+    origins: CorsOriginPolicy,
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self {
+            origins: CorsOriginPolicy::Any,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidCorsAllowedOrigins;
+
+impl fmt::Display for InvalidCorsAllowedOrigins {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "CORS_ALLOWED_ORIGINS must be '*' or a comma-separated list of canonical http(s) origins without paths",
+        )
+    }
+}
+
+impl std::error::Error for InvalidCorsAllowedOrigins {}
+
+impl CorsConfig {
+    /// Load CORS origin policy from `CORS_ALLOWED_ORIGINS`.
+    /// Absent or `*` selects open federated CORS (`Access-Control-Allow-Origin: *`).
+    pub fn from_env() -> Result<Self, InvalidCorsAllowedOrigins> {
+        Self::from_env_result(std::env::var("CORS_ALLOWED_ORIGINS"))
+    }
+
+    /// Parse a raw `CORS_ALLOWED_ORIGINS` value (`*` or comma-separated canonical origins).
+    pub fn from_raw(raw: &str) -> Result<Self, InvalidCorsAllowedOrigins> {
+        Self::from_env_result(Ok(raw.to_owned()))
+    }
+
+    pub(crate) fn from_env_result(
+        value: Result<String, std::env::VarError>,
+    ) -> Result<Self, InvalidCorsAllowedOrigins> {
+        let raw = match value {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => return Ok(Self::default()),
+            Err(std::env::VarError::NotUnicode(_)) => return Err(InvalidCorsAllowedOrigins),
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(InvalidCorsAllowedOrigins);
+        }
+        if trimmed == "*" {
+            return Ok(Self::default());
+        }
+        let mut origins = Vec::new();
+        for part in trimmed.split(',') {
+            let candidate = part.trim();
+            if candidate.is_empty() || candidate == "*" {
+                return Err(InvalidCorsAllowedOrigins);
+            }
+            let parsed = Url::parse(candidate).map_err(|_| InvalidCorsAllowedOrigins)?;
+            if !matches!(parsed.scheme(), "http" | "https")
+                || parsed.host_str().is_none()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+                || candidate != parsed.origin().ascii_serialization()
+            {
+                return Err(InvalidCorsAllowedOrigins);
+            }
+            let header_val =
+                HeaderValue::from_str(candidate).map_err(|_| InvalidCorsAllowedOrigins)?;
+            if !origins.contains(&header_val) {
+                origins.push(header_val);
+            }
+        }
+        if origins.is_empty() {
+            return Err(InvalidCorsAllowedOrigins);
+        }
+        Ok(Self {
+            origins: CorsOriginPolicy::AllowList(origins),
+        })
+    }
+
+    pub fn origins(&self) -> &CorsOriginPolicy {
+        &self.origins
+    }
+
+    pub fn summary(&self) -> String {
+        match &self.origins {
+            CorsOriginPolicy::Any => "*".to_string(),
+            CorsOriginPolicy::AllowList(list) => list
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect::<Vec<_>>()
+                .join(","),
+        }
+    }
+
+    /// Build the Axum/Tower `CorsLayer` for this policy.
+    /// Deliberately never enables `allow_credentials(true)`.
+    pub fn into_layer(&self) -> CorsLayer {
+        let allow_origin = match &self.origins {
+            CorsOriginPolicy::Any => AllowOrigin::any(),
+            CorsOriginPolicy::AllowList(origins) => AllowOrigin::list(origins.clone()),
+        };
+        CorsLayer::new()
+            .allow_origin(allow_origin)
+            .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+            .allow_headers([
+                header::AUTHORIZATION,
+                header::CONTENT_TYPE,
+                header::ACCEPT,
+                HeaderName::from_static("dpop"),
+                HeaderName::from_static("idempotency-key"),
+                HeaderName::from_static("catbird-chat-read"),
+                HeaderName::from_static("catbird-chat-read-signature"),
+            ])
+            .expose_headers([
+                header::CONTENT_TYPE,
+                header::RETRY_AFTER,
+                HeaderName::from_static("dpop-nonce"),
+            ])
+            .max_age(Duration::from_secs(86_400))
     }
 }
 
@@ -716,5 +860,54 @@ mod tests {
         };
         // 5 × 0.1 = 0.5 → ceil 1; max(3, 1) = 3
         assert_eq!(cfg.required_for(5), 3);
+    }
+
+    #[test]
+    fn cors_config_defaults_to_open_federated_wildcard() {
+        assert_eq!(
+            CorsConfig::from_env_result(Err(std::env::VarError::NotPresent)),
+            Ok(CorsConfig {
+                origins: CorsOriginPolicy::Any
+            })
+        );
+        assert_eq!(
+            CorsConfig::from_env_result(Ok(" * ".to_owned())),
+            Ok(CorsConfig {
+                origins: CorsOriginPolicy::Any
+            })
+        );
+    }
+
+    #[test]
+    fn cors_config_accepts_canonical_origin_allowlist() {
+        let cfg = CorsConfig::from_env_result(Ok(
+            "https://catmos.catbird.blue, http://localhost:5173, https://catmos.catbird.blue"
+                .to_owned(),
+        ))
+        .expect("valid origin list");
+        assert_eq!(
+            cfg.summary(),
+            "https://catmos.catbird.blue,http://localhost:5173"
+        );
+    }
+
+    #[test]
+    fn cors_config_rejects_malformed_or_mixed_origins() {
+        for invalid in [
+            "",
+            "   ",
+            "*,https://catmos.catbird.blue",
+            "https://catmos.catbird.blue/",
+            "https://catmos.catbird.blue/path",
+            "https://catmos.catbird.blue?q=1",
+            "ftp://catmos.catbird.blue",
+            "catmos.catbird.blue",
+        ] {
+            assert_eq!(
+                CorsConfig::from_env_result(Ok(invalid.to_owned())),
+                Err(InvalidCorsAllowedOrigins),
+                "expected `{invalid}` to be rejected"
+            );
+        }
     }
 }

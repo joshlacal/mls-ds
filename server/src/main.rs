@@ -532,6 +532,57 @@ fn merge_application_routers(
     db_pool: PgPool,
     ingress_body_policy: IngressBodyPolicy,
 ) -> Router {
+    merge_application_routers_with_cors(
+        base_router,
+        ds_router,
+        db_pool,
+        ingress_body_policy,
+        &config::CorsConfig::default(),
+    )
+}
+
+/// Applies `tower_http::cors::CorsLayer` to all browser requests and genuine
+/// CORS preflights (`OPTIONS` carrying both `Origin` and
+/// `Access-Control-Request-Method`), while letting non-CORS `OPTIONS` requests
+/// traverse the normal router and ingress middleware stack per the Fetch spec.
+async fn cors_middleware(
+    axum::extract::State(cors_layer): axum::extract::State<tower_http::cors::CorsLayer>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use tower::{Layer, Service};
+
+    let is_options = request.method() == axum::http::Method::OPTIONS;
+    let is_cors_preflight = is_options
+        && request.headers().contains_key(axum::http::header::ORIGIN)
+        && request
+            .headers()
+            .contains_key(axum::http::header::ACCESS_CONTROL_REQUEST_METHOD);
+    if is_options && !is_cors_preflight {
+        return next.run(request).await;
+    }
+
+    let mut service = cors_layer.layer(next);
+    std::future::poll_fn(|cx| service.poll_ready(cx))
+        .await
+        .unwrap_or_else(|err| match err {});
+    let mut response = service
+        .call(request)
+        .await
+        .unwrap_or_else(|err| match err {});
+    if is_cors_preflight && response.status() == axum::http::StatusCode::OK {
+        *response.status_mut() = axum::http::StatusCode::NO_CONTENT;
+    }
+    response
+}
+
+fn merge_application_routers_with_cors(
+    base_router: Router,
+    ds_router: Router,
+    db_pool: PgPool,
+    ingress_body_policy: IngressBodyPolicy,
+    cors_config: &config::CorsConfig,
+) -> Router {
     base_router
         .merge(ds_router)
         .layer(axum::middleware::from_fn_with_state(
@@ -558,6 +609,13 @@ fn merge_application_routers(
         ))
         .layer(axum::middleware::from_fn(
             middleware::logging::log_headers_middleware,
+        ))
+        // Outer CORS layer answers CORS preflights directly (204) and attaches
+        // CORS headers to both success and error responses (401/413/429) without
+        // credentials, while allowing non-CORS OPTIONS through to the router.
+        .layer(axum::middleware::from_fn_with_state(
+            cors_config.into_layer(),
+            cors_middleware,
         ))
         .layer(TraceLayer::new_for_http())
 }
@@ -1219,11 +1277,19 @@ async fn main() -> anyhow::Result<()> {
         base_router
     };
 
-    let app = merge_application_routers(
+    let cors_config =
+        config::CorsConfig::from_env().unwrap_or_else(|error| panic!("Refusing to start: {error}"));
+    tracing::info!(
+        cors_allowed_origins = %cors_config.summary(),
+        "CORS configuration loaded"
+    );
+
+    let app = merge_application_routers_with_cors(
         base_router,
         ds_router,
         db_pool.clone(),
         IngressBodyPolicy::from_env(),
+        &cors_config,
     );
 
     let addr = server_bind.socket_addr();
@@ -2223,5 +2289,157 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(too_large_labyrinth.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn federated_cors_preflight_and_responses_allow_browser_xrpc_without_credentials() {
+        let base_router =
+            Router::new().route("/xrpc/blue.catbird.chat.enrollDevice", post(consume_body));
+        let app = merge_application_routers(
+            base_router,
+            Router::new(),
+            lazy_test_pool(),
+            test_ingress_policy(),
+        );
+
+        let preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::OPTIONS)
+                    .uri("/xrpc/blue.catbird.chat.enrollDevice")
+                    .header("origin", "https://thirdparty-client.example")
+                    .header("access-control-request-method", "POST")
+                    .header(
+                        "access-control-request-headers",
+                        "authorization, content-type, catbird-chat-read, catbird-chat-read-signature",
+                    )
+                    .body(Body::empty())
+                    .expect("preflight"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            preflight
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("*")
+        );
+        assert!(preflight
+            .headers()
+            .get("access-control-allow-credentials")
+            .is_none());
+        let allow_headers = preflight
+            .headers()
+            .get("access-control-allow-headers")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        for required in [
+            "authorization",
+            "content-type",
+            "catbird-chat-read",
+            "catbird-chat-read-signature",
+        ] {
+            assert!(
+                allow_headers.contains(required),
+                "missing `{required}` in `{allow_headers}`"
+            );
+        }
+
+        let post_resp = app
+            .clone()
+            .oneshot(
+                Request::post("/xrpc/blue.catbird.chat.enrollDevice")
+                    .header("origin", "https://thirdparty-client.example")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("post"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(post_resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            post_resp
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("*")
+        );
+        let expose_headers = post_resp
+            .headers()
+            .get("access-control-expose-headers")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert!(expose_headers.contains("retry-after"));
+        assert!(expose_headers.contains("dpop-nonce"));
+
+        let missing_route_error = app
+            .oneshot(
+                Request::get("/xrpc/blue.catbird.chat.doesNotExist")
+                    .header("origin", "https://thirdparty-client.example")
+                    .body(Body::empty())
+                    .expect("missing route"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(missing_route_error.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing_route_error
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("*")
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_allowlist_restricts_origins_when_configured() {
+        let base_router =
+            Router::new().route("/xrpc/blue.catbird.chat.enrollDevice", post(consume_body));
+        let cors_config =
+            config::CorsConfig::from_raw("https://catmos.catbird.blue").expect("valid allowlist");
+        let app = merge_application_routers_with_cors(
+            base_router,
+            Router::new(),
+            lazy_test_pool(),
+            test_ingress_policy(),
+            &cors_config,
+        );
+
+        let allowed = app
+            .clone()
+            .oneshot(
+                Request::post("/xrpc/blue.catbird.chat.enrollDevice")
+                    .header("origin", "https://catmos.catbird.blue")
+                    .body(Body::from("{}"))
+                    .expect("allowed"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            allowed
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("https://catmos.catbird.blue")
+        );
+
+        let denied = app
+            .oneshot(
+                Request::post("/xrpc/blue.catbird.chat.enrollDevice")
+                    .header("origin", "https://unlisted.example")
+                    .body(Body::from("{}"))
+                    .expect("denied"),
+            )
+            .await
+            .expect("response");
+        assert!(denied
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none());
     }
 }
