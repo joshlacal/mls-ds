@@ -53,6 +53,27 @@ may retain restored ciphertext until replay runs. The existing restore
 scripts do not restart the service or invoke replay themselves; operators
 must follow this stop, restore, restart sequence.
 
+Restore into a fresh database, never over the live one with
+`pg_restore --clean`. Since `20261104000012_postgres_churn_partitions`,
+`outbound_queue` and `federation_outbox` are partitioned, and a
+`--clean` restore over them fails (seen on the Nov 26, 2026 deploy).
+From a `pg_dump -Fc` dump:
+
+```bash
+systemctl stop catbird-mls-server
+runuser -u postgres -- dropdb --if-exists catbird      # destroys the current copy
+runuser -u postgres -- createdb -O "$DB_OWNER" catbird   # the role in DATABASE_URL
+runuser -u postgres -- pg_restore --exit-on-error -d catbird < /root/catbird.dump
+# keep the KEK and journal as they are, then:
+systemctl start catbird-mls-server
+```
+
+To check a dump first, restore it into another name (`createdb
+catbird_restored`) the same way and compare. Roll the binary back with
+the database: an older binary refuses a database that holds migrations it
+doesn't know, and the newer binary would apply its pending migrations again
+on start.
+
 ## Journal rollover and recovery
 
 The configured path is the original version-1 journal. A running server keeps its exclusive lock on that base file across rotations. At 256 MiB it creates a private sibling named `<base>.segment.<UUID>`, syncs the file and directory, and appends and syncs an authenticated link before acknowledging any erasure in that successor. The limit triggers rollover. Existing valid version-1 journals above the limit are replayed in full and roll forward on their next append.
