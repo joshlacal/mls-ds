@@ -104,11 +104,11 @@ async fn require_pending_notice_hold(
 /// verified `prevSig`, which only a holder of the account's recovery secret
 /// (recovery code or backup passkey) can produce.
 ///
-/// The 72-hour hold exists so a sibling still in use can see and deny the
-/// pending device. An awake sibling always vetoes, and a dormant one keeps the
-/// full hold. When no active sibling is left at all (every earlier device
-/// revoked), nobody can see the notice or approve, so a chained proof
-/// promotes at once. A genesis head proves nothing and keeps the hold.
+/// A chained proof promotes at once, whatever other devices are registered:
+/// the account owner chose the recovery code or backup passkey as enough on
+/// its own. A genesis head proves nothing, so it keeps the 72-hour hold that
+/// lets a sibling see and deny the pending device, and an awake sibling
+/// vetoes it.
 async fn promote_pending_device(
     conn: &mut PgConnection,
     did: &str,
@@ -147,17 +147,15 @@ async fn promote_pending_device(
     .fetch_all(&mut *conn)
     .await
     .map_err(promotion_lock_error)?;
-    if siblings.iter().any(|(awake,)| *awake) {
-        return Err(LabyrinthError::not_authorized(
-            "an active sibling must approve or deny the pending device",
-        ));
-    }
-
-    // No active sibling remains to see the notice or to approve, so the hold
-    // would only strand the account. A chained head proves the recovery
-    // secret (recovery code or backup passkey), which is the authority left.
-    let no_active_sibling = siblings.is_empty();
-    if !(no_active_sibling && chained_proof) {
+    // A chained head proves the recovery secret (recovery code or backup
+    // passkey). The owner chose that proof over sibling approval and the hold,
+    // so it promotes at once.
+    if !chained_proof {
+        if siblings.iter().any(|(awake,)| *awake) {
+            return Err(LabyrinthError::not_authorized(
+                "an active sibling must approve or deny the pending device",
+            ));
+        }
         require_pending_notice_hold(conn, did, device_id, at).await?;
     }
 

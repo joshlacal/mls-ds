@@ -3391,88 +3391,15 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     .unwrap();
     assert_eq!(status_after_forged, "pending_approval");
 
-    // 7. A valid chained restore is still refused while another device is
-    //    awake. A correct prevSig does not override sibling approval.
+    // 7. A valid chained restore promotes at once, even while another device
+    //    is awake. The chained head proves the recovery code or backup
+    //    passkey, and the account owner chose that proof over the sibling
+    //    approval and the 72-hour hold.
     let (valid_ep1, alice_link1) =
         build_epoch_public_for_device(&alice_d2, 1, [0x32_u8; 32], Some(alice_link0), None);
-    let (awake_status, awake_body) = http::send(
-        router.clone(),
-        alice_d2.labyrinth_post_request("publishEpochHead", &json!({ "epoch": valid_ep1.clone() })),
-    )
-    .await;
-    assert_eq!(awake_status, StatusCode::UNAUTHORIZED, "{awake_body}");
-    let unpublished_epoch: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM labyrinth.epoch_heads WHERE did = $1 AND epoch_number = 1",
-    )
-    .bind(&alice_acct.did)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        unpublished_epoch, 0,
-        "refused promotion must roll back head"
-    );
-
-    // The lost sibling becomes dormant. Before the 72h notice hold expires,
-    // an explicit restore action still cannot promote the replacement.
-    sqlx::query(
-        "UPDATE chat.devices SET last_active_at = $3, dormant_at = NULL \
-          WHERE user_did = $1 AND device_id = $2",
-    )
-    .bind(&alice_acct.did)
-    .bind(alice_d1.device_id)
-    .bind(Utc::now() - Duration::hours(100))
-    .execute(&pool)
-    .await
-    .unwrap();
-    assert_eq!(mark_inactive_devices(&pool, Utc::now()).await.unwrap(), 0);
-    let (early_status, early_body) = http::send(
-        router.clone(),
-        alice_d2.labyrinth_post_request("publishEpochHead", &json!({ "epoch": valid_ep1.clone() })),
-    )
-    .await;
-    assert_eq!(early_status, StatusCode::UNAUTHORIZED, "{early_body}");
-
-    // Age the durable notice, not just the device row. The audit table's
-    // immutability trigger is bypassed only in this isolated test database.
-    {
-        let mut tx = pool.begin().await.unwrap();
-        sqlx::query("SET LOCAL session_replication_role = replica")
-            .execute(&mut *tx)
-            .await
-            .unwrap();
-        sqlx::query(
-            "UPDATE chat.device_promotion_audit \
-                SET recorded_at = clock_timestamp() - interval '73 hours' \
-              WHERE user_did = $1 AND device_id = $2 AND event_kind = 'pending_notice'",
-        )
-        .bind(&alice_acct.did)
-        .bind(alice_d2.device_id)
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-        tx.commit().await.unwrap();
-    }
-    let (no_auto_status, _) = http::send(
-        router.clone(),
-        alice_d2.dpop_get_request(
-            "blue.catbird.chat.getDevices",
-            &format!("userDids={}", bob_acct.did),
-        ),
-    )
-    .await;
-    assert_eq!(no_auto_status, StatusCode::UNAUTHORIZED);
-
-    // A sibling using only Labyrinth becomes awake again before the restore
-    // action, so an attacker cannot exploit a chat-only activity stamp.
-    let (wake_status, wake_body) = http::send(
-        router.clone(),
-        alice_d1.labyrinth_get_request("getEpochHead", &[("did", &alice_acct.did)]),
-    )
-    .await;
-    assert_eq!(wake_status, StatusCode::OK, "{wake_body}");
-    let d1_awake: bool = sqlx::query_scalar(
-        "SELECT dormant_at IS NULL FROM chat.devices WHERE user_did = $1 AND device_id = $2",
+    let alice_d1_awake: bool = sqlx::query_scalar(
+        "SELECT last_active_at > now() - interval '72 hours' FROM chat.devices \
+          WHERE user_did = $1 AND device_id = $2 AND status = 'active'",
     )
     .bind(&alice_acct.did)
     .bind(alice_d1.device_id)
@@ -3480,29 +3407,9 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     .await
     .unwrap();
     assert!(
-        d1_awake,
-        "authenticated Labyrinth activity must wake its device"
+        alice_d1_awake,
+        "the sibling must still be awake for this check"
     );
-    let (returned_status, returned_body) = http::send(
-        router.clone(),
-        alice_d2.labyrinth_post_request("publishEpochHead", &json!({ "epoch": valid_ep1.clone() })),
-    )
-    .await;
-    assert_eq!(returned_status, StatusCode::UNAUTHORIZED, "{returned_body}");
-
-    // Simulate full loss again; now the aged notice plus a fresh explicit
-    // chained restore promotes the replacement atomically.
-    sqlx::query(
-        "UPDATE chat.devices SET last_active_at = $3, dormant_at = NULL \
-          WHERE user_did = $1 AND device_id = $2",
-    )
-    .bind(&alice_acct.did)
-    .bind(alice_d1.device_id)
-    .bind(Utc::now() - Duration::hours(100))
-    .execute(&pool)
-    .await
-    .unwrap();
-    assert_eq!(mark_inactive_devices(&pool, Utc::now()).await.unwrap(), 0);
     let (st_ep1, ep1_body) = http::send(
         router.clone(),
         alice_d2.labyrinth_post_request("publishEpochHead", &json!({ "epoch": valid_ep1.clone() })),
@@ -3532,7 +3439,7 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     .unwrap();
     assert_eq!(
         status_after_promote, "active",
-        "aged full-loss restore must atomically promote pending_approval -> active"
+        "a chained restore must atomically promote pending_approval -> active"
     );
     let promotion_audit_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM chat.device_promotion_audit \
@@ -3727,6 +3634,37 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
         .unwrap();
         tx.commit().await.unwrap();
     }
+    // A genesis head proves no recovery secret, so an awake sibling still
+    // vetoes it even after the notice hold.
+    sqlx::query(
+        "UPDATE chat.devices SET last_active_at = $3, dormant_at = NULL \
+          WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&carol_acct.did)
+    .bind(carol_d1.device_id)
+    .bind(Utc::now())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (veto_status, veto_body) = http::send(
+        router.clone(),
+        carol_d2.labyrinth_post_request(
+            "publishEpochHead",
+            &json!({ "epoch": carol_genesis.clone() }),
+        ),
+    )
+    .await;
+    assert_eq!(veto_status, StatusCode::UNAUTHORIZED, "{veto_body}");
+    sqlx::query(
+        "UPDATE chat.devices SET last_active_at = $3, dormant_at = NULL \
+          WHERE user_did = $1 AND device_id = $2",
+    )
+    .bind(&carol_acct.did)
+    .bind(carol_d1.device_id)
+    .bind(Utc::now() - Duration::hours(100))
+    .execute(&pool)
+    .await
+    .unwrap();
     let (c_restore_status, c_restore_body) = http::send(
         router.clone(),
         carol_d2.labyrinth_post_request("publishEpochHead", &json!({ "epoch": carol_genesis })),
