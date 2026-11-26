@@ -284,7 +284,7 @@ async fn prepare_fanout(
         return Ok(None);
     }
 
-    let space_uri: String = sqlx::query_scalar(
+    let stored_space_uri: Option<String> = sqlx::query_scalar(
         "SELECT space_uri FROM chat.conversation_spaces \
           WHERE conversation_id = $1 AND generation = $2",
     )
@@ -292,10 +292,17 @@ async fn prepare_fanout(
     .bind(generation)
     .fetch_optional(&mut **tx)
     .await
-    .map_err(|e| format!("group fanout space lookup failed: {e}"))?
-    .unwrap_or_else(|| {
-        format!("at://{sequencer_did}/space/blue.catbird.labyrinth.conversation/{convo_id}-{generation}")
-    });
+    .map_err(|e| format!("group fanout space lookup failed: {e}"))?;
+    let space_uri = match stored_space_uri {
+        Some(uri) => uri,
+        // `at:space/{sequencer}/blue.catbird.labyrinth.conversation/{convo}-{generation}`
+        None => atproto_spaces::SpaceUri::conversation(
+            &sequencer_did,
+            &format!("{convo_id}-{generation}"),
+        )
+        .map_err(|e| format!("group fanout space URI invalid: {e}"))?
+        .to_string(),
+    };
 
     let targets = by_ds
         .into_iter()

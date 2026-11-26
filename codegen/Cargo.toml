@@ -8,8 +8,8 @@ name = "gen-lexicons"
 path = "src/main.rs"
 
 [dependencies]
-jacquard-common = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40" }
-jacquard-lexicon = { git = "https://tangled.org/nonbinary.computer/jacquard", rev = "3287244a99262a361bd32873a871982da0a76c40" }
+jacquard-common = { git = "https://github.com/joshlacal/jacquard", rev = "7a695dd560c0da2df578f6088e3db1e6026e3825" }
+jacquard-lexicon = { git = "https://github.com/joshlacal/jacquard", rev = "7a695dd560c0da2df578f6088e3db1e6026e3825" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

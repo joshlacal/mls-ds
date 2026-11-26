@@ -28,7 +28,7 @@ use atproto_spaces::{
     kem::decode_p256_did_key,
     lthash::compute_dagcbor_cid,
     tokens::{verify_space_token, SpaceKeyResolver, SpaceTokenKind, SpaceVerifyingKey},
-    SpaceUri, SpacesError,
+    SpacesError,
 };
 use catbird_atproto::generated::blue_catbird::labyrinth::mailbox_keys::{
     MailboxKeys, MailboxKeysBackend,
@@ -473,8 +473,13 @@ pub async fn relay_space_credential_with_options(
     options: RelayCredentialOptions<'_>,
 ) -> Result<RelayedCredentialOutput, SpaceRelayError> {
     let authority_did = crate::identity::canonical_did(authority_did);
-    let space = SpaceUri::parse_hedged(space_uri)
-        .map_err(|e| SpaceRelayError::InvalidRequest(e.to_string()))?;
+    // Strict: exactly `at:space/{authorityDid}/{spaceType}/{skey}`, the string the
+    // authority's credential `sub` must then equal.
+    let space = crate::space_host::parse_strict_space_ref(space_uri).ok_or_else(|| {
+        SpaceRelayError::InvalidRequest(
+            "space must be an at:space/{did}/{spaceType}/{skey} Space ref".into(),
+        )
+    })?;
     if space.authority != authority_did {
         return Err(SpaceRelayError::InvalidRequest(
             "Space authority does not match authorityDid".into(),
@@ -498,7 +503,7 @@ pub async fn relay_space_credential_with_options(
         target.base_url
     );
     let request = UpstreamCredentialRequest {
-        space: space.as_str(),
+        space: space_uri,
         credential_key,
         delegation_token,
         client_attestation: options.client_attestation.filter(|s| !s.is_empty()),
@@ -576,9 +581,8 @@ pub async fn relay_space_credential_with_options(
         now_sec,
     ))
     .map_err(|e| SpaceRelayError::UpstreamError(e.to_string()))?;
-    let claim_space = SpaceUri::parse_hedged(&claims.sub).ok();
     if claims.iss != authority_did
-        || claim_space.as_ref() != Some(&space)
+        || claims.sub != space_uri
         || claims.cnf_kid.as_deref() != Some(credential_key)
         || claims.exp <= now_sec
     {
@@ -3255,7 +3259,7 @@ mod tests {
             SpaceSigningKey::from_p256_secret(&secret, "#atproto"),
             SpaceTokenClaims {
                 iss: authority.into(),
-                sub: format!("at://{authority}/space/blue.catbird.labyrinth.mailbox/self"),
+                sub: format!("at:space/{authority}/blue.catbird.labyrinth.mailbox/self"),
                 aud: None,
                 iat: NOW,
                 exp: NOW + 600,
@@ -3361,14 +3365,13 @@ mod tests {
                 parts[2]
             );
             let mut wrong_space = claims.clone();
-            wrong_space.sub =
-                format!("at://{authority}/space/blue.catbird.labyrinth.mailbox/other");
+            wrong_space.sub = format!("at:space/{authority}/blue.catbird.labyrinth.mailbox/other");
             let mut wrong_pop = claims.clone();
             wrong_pop.cnf_kid = Some(encode_p256_did_key(&attacker.public_key()));
             let mut wrong_authority = claims.clone();
             wrong_authority.iss = "did:web:another-authority.example".into();
             wrong_authority.sub =
-                "at://did:web:another-authority.example/space/blue.catbird.labyrinth.mailbox/self"
+                "at:space/did:web:another-authority.example/blue.catbird.labyrinth.mailbox/self"
                     .into();
             let mut expired = claims.clone();
             expired.iat = NOW - 600;
@@ -3405,7 +3408,9 @@ mod tests {
             assert!(exchange().await.is_ok());
 
             let before = requests.load(Ordering::SeqCst);
-            let at_space_scheme = claims.sub.replacen("at://", "at-space://", 1);
+            let at_space_scheme =
+                format!("at-space://{authority}/blue.catbird.labyrinth.mailbox/self");
+            let legacy_form = format!("at://{authority}/space/blue.catbird.labyrinth.mailbox/self");
             let record_uri = format!(
                 "{}/did:plc:alice/blue.catbird.labyrinth.entry/3l2aaaaaaaaaa",
                 claims.sub
@@ -3413,6 +3418,7 @@ mod tests {
             for (target, space, pop_key) in [
                 (authority, claims.sub.as_str(), "not-a-P256-did-key"),
                 (authority, at_space_scheme.as_str(), kid),
+                (authority, legacy_form.as_str(), kid),
                 (authority, record_uri.as_str(), kid),
                 ("did:web:wrong-target.example", claims.sub.as_str(), kid),
             ] {

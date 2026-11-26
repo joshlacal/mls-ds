@@ -362,7 +362,7 @@ async fn d1_cross_server_group_relay_sequences_on_authority_and_fans_out_with_i1
         conversation_id: fixture.conversation_id,
         generation: 0,
         space_uri: format!(
-            "at://{seq_did}/space/blue.catbird.labyrinth.conversation/{}-0",
+            "at:space/{seq_did}/blue.catbird.labyrinth.conversation/{}-0",
             fixture.conversation_id
         ),
         recipient_dids: vec![fixture.recipient_did.clone()],

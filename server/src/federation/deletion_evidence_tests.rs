@@ -106,7 +106,7 @@ async fn a_group_mirror_stores_only_its_sequencers_signed_account_deletion_verba
         let body = serde_json::to_vec(&DeliverGroupEntryRequest {
             conversation_id: cid,
             generation: 0,
-            space_uri: format!("at://{SEQ}/space/blue.catbird.labyrinth.conversation/{cid}-0"),
+            space_uri: format!("at:space/{SEQ}/blue.catbird.labyrinth.conversation/{cid}-0"),
             recipient_dids: vec![mirror.recipient_did.clone()],
             recipient_devices: vec![(mirror.recipient_did.clone(), mirror.recipient_device_id)],
             entry,
@@ -243,7 +243,7 @@ async fn mirror_serves_device_evidence(pad_to: usize, key_proof_len: usize) {
     let body = serde_json::to_vec(&DeliverGroupEntryRequest {
         conversation_id: cid,
         generation: 0,
-        space_uri: format!("at://{SEQ}/space/blue.catbird.labyrinth.conversation/{cid}-0"),
+        space_uri: format!("at:space/{SEQ}/blue.catbird.labyrinth.conversation/{cid}-0"),
         recipient_dids: vec![mirror.recipient_did.clone()],
         recipient_devices: vec![(mirror.recipient_did.clone(), mirror.recipient_device_id)],
         entry: genuine.clone(),
@@ -364,7 +364,7 @@ async fn a_group_mirror_verifies_new_and_archived_deletions_after_a_key_rotation
         let body = serde_json::to_vec(&DeliverGroupEntryRequest {
             conversation_id: cid,
             generation: 0,
-            space_uri: format!("at://{SEQ}/space/blue.catbird.labyrinth.conversation/{cid}-0"),
+            space_uri: format!("at:space/{SEQ}/blue.catbird.labyrinth.conversation/{cid}-0"),
             recipient_dids: vec![mirror.recipient_did.clone()],
             recipient_devices: vec![(mirror.recipient_did.clone(), mirror.recipient_device_id)],
             entry,

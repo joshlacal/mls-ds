@@ -3,7 +3,7 @@
 //!   `chat.generations.lifecycle` and `chat.conversations.lifecycle` to `'superseded'` cleanly
 //!   through all deferred PostgreSQL triggers AND unblocks `check_pair_owner_fence` for a fresh
 //!   direct request between the same `(actor_did, recipient_did)` pair;
-//! - Option A `chat.conversation_spaces` creation on conversation creation (`at://{authority}/space/blue.catbird.labyrinth.conversation/{cid}-{gen}`)
+//! - Option A `chat.conversation_spaces` creation on conversation creation (`at:space/{authority}/blue.catbird.labyrinth.conversation/{cid}-{gen}`)
 //!   and participant roster status semantics (`active` vs `left` / `removed`).
 
 mod common;
@@ -128,7 +128,7 @@ async fn conversation_spaces_registered_on_creation_with_active_vs_historical_ro
     assert_eq!(
         space_uri,
         format!(
-            "at://{authority_did}/space/blue.catbird.labyrinth.conversation/{}-0",
+            "at:space/{authority_did}/blue.catbird.labyrinth.conversation/{}-0",
             fixture.conversation_id
         )
     );

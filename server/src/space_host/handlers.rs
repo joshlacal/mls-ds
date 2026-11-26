@@ -38,7 +38,7 @@ use sqlx::FromRow;
 use uuid::Uuid;
 
 use super::{
-    decode_tid_micros,
+    decode_tid_micros, parse_strict_space_ref,
     revocation_fanout::{allow_loopback_space_endpoint, build_space_webhook_client},
     SpaceHostRuntime,
 };
@@ -151,8 +151,16 @@ fn xrpc_err(status: StatusCode, code: &str, message: impl Into<String>) -> Respo
 
 #[allow(clippy::result_large_err)]
 fn parse_canonical_space_uri(raw: &str, expected_authority: &str) -> Result<SpaceUri, Response> {
-    let parsed = SpaceUri::parse_hedged(raw)
-        .map_err(|e| xrpc_err(StatusCode::BAD_REQUEST, "InvalidSpaceUri", e.to_string()))?;
+    // Strict, like the reference host's `space-ref` param validation: only
+    // `at:space/{did}/{type}/{skey}`; the alpha `at://{did}/space/...` form and handle
+    // authorities are 400 InvalidRequest.
+    let parsed = parse_strict_space_ref(raw).ok_or_else(|| {
+        xrpc_err(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "space must be an at:space/{did}/{spaceType}/{skey} Space ref",
+        )
+    })?;
     if parsed.authority != expected_authority {
         return Err(xrpc_err(
             StatusCode::BAD_REQUEST,
@@ -414,8 +422,8 @@ async fn authenticate_credential_request_allowing_repo_audience(
             )
         })?;
 
-    let claims_space = SpaceUri::parse_hedged(&claims.sub).ok().map(|s| s.raw);
-    if claims.iss != runtime.authority_did() || claims_space.as_deref() != Some(space_uri) {
+    // The credential `sub` is compared to the Space ref exactly, as the reference does.
+    if claims.iss != runtime.authority_did() || claims.sub != space_uri {
         return Err(xrpc_err(
             StatusCode::UNAUTHORIZED,
             "InvalidSpaceCredential",
@@ -851,8 +859,7 @@ async fn authorize_space_sync(
         }
     };
 
-    let del_sub = SpaceUri::parse_hedged(&del_claims.sub).ok().map(|s| s.raw);
-    if del_sub.as_deref() != Some(space_uri)
+    if del_claims.sub != space_uri
         || del_claims
             .cnf_kid
             .as_deref()
@@ -3529,7 +3536,7 @@ mod tests {
         assert!(inventory_commitment(&duplicate).is_err());
 
         let key = [9u8; 32];
-        let space = "at://did:web:authority.example/space/blue.catbird.labyrinth.conversation/test";
+        let space = "at:space/did:web:authority.example/blue.catbird.labyrinth.conversation/test";
         let cursor =
             encode_inventory_cursor(&key, space, "3l2aaaaaaaaab", &commitment, 100).unwrap();
         let decoded = decode_inventory_cursor(&key, space, &cursor).unwrap();
@@ -3537,7 +3544,7 @@ mod tests {
         assert_eq!(decoded.commitment, commitment);
         assert_eq!(decoded.offset, 100);
         assert!(
-            decode_inventory_cursor(&key, "at://did:web:other.example/space/x/y", &cursor).is_err()
+            decode_inventory_cursor(&key, "at:space/did:web:other.example/x/y", &cursor).is_err()
         );
         let mut tampered = cursor.into_bytes();
         let midpoint = tampered.len() / 2;

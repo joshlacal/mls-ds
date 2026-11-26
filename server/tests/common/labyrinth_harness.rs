@@ -442,9 +442,8 @@ pub async fn seed_conversation_with_storage(
     let authority_did = authority
         .map(str::to_owned)
         .unwrap_or_else(catbird_server::identity::service_did);
-    let space_uri = format!(
-        "at://{authority_did}/space/blue.catbird.labyrinth.conversation/{conversation_id}-1"
-    );
+    let space_uri =
+        format!("at:space/{authority_did}/blue.catbird.labyrinth.conversation/{conversation_id}-1");
     sqlx::query(
         "INSERT INTO chat.conversation_spaces(conversation_id, generation, space_uri, authority_did, created_at) \
          VALUES ($1, 1, $2, $3, $4)",

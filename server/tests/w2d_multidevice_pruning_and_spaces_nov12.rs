@@ -988,7 +988,7 @@ async fn d2_multidevice_enrollment_approval_and_device_view_end_to_end() {
             &json!({
                 "actorDeviceId": alice_d2.device_id,
                 "authorityDid": "did:web:chat.catbird.blue",
-                "space": format!("at://{}/space/blue.catbird.labyrinth.mailbox/self", alice_acct.did),
+                "space": format!("at:space/{}/blue.catbird.labyrinth.mailbox/self", alice_acct.did),
                 "delegationToken": "header.payload.sig",
                 "cnfKey": "did:key:zDnaerx9CtbPJ1q36T5Ln5wYt3MQYeGRG5ehnPAmxcf5mDZpv",
             }),
@@ -1886,7 +1886,7 @@ async fn y7_pruning_requires_recipient_quorum_after_72h_or_the_30d_ceiling() {
     // evidence. Re-sending the sender ACK after 72h must still retain the
     // payload while the only recipient is dormant.
     let fix2_space_uri = format!(
-        "at://{self_did}/space/blue.catbird.labyrinth.conversation/{}-0",
+        "at:space/{self_did}/blue.catbird.labyrinth.conversation/{}-0",
         fix2.conversation_id
     );
     sqlx::query(

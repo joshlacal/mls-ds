@@ -635,6 +635,7 @@ dependencies = [
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rusqlite",
+ "rustix",
  "scopeguard",
  "serde",
  "serde_ipld_dagcbor 0.6.4",
@@ -2424,7 +2425,7 @@ checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
 [[package]]
 name = "jacquard-common"
 version = "0.13.0"
-source = "git+https://tangled.org/nonbinary.computer/jacquard?rev=3287244a99262a361bd32873a871982da0a76c40#3287244a99262a361bd32873a871982da0a76c40"
+source = "git+https://github.com/joshlacal/jacquard?rev=7a695dd560c0da2df578f6088e3db1e6026e3825#7a695dd560c0da2df578f6088e3db1e6026e3825"
 dependencies = [
  "base64 0.23.1",
  "bon",
@@ -2475,7 +2476,7 @@ dependencies = [
 [[package]]
 name = "jacquard-derive"
 version = "0.13.0"
-source = "git+https://tangled.org/nonbinary.computer/jacquard?rev=3287244a99262a361bd32873a871982da0a76c40#3287244a99262a361bd32873a871982da0a76c40"
+source = "git+https://github.com/joshlacal/jacquard?rev=7a695dd560c0da2df578f6088e3db1e6026e3825#7a695dd560c0da2df578f6088e3db1e6026e3825"
 dependencies = [
  "heck",
  "jacquard-lexicon",
@@ -2487,7 +2488,7 @@ dependencies = [
 [[package]]
 name = "jacquard-lexicon"
 version = "0.13.0"
-source = "git+https://tangled.org/nonbinary.computer/jacquard?rev=3287244a99262a361bd32873a871982da0a76c40#3287244a99262a361bd32873a871982da0a76c40"
+source = "git+https://github.com/joshlacal/jacquard?rev=7a695dd560c0da2df578f6088e3db1e6026e3825#7a695dd560c0da2df578f6088e3db1e6026e3825"
 dependencies = [
  "cid",
  "dashmap",
@@ -5245,7 +5246,7 @@ dependencies = [
 [[package]]
 name = "tokio-tungstenite-wasm-jacquard"
 version = "0.6.99"
-source = "git+https://tangled.org/nonbinary.computer/jacquard?rev=3287244a99262a361bd32873a871982da0a76c40#3287244a99262a361bd32873a871982da0a76c40"
+source = "git+https://github.com/joshlacal/jacquard?rev=7a695dd560c0da2df578f6088e3db1e6026e3825#7a695dd560c0da2df578f6088e3db1e6026e3825"
 dependencies = [
  "bytes",
  "futures-channel",

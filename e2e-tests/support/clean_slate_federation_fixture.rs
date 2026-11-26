@@ -348,7 +348,7 @@ async fn admin_seed_group_fixture(
     }
 
     let default_space_uri = format!(
-        "at://{}/space/blue.catbird.labyrinth.conversation/{}-0",
+        "at:space/{}/blue.catbird.labyrinth.conversation/{}-0",
         state.service_did, fixture.conversation_id
     );
     let _ = sqlx::query(

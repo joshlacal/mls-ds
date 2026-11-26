@@ -734,7 +734,7 @@ async fn remote_group_transport_waits_for_local_acks_as_home() {
         conversation_id: fixture.conversation_id,
         generation: 0,
         space_uri: format!(
-            "at://did:web:pruning-sequencer.example.com/space/blue.catbird.labyrinth.conversation/{}-0",
+            "at:space/did:web:pruning-sequencer.example.com/blue.catbird.labyrinth.conversation/{}-0",
             fixture.conversation_id
         ),
         recipient_dids: audience.iter().map(|(did, _)| did.clone()).collect(),

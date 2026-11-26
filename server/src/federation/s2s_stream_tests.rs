@@ -1073,7 +1073,7 @@ impl GroupStream {
                 conversation_id,
                 generation: 0,
                 space_uri: format!(
-                    "at://{SEQ}/space/blue.catbird.labyrinth.conversation/{conversation_id}-0"
+                    "at:space/{SEQ}/blue.catbird.labyrinth.conversation/{conversation_id}-0"
                 ),
                 recipient_dids: Vec::new(),
                 recipient_devices: Vec::new(),
@@ -1632,7 +1632,7 @@ impl GroupStream {
                 conversation_id: self.cid,
                 generation: 0,
                 space_uri: format!(
-                    "at://{SEQ}/space/blue.catbird.labyrinth.conversation/{}-0",
+                    "at:space/{SEQ}/blue.catbird.labyrinth.conversation/{}-0",
                     self.cid
                 ),
                 recipient_dids: devices.iter().map(|(did, _)| did.to_string()).collect(),

@@ -176,7 +176,7 @@ fn scopes() -> Vec<String> {
 }
 
 fn mailbox(did: &str) -> String {
-    format!("at://{did}/space/blue.catbird.labyrinth.mailbox/self")
+    format!("at:space/{did}/blue.catbird.labyrinth.mailbox/self")
 }
 
 /// A device's platform transport: signed in to `did`'s PDS session, homed on `home`, and
@@ -335,7 +335,7 @@ async fn removed_members_restore_only_on_the_authoritys_signed_denial_relayed_by
         .context("a live group pins its conversation Space")?;
     anyhow::ensure!(
         created.sequencer_did == DS_B
-            && space == format!("at://{DS_B}/space/blue.catbird.labyrinth.conversation/{cid}-0"),
+            && space == format!("at:space/{DS_B}/blue.catbird.labyrinth.conversation/{cid}-0"),
         "conversation Space {space} sequenced by {}",
         created.sequencer_did
     );

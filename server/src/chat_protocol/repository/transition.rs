@@ -3005,7 +3005,7 @@ pub(crate) async fn insert_generation(
     Ok(())
 }
 
-/// Register the Option A conversation Space (`at://{authorityDid}/space/blue.catbird.labyrinth.conversation/{conversationId}-{generation}`)
+/// Register the Option A conversation Space (`at:space/{authorityDid}/blue.catbird.labyrinth.conversation/{conversationId}-{generation}`)
 /// in `chat.conversation_spaces` when the clean-slate migration is present.
 /// A local conversation's authority is `local_authority_did` (this DS); a
 /// remote mirror's is its sequencer.
@@ -3050,9 +3050,12 @@ pub(crate) async fn register_conversation_space_if_migrated(
             .filter(|did| !did.is_empty())
             .unwrap_or_else(|| "did:web:localhost".to_owned())
     };
-    let space_uri = format!(
-        "at://{authority_did}/space/blue.catbird.labyrinth.conversation/{conversation_id}-{generation}"
-    );
+    let space_uri = atproto_spaces::SpaceUri::conversation(
+        &authority_did,
+        &format!("{conversation_id}-{generation}"),
+    )
+    .map_err(|e| sqlx::Error::Protocol(format!("invalid conversation Space URI: {e}")))?
+    .to_string();
     sqlx::query(
         "INSERT INTO chat.conversation_spaces \
             (conversation_id, generation, space_uri, authority_did, created_at) \

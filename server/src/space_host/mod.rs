@@ -1,7 +1,7 @@
 //! Option A Conversation `SpaceHost` (`atproto#5187` / Spec §6.1, §6.2, §6.5).
 //!
 //! Each sequencing `mls-ds` (`did:web` or `did:plc`) acts as the Space Authority and
-//! Space Host for conversation Spaces (`at://{authority_did}/space/blue.catbird.labyrinth.conversation/{conversation_id}-{generation}`).
+//! Space Host for conversation Spaces (`at:space/{authority_did}/blue.catbird.labyrinth.conversation/{conversation_id}-{generation}`).
 //!
 //! Key security & federation invariants:
 //! - Zero `NOT c.is_remote` local-only guards anywhere in `space_host`.
@@ -764,6 +764,25 @@ fn extract_service_endpoint(doc: &Value, fragment: &str) -> Option<String> {
     None
 }
 
+/// Prefix of every Space ref and in-space record URI (`at:space/{spaceDid}/...`).
+pub(crate) const SPACE_URI_PREFIX: &str = "at:space/";
+
+/// Strict Space ref parse for request params and token subjects: only the exact
+/// `at:space/{did}/{spaceType}/{skey}` form is accepted. The alpha `at://{did}/space/...`
+/// form, handle authorities, `at-space://`, the `com.atproto.space.space` spelling and
+/// in-space record URIs are all rejected, as the reference host does.
+pub(crate) fn parse_strict_space_ref(raw: &str) -> Option<atproto_spaces::SpaceUri> {
+    if !raw.starts_with(SPACE_URI_PREFIX) {
+        return None;
+    }
+    let parsed = atproto_spaces::SpaceUri::parse_hedged(raw).ok()?;
+    let canonical = format!(
+        "{SPACE_URI_PREFIX}{}/{}/{}",
+        parsed.authority, parsed.space_type, parsed.rkey
+    );
+    (canonical == raw).then_some(parsed)
+}
+
 const TID_CHARS: &[u8; 32] = b"234567abcdefghijklmnopqrstuvwxyz";
 
 pub(crate) fn encode_tid_micros(micros: u64, clock_id: u16) -> String {
@@ -802,6 +821,26 @@ mod tests {
     use super::*;
     use crate::sim_hooks::{with_ds_clock, ManualDsClock};
 
+    #[test]
+    fn strict_space_ref_accepts_only_the_at_space_form() {
+        let space = "at:space/did:web:authority.example/blue.catbird.labyrinth.conversation/c-0";
+        let parsed = parse_strict_space_ref(space).expect("canonical Space ref");
+        assert_eq!(parsed.authority, "did:web:authority.example");
+        assert_eq!(parsed.space_type, "blue.catbird.labyrinth.conversation");
+        assert_eq!(parsed.rkey, "c-0");
+        for rejected in [
+            "at://did:web:authority.example/space/blue.catbird.labyrinth.conversation/c-0",
+            "at:space/authority.example/blue.catbird.labyrinth.conversation/c-0",
+            "at-space://did:web:authority.example/blue.catbird.labyrinth.conversation/c-0",
+            "at://space/did:web:authority.example/blue.catbird.labyrinth.conversation/c-0",
+            "at://did:web:authority.example/com.atproto.space.space/blue.catbird.labyrinth.conversation:c-0",
+            "at:space/did:web:authority.example/blue.catbird.labyrinth.conversation/c-0/did:plc:a/b.c.d/3l2a",
+            "at:space/did:web:authority.example/blue.catbird.labyrinth.conversation/c-0/",
+        ] {
+            assert!(parse_strict_space_ref(rejected).is_none(), "{rejected}");
+        }
+    }
+
     #[tokio::test]
     async fn space_credential_jtis_and_tokens_replay_per_clock() {
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -817,7 +856,7 @@ mod tests {
         let now = DateTime::from_timestamp(1_600_000_000, 0).unwrap();
         let clock = Arc::new(ManualDsClock::new(now));
         let space_uri =
-            "at://did:web:authority.example/space/blue.catbird.labyrinth.conversation/test-0";
+            "at:space/did:web:authority.example/blue.catbird.labyrinth.conversation/test-0";
         let credential_kid = atproto_spaces::kem::encode_p256_did_key(&p256::PublicKey::from(
             runtime.config.signing_key.verifying_key(),
         ));
