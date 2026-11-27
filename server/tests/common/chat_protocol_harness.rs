@@ -204,7 +204,7 @@ pub mod repository {
     pub mod federation {
         use catbird_server::blue_catbird::chat::ConversationCoordinates;
         use catbird_server::blue_catbird::mls_ds::submit_commit::Input as SubmitCommit;
-                use uuid::Uuid;
+        use uuid::Uuid;
 
         #[allow(clippy::too_many_arguments)]
         pub async fn enqueue_federated_welcome_job(
@@ -245,8 +245,7 @@ pub mod repository {
             _signed_request_bytes: &[u8],
             _sequencer_term: u64,
             _received_at: &crate::chat_protocol::validation::CanonicalTimestamp,
-        ) -> Result<SubmitCommit, catbird_server::federation::errors::FederationError>
-        {
+        ) -> Result<SubmitCommit, catbird_server::federation::errors::FederationError> {
             Err(
                 catbird_server::federation::errors::FederationError::InvalidEnvelope {
                     reason: "test stub".to_string(),

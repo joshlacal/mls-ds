@@ -33,10 +33,10 @@ use axum::routing::post;
 use axum::Router;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
-use catbird_server::blue_catbird::chat::ConversationCoordinates;
 use catbird_server::auth::{
     cache_test_did_document, DidDocument, PublicKeyJwk, VerificationMethod,
 };
+use catbird_server::blue_catbird::chat::ConversationCoordinates;
 use catbird_server::federation::ack::AckSigner;
 use catbird_server::federation::envelope::{
     compute_commit_envelope_digest, compute_message_envelope_digest,
@@ -49,7 +49,9 @@ use catbird_server::federation::resolver::{DsResolver, ValidatedRemoteDestinatio
 use catbird_server::federation::FederationMode;
 use catbird_server::federation::ServiceAuthClient;
 use catbird_server::handlers::chat::ChatRuntime;
-use catbird_server::handlers::ds::get_convo_digest::{compute_clean_convo_digest, CleanDigestRow, GetConvoDigestOutput};
+use catbird_server::handlers::ds::get_convo_digest::{
+    compute_clean_convo_digest, CleanDigestRow, GetConvoDigestOutput,
+};
 use catbird_server::storage::DbPool;
 use chrono::{DateTime, SecondsFormat, Utc};
 use common::fresh_db::{fresh_legacy_pool, DisposableDatabase};
@@ -6216,9 +6218,7 @@ async fn test_deliver_welcome_router_cancelled_or_stale_welcome_rejects() {
             outer_entry_fingerprint: outer_fp,
         },
         &ConversationCoordinates {
-            conversation_id: String::from(
-                convo_id.hyphenated().to_string(),
-            ),
+            conversation_id: String::from(convo_id.hyphenated().to_string()),
             generation: 0,
             state_version: 1,
             epoch: 1,
@@ -7144,7 +7144,9 @@ async fn test_remote_commit_canonical_mismatch_fails_and_rolls_back() {
             let signer = signer_clone.clone();
             let router = seq_router.clone();
             async move {
-                use catbird_server::blue_catbird::mls_ds::submit_commit::{Input as SubmitCommit, Output as SubmitCommitOutput};
+                use catbird_server::blue_catbird::mls_ds::submit_commit::{
+                    Input as SubmitCommit, Output as SubmitCommitOutput,
+                };
                 use catbird_server::federation::envelope::sign_receipt;
                 use catbird_server::federation::envelope::validate_envelope_header;
 
@@ -7169,11 +7171,14 @@ async fn test_remote_commit_canonical_mismatch_fails_and_rolls_back() {
                 let mut output: SubmitCommitOutput = serde_json::from_slice(&resp_bytes).unwrap();
                 // Coordinates, entryId, seq, and locator hashes match perfectly.
                 // Mutate received_at so that only full byte-for-byte canonical response equality detects the mismatch.
-                output.commit_entry.received_at =
-                    catbird_server::atproto_conv::chrono_to_datetime(now - chrono::Duration::seconds(100));
+                output.commit_entry.received_at = catbird_server::atproto_conv::chrono_to_datetime(
+                    now - chrono::Duration::seconds(100),
+                );
                 let st_output = catbird_server::blue_catbird::chat::submit_transition::Output {
                     coordinates: output.coordinates.clone(),
-                    entry: catbird_server::blue_catbird::chat::ConversationEntry::CommitEntry(Box::new(output.commit_entry.clone())),
+                    entry: catbird_server::blue_catbird::chat::ConversationEntry::CommitEntry(
+                        Box::new(output.commit_entry.clone()),
+                    ),
                     welcomes: vec![],
                 };
                 let st_bytes = serde_json::to_vec(&st_output).unwrap();
@@ -7449,7 +7454,9 @@ async fn test_remote_commit_receipt_locator_payload_hash_mismatch_fails_and_roll
             let signer = signer_clone.clone();
             let router = seq_router.clone();
             async move {
-                use catbird_server::blue_catbird::mls_ds::submit_commit::{Input as SubmitCommit, Output as SubmitCommitOutput};
+                use catbird_server::blue_catbird::mls_ds::submit_commit::{
+                    Input as SubmitCommit, Output as SubmitCommitOutput,
+                };
                 use catbird_server::federation::envelope::sign_receipt;
                 use catbird_server::federation::envelope::validate_envelope_header;
 
@@ -7475,7 +7482,9 @@ async fn test_remote_commit_receipt_locator_payload_hash_mismatch_fails_and_roll
 
                 let st_output = catbird_server::blue_catbird::chat::submit_transition::Output {
                     coordinates: output.coordinates.clone(),
-                    entry: catbird_server::blue_catbird::chat::ConversationEntry::CommitEntry(Box::new(output.commit_entry.clone())),
+                    entry: catbird_server::blue_catbird::chat::ConversationEntry::CommitEntry(
+                        Box::new(output.commit_entry.clone()),
+                    ),
                     welcomes: vec![],
                 };
                 let st_bytes = serde_json::to_vec(&st_output).unwrap();
@@ -7745,7 +7754,9 @@ async fn test_remote_commit_receipt_locator_fingerprint_mismatch_fails_and_rolls
             let signer = signer_clone.clone();
             let router = seq_router.clone();
             async move {
-                use catbird_server::blue_catbird::mls_ds::submit_commit::{Input as SubmitCommit, Output as SubmitCommitOutput};
+                use catbird_server::blue_catbird::mls_ds::submit_commit::{
+                    Input as SubmitCommit, Output as SubmitCommitOutput,
+                };
                 use catbird_server::federation::envelope::sign_receipt;
                 use catbird_server::federation::envelope::validate_envelope_header;
 
@@ -7771,7 +7782,9 @@ async fn test_remote_commit_receipt_locator_fingerprint_mismatch_fails_and_rolls
 
                 let st_output = catbird_server::blue_catbird::chat::submit_transition::Output {
                     coordinates: output.coordinates.clone(),
-                    entry: catbird_server::blue_catbird::chat::ConversationEntry::CommitEntry(Box::new(output.commit_entry.clone())),
+                    entry: catbird_server::blue_catbird::chat::ConversationEntry::CommitEntry(
+                        Box::new(output.commit_entry.clone()),
+                    ),
                     welcomes: vec![],
                 };
                 let st_bytes = serde_json::to_vec(&st_output).unwrap();

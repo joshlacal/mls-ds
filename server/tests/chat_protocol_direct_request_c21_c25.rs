@@ -13,7 +13,8 @@
 #![allow(dead_code, unused_imports)]
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use catbird_server::blue_catbird::chat::{
-    get_conversations::Output as GetConversationsOutput, get_pending_welcomes::Output as GetPendingWelcomesOutput,
+    get_conversations::Output as GetConversationsOutput,
+    get_pending_welcomes::Output as GetPendingWelcomesOutput,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};

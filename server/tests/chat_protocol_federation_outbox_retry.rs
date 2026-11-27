@@ -23,10 +23,10 @@ mod common;
 use std::sync::Arc;
 
 use base64::Engine as _;
-use catbird_server::blue_catbird::chat::ConversationCoordinates;
 use catbird_server::auth::{
     cache_test_did_document, AuthMiddleware, DidDocument, VerificationMethod,
 };
+use catbird_server::blue_catbird::chat::ConversationCoordinates;
 use catbird_server::chat_protocol::test_support::repository::{
     enqueue_clean_federation_message_jobs, enqueue_federated_welcome_job, AppendEntry,
 };
@@ -1242,24 +1242,17 @@ async fn test_outbound_queue_receipt_db_persistence_failure_retries_and_never_ma
             ),
             delivery_id: String::from(item_id.clone()),
             conversation_id: String::from(convo_id.clone()),
-            sender_ds_did: petrel_core::Did::parse(service_did_base())
-                .unwrap(),
-            receiver_ds_did: petrel_core::Did::parse(peer_did.clone())
-                .unwrap(),
-            sequencer_did: petrel_core::Did::parse(service_did_base())
-                .unwrap(),
+            sender_ds_did: petrel_core::Did::parse(service_did_base()).unwrap(),
+            receiver_ds_did: petrel_core::Did::parse(peer_did.clone()).unwrap(),
+            sequencer_did: petrel_core::Did::parse(service_did_base()).unwrap(),
             sequencer_term: 1,
             payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[42u8; 32])),
             extra_data: None,
         },
-        recipient_did: petrel_core::Did::parse(
-            "did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string(),
-        )
-        .unwrap(),
+        recipient_did: petrel_core::Did::parse("did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string())
+            .unwrap(),
         entry_locator: catbird_server::blue_catbird::mls_ds::EntryLocatorV1 {
-            entry_id: String::from(
-                source_locator.entry_id.to_string(),
-            ),
+            entry_id: String::from(source_locator.entry_id.to_string()),
             seq: source_locator.seq as i64,
             accepted_payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(
                 &source_locator.accepted_payload_sha256,
@@ -1477,24 +1470,17 @@ async fn test_outbound_queue_valid_signed_receipt_marks_delivered_and_stores_res
             ),
             delivery_id: String::from(item_id.clone()),
             conversation_id: String::from(convo_id.clone()),
-            sender_ds_did: petrel_core::Did::parse(service_did_base())
-                .unwrap(),
-            receiver_ds_did: petrel_core::Did::parse(peer_did.clone())
-                .unwrap(),
-            sequencer_did: petrel_core::Did::parse(service_did_base())
-                .unwrap(),
+            sender_ds_did: petrel_core::Did::parse(service_did_base()).unwrap(),
+            receiver_ds_did: petrel_core::Did::parse(peer_did.clone()).unwrap(),
+            sequencer_did: petrel_core::Did::parse(service_did_base()).unwrap(),
             sequencer_term: 1,
             payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[42u8; 32])),
             extra_data: None,
         },
-        recipient_did: petrel_core::Did::parse(
-            "did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string(),
-        )
-        .unwrap(),
+        recipient_did: petrel_core::Did::parse("did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string())
+            .unwrap(),
         entry_locator: catbird_server::blue_catbird::mls_ds::EntryLocatorV1 {
-            entry_id: String::from(
-                source_locator.entry_id.to_string(),
-            ),
+            entry_id: String::from(source_locator.entry_id.to_string()),
             seq: source_locator.seq as i64,
             accepted_payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(
                 &source_locator.accepted_payload_sha256,
@@ -2032,9 +2018,7 @@ async fn test_recovery_fulfillment_remote_welcome_creates_typed_outbox_job_and_r
     };
 
     let coordinates = ConversationCoordinates {
-        conversation_id: String::from(
-            convo_id.hyphenated().to_string(),
-        ),
+        conversation_id: String::from(convo_id.hyphenated().to_string()),
         generation: 1,
         state_version: 1,
         epoch: 1,
@@ -2179,9 +2163,7 @@ async fn test_recovery_fulfillment_absent_participant_fails_hard_and_rolls_back(
     };
 
     let coordinates = ConversationCoordinates {
-        conversation_id: String::from(
-            convo_id.hyphenated().to_string(),
-        ),
+        conversation_id: String::from(convo_id.hyphenated().to_string()),
         generation: 1,
         state_version: 1,
         epoch: 1,
@@ -2562,9 +2544,7 @@ async fn test_recovery_fulfillment_pending_remote_welcome_creates_typed_outbox_j
     };
 
     let coordinates = ConversationCoordinates {
-        conversation_id: String::from(
-            convo_id.hyphenated().to_string(),
-        ),
+        conversation_id: String::from(convo_id.hyphenated().to_string()),
         generation: 1,
         state_version: 1,
         epoch: 1,
@@ -2763,12 +2743,9 @@ async fn test_submit_commit_valid_receipt_marks_delivered_end_to_end_mock() {
             ),
             delivery_id: String::from(item_id.clone()),
             conversation_id: String::from(convo_id.clone()),
-            sender_ds_did: petrel_core::Did::parse(service_did_base())
-                .unwrap(),
-            receiver_ds_did: petrel_core::Did::parse(peer_did.clone())
-                .unwrap(),
-            sequencer_did: petrel_core::Did::parse(peer_did.clone())
-                .unwrap(),
+            sender_ds_did: petrel_core::Did::parse(service_did_base()).unwrap(),
+            receiver_ds_did: petrel_core::Did::parse(peer_did.clone()).unwrap(),
+            sequencer_did: petrel_core::Did::parse(peer_did.clone()).unwrap(),
             sequencer_term: 1,
             payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[42u8; 32])),
             extra_data: None,
@@ -3239,24 +3216,17 @@ async fn test_recomputed_envelope_digest_mismatch_marks_dead_immediately() {
             ),
             delivery_id: String::from(item_id.clone()),
             conversation_id: String::from(convo_id.clone()),
-            sender_ds_did: petrel_core::Did::parse(service_did_base())
-                .unwrap(),
-            receiver_ds_did: petrel_core::Did::parse(peer_did.clone())
-                .unwrap(),
-            sequencer_did: petrel_core::Did::parse(service_did_base())
-                .unwrap(),
+            sender_ds_did: petrel_core::Did::parse(service_did_base()).unwrap(),
+            receiver_ds_did: petrel_core::Did::parse(peer_did.clone()).unwrap(),
+            sequencer_did: petrel_core::Did::parse(service_did_base()).unwrap(),
             sequencer_term: 1,
             payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[42u8; 32])),
             extra_data: None,
         },
-        recipient_did: petrel_core::Did::parse(
-            "did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string(),
-        )
-        .unwrap(),
+        recipient_did: petrel_core::Did::parse("did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string())
+            .unwrap(),
         entry_locator: catbird_server::blue_catbird::mls_ds::EntryLocatorV1 {
-            entry_id: String::from(
-                source_locator.entry_id.to_string(),
-            ),
+            entry_id: String::from(source_locator.entry_id.to_string()),
             seq: source_locator.seq as i64,
             accepted_payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(
                 &source_locator.accepted_payload_sha256,
@@ -3433,8 +3403,7 @@ async fn test_store_federation_receipt_db_conflict_exact_compares_digest_and_byt
 
     // 4. Conflicting envelope digest in receipt must fail with Protocol error
     let mut conflicting_receipt = receipt.clone();
-    conflicting_receipt.envelope_sha256 =
-        petrel_core::Bytes(<[u8]>::to_vec(&[0x99u8; 32]));
+    conflicting_receipt.envelope_sha256 = petrel_core::Bytes(<[u8]>::to_vec(&[0x99u8; 32]));
     let err_envelope = catbird_server::federation::queue::store_federation_receipt(
         &pool,
         &conflicting_receipt,
@@ -3599,10 +3568,8 @@ async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_deliver_we
             payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[42u8; 32])),
             extra_data: None,
         },
-        recipient_did: petrel_core::Did::parse(
-            "did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string(),
-        )
-        .unwrap(),
+        recipient_did: petrel_core::Did::parse("did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string())
+            .unwrap(),
         recipient_device_id: Uuid::new_v4().to_string().into(),
         recovery_request_id: Uuid::new_v4().to_string().into(),
         coordinates: catbird_server::blue_catbird::chat::ConversationCoordinates {
@@ -3618,20 +3585,14 @@ async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_deliver_we
         },
         welcome_id: Uuid::new_v4().to_string().into(),
         welcome_bytes: petrel_core::Bytes(<[u8]>::to_vec(b"welcome")),
-        welcome_sha256: petrel_core::Bytes(<[u8]>::to_vec(&Sha256::digest(
-            b"welcome",
-        ))),
+        welcome_sha256: petrel_core::Bytes(<[u8]>::to_vec(&Sha256::digest(b"welcome"))),
         key_package_ref: petrel_core::Bytes(<[u8]>::to_vec(&[11u8; 32])),
         tree_summary_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[12u8; 32])),
         public_snapshot_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[13u8; 32])),
         entry_bytes: petrel_core::Bytes(<[u8]>::to_vec(b"sample-entry-bytes")),
-        signed_request_bytes: petrel_core::Bytes(<[u8]>::to_vec(
-            b"sample-signed-request-bytes",
-        )),
+        signed_request_bytes: petrel_core::Bytes(<[u8]>::to_vec(b"sample-signed-request-bytes")),
         entry_locator: catbird_server::blue_catbird::mls_ds::EntryLocatorV1 {
-            entry_id: String::from(
-                source_locator.entry_id.to_string(),
-            ),
+            entry_id: String::from(source_locator.entry_id.to_string()),
             seq: source_locator.seq as i64,
             accepted_payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(
                 &source_locator.accepted_payload_sha256,
@@ -3721,14 +3682,10 @@ async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_deliver_me
             payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[42u8; 32])),
             extra_data: None,
         },
-        recipient_did: petrel_core::Did::parse(
-            "did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string(),
-        )
-        .unwrap(),
+        recipient_did: petrel_core::Did::parse("did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string())
+            .unwrap(),
         entry_locator: catbird_server::blue_catbird::mls_ds::EntryLocatorV1 {
-            entry_id: String::from(
-                source_locator.entry_id.to_string(),
-            ),
+            entry_id: String::from(source_locator.entry_id.to_string()),
             seq: source_locator.seq as i64,
             accepted_payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(
                 &source_locator.accepted_payload_sha256,

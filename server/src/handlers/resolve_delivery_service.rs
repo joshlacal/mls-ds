@@ -35,21 +35,19 @@ pub async fn resolve(
         }
     })?;
 
-    let endpoint =
-        petrel_core::Uri::parse(ds_endpoint.endpoint.as_str())
-        .map_err(|e| FederationError::ResolutionFailed {
+    let endpoint = petrel_core::Uri::parse(ds_endpoint.endpoint.as_str()).map_err(|e| {
+        FederationError::ResolutionFailed {
             did: user_did.clone(),
             kind: crate::federation::ResolutionFailureKind::InvalidUrl(format!(
                 "Invalid endpoint URI: {}",
                 e
             )),
-        })?;
+        }
+    })?;
 
-    let supported_cipher_suites = ds_endpoint.supported_cipher_suites.map(|suites| {
-        suites
-            .into_iter()
-            .collect()
-    });
+    let supported_cipher_suites = ds_endpoint
+        .supported_cipher_suites
+        .map(|suites| suites.into_iter().collect());
 
     debug!(
         user_did = %crate::crypto::redact_for_log(user_did),

@@ -1,7 +1,8 @@
 //! Transport regressions: unknown request unions fail closed and legacy optional
 //! scope omission stays omission. SQL audience/cursor tests run separately.
 use catbird_server::blue_catbird::chat::{
-    get_conversations::Output as GetConversationsOutput, get_pending_welcomes::Output as GetPendingWelcomesOutput,
+    get_conversations::Output as GetConversationsOutput,
+    get_pending_welcomes::Output as GetPendingWelcomesOutput,
 };
 use serde_json::json;
 #[test]

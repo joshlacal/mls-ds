@@ -24,24 +24,11 @@ fn sample_header() -> EnvelopeHeaderV1 {
     EnvelopeHeaderV1 {
         protocol_version: catbird_server::blue_catbird::mls_ds::ProtocolVersion::Value1,
         received_at: catbird_server::atproto_conv::chrono_to_canonical_datetime(chrono::Utc::now()),
-        delivery_id: String::from(
-            Uuid::new_v4().hyphenated().to_string(),
-        ),
-        conversation_id: String::from(
-            Uuid::new_v4().hyphenated().to_string(),
-        ),
-        sender_ds_did: petrel_core::Did::parse(
-            "did:web:ds1.example.com".to_string(),
-        )
-        .unwrap(),
-        receiver_ds_did: petrel_core::Did::parse(
-            "did:web:ds2.example.com".to_string(),
-        )
-        .unwrap(),
-        sequencer_did: petrel_core::Did::parse(
-            "did:web:ds1.example.com".to_string(),
-        )
-        .unwrap(),
+        delivery_id: String::from(Uuid::new_v4().hyphenated().to_string()),
+        conversation_id: String::from(Uuid::new_v4().hyphenated().to_string()),
+        sender_ds_did: petrel_core::Did::parse("did:web:ds1.example.com".to_string()).unwrap(),
+        receiver_ds_did: petrel_core::Did::parse("did:web:ds2.example.com".to_string()).unwrap(),
+        sequencer_did: petrel_core::Did::parse("did:web:ds1.example.com".to_string()).unwrap(),
         sequencer_term: 1,
         payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[42u8; 32])),
         extra_data: None,
@@ -50,9 +37,7 @@ fn sample_header() -> EnvelopeHeaderV1 {
 
 fn sample_locator() -> EntryLocatorV1 {
     EntryLocatorV1 {
-        entry_id: String::from(
-            Uuid::new_v4().hyphenated().to_string(),
-        ),
+        entry_id: String::from(Uuid::new_v4().hyphenated().to_string()),
         seq: 1,
         accepted_payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[1u8; 32])),
         outer_entry_fingerprint: petrel_core::Bytes(<[u8]>::to_vec(&[2u8; 32])),
@@ -91,8 +76,7 @@ fn test_envelope_header_validation_negative_uuid() {
 #[test]
 fn test_envelope_header_validation_negative_did() {
     let mut header = sample_header();
-    header.sender_ds_did =
-        petrel_core::Did::parse("did:invalid:bad".to_string()).unwrap();
+    header.sender_ds_did = petrel_core::Did::parse("did:invalid:bad".to_string()).unwrap();
     let err = validate_envelope_header(&header).expect_err("bad DID must fail");
     assert!(matches!(err, FederationError::InvalidEnvelope { .. }));
 }
@@ -101,10 +85,7 @@ fn test_envelope_header_validation_negative_did() {
 fn test_envelope_header_validation_negative_extra_data() {
     let mut header = sample_header();
     let mut extra = std::collections::BTreeMap::new();
-    extra.insert(
-        String::from("unknownField"),
-        petrel_core::Value::Null,
-    );
+    extra.insert(String::from("unknownField"), petrel_core::Value::Null);
     header.extra_data = Some(extra);
     let err = validate_envelope_header(&header).expect_err("extra fields must fail");
     assert!(matches!(err, FederationError::InvalidEnvelope { .. }));

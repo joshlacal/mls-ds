@@ -17,10 +17,10 @@ use super::ticket::{
     TicketRepositoryError,
 };
 use crate::{
+    atproto_conv::chrono_to_datetime,
     chat_protocol::cursor::{
         mint_capability_token, CursorSealer, OsSecureRandom, SealedCapability, SealerBinding,
     },
-    atproto_conv::chrono_to_datetime,
 };
 
 const MAX_BATCH: i64 = 256;
