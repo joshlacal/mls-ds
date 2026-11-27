@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::chat_protocol::validation::{CanonicalTimestamp, CanonicalUuidV4};
-use catbird_atproto::generated::blue_catbird::chat::SubscriptionMessage;
+use catbird_server::blue_catbird::chat::SubscriptionMessage;
 use tower_util::ServiceExt as _;
 
 const ENVELOPE_TYPE: &str = "blue.catbird.chat.defs#eventEnvelope";

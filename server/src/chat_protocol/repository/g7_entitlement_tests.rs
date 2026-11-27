@@ -4402,7 +4402,7 @@ fn b_auth_read_authority_privacy_and_call_graph_guards() {
 const B_AUTH_DEVICE_DIRECTORY_SHA256: &str =
     "6fdb19ec46bcde33fe7116d1e88621821d12b2be68691c1810ae3944dc992c8f";
 const B_AUTH_DEVICE_VIEWS_SHA256: &str =
-    "361fb5f4e6de3bc4c901c7a6d7be045dc4330e5fcec622e26fceb7c6e1d10b75";
+    "a0f7a408a7fd3c7b3e545c7cee08323d9e31bbac2c354d1e0d38138a959e8be6";
 
 // ---------------------------------------------------------------------------
 // 4-7. Ignored Tokio database cases, class `commit-write`. Task B6 runs these.
@@ -7799,7 +7799,7 @@ async fn inventory_fence_rejects_key_floor_head_and_expiry_drift() {
 // C1-1: canonical-JSON v1 encoder — pure fixture-driven tests (no database).
 //
 // Drives the production `read_projection` canonical encoder through the
-// frozen `encode_canonical_generated_chat_json_v1` entry point. The fixture
+// frozen `encode_canonical_petrel_chat_json_v1` entry point. The fixture
 // (`server/tests/fixtures/chat_protocol_g7_canonical_json_v1.json`) was
 // written fixture-first and its canonical hex/SHA-256 values were derived by
 // an INDEPENDENT Python JCS reference (RFC 8785) kept at
@@ -7809,8 +7809,7 @@ async fn inventory_fence_rejects_key_floor_head_and_expiry_drift() {
 const CANONICAL_JSON_FIXTURE: &str =
     include_str!("../../../tests/fixtures/chat_protocol_g7_canonical_json_v1.json");
 
-use catbird_atproto::generated::blue_catbird::chat as chat_dto;
-use jacquard_common::DefaultStr;
+use catbird_server::blue_catbird::chat as chat_dto;
 
 fn canonical_json_fixture() -> serde_json::Value {
     serde_json::from_str(CANONICAL_JSON_FIXTURE).expect("C1-1 fixture parses as JSON")
@@ -7856,7 +7855,7 @@ fn static_definition_id(fixture_id: &str) -> &'static str {
 }
 
 /// `extra_data` injection: generated DTOs carry the flattened
-/// `Option<BTreeMap<SmolStr, Data>>` member, so invalid vectors record the
+/// `Option<BTreeMap<String, Data>>` member, so invalid vectors record the
 /// poison as `extraData` and the harness injects it into the DTO before the
 /// encoder serializes it.
 trait CanonicalExtraDataInjection {
@@ -7872,8 +7871,8 @@ macro_rules! impl_extra_data_injection {
                     extra: &serde_json::Value,
                 ) -> Result<(), String> {
                     let map: std::collections::BTreeMap<
-                        jacquard_common::deps::smol_str::SmolStr,
-                        jacquard_common::types::value::Data<DefaultStr>,
+                        String,
+                        petrel_core::Value,
                     > = serde_json::from_value(extra.clone())
                         .map_err(|error| format!("extra_data decode: {error}"))?;
                     self.extra_data = Some(map);
@@ -7885,12 +7884,12 @@ macro_rules! impl_extra_data_injection {
 }
 
 impl_extra_data_injection!(
-    chat_dto::ConversationState<DefaultStr>,
-    chat_dto::ConversationRemovalTombstone<DefaultStr>,
-    chat_dto::ConversationCloseTombstone<DefaultStr>,
-    chat_dto::WelcomeView<DefaultStr>,
-    chat_dto::LeafRecoveryView<DefaultStr>,
-    chat_dto::MetadataContentProjection<DefaultStr>,
+    chat_dto::ConversationState,
+    chat_dto::ConversationRemovalTombstone,
+    chat_dto::ConversationCloseTombstone,
+    chat_dto::WelcomeView,
+    chat_dto::LeafRecoveryView,
+    chat_dto::MetadataContentProjection,
 );
 
 /// Decodes the fixture's typed value into the generated DTO named by the
@@ -7910,101 +7909,137 @@ fn encode_fixture_vector(
     let definition_id = static_definition_id(fixture_id);
     let dto_kind = vector["dto"].as_str().expect("dto");
     let value = &vector["value"];
-    let value_text = serde_json::to_string(value).expect("fixture value re-serializes");
+    let name = format!("{}{}", dto_kind[..1].to_ascii_lowercase(), &dto_kind[1..]);
     let extra_data = vector.get("extraData");
     match dto_kind {
         "ConversationState" => {
-            let mut dto: chat_dto::ConversationState<DefaultStr> =
-                serde_json::from_str(&value_text).expect("fixture DTO decodes");
+            let mut dto: chat_dto::ConversationState =
+                catbird_server::chat_protocol::retained_json::decode_definition(
+                    &name,
+                    value.clone(),
+                )
+                .expect("fixture DTO decodes");
             if let Some(extra) = extra_data {
                 dto.inject_canonical_extra_data(extra)
                     .expect("extra_data injects");
             }
-            chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+            chat_protocol::read_projection::encode_canonical_petrel_chat_json_v1(
                 &dto,
                 definition_id,
             )
         }
         "ConversationRemovalTombstone" => {
-            let mut dto: chat_dto::ConversationRemovalTombstone<DefaultStr> =
-                serde_json::from_str(&value_text).expect("fixture DTO decodes");
+            let mut dto: chat_dto::ConversationRemovalTombstone =
+                catbird_server::chat_protocol::retained_json::decode_definition(
+                    &name,
+                    value.clone(),
+                )
+                .expect("fixture DTO decodes");
             if let Some(extra) = extra_data {
                 dto.inject_canonical_extra_data(extra)
                     .expect("extra_data injects");
             }
-            chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+            chat_protocol::read_projection::encode_canonical_petrel_chat_json_v1(
                 &dto,
                 definition_id,
             )
         }
         "ConversationCloseTombstone" => {
-            let mut dto: chat_dto::ConversationCloseTombstone<DefaultStr> =
-                serde_json::from_str(&value_text).expect("fixture DTO decodes");
+            let mut dto: chat_dto::ConversationCloseTombstone =
+                catbird_server::chat_protocol::retained_json::decode_definition(
+                    &name,
+                    value.clone(),
+                )
+                .expect("fixture DTO decodes");
             if let Some(extra) = extra_data {
                 dto.inject_canonical_extra_data(extra)
                     .expect("extra_data injects");
             }
-            chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+            chat_protocol::read_projection::encode_canonical_petrel_chat_json_v1(
                 &dto,
                 definition_id,
             )
         }
         "ConversationInventoryItem" => {
-            let dto: chat_dto::ConversationInventoryItem<DefaultStr> =
-                serde_json::from_str(&value_text).expect("fixture DTO decodes");
-            chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+            let dto: chat_dto::ConversationInventoryItem =
+                catbird_server::chat_protocol::retained_json::decode_definition(
+                    &name,
+                    value.clone(),
+                )
+                .expect("fixture DTO decodes");
+            chat_protocol::read_projection::encode_canonical_petrel_chat_json_v1(
                 &dto,
                 definition_id,
             )
         }
         "WelcomeView" => {
-            let mut dto: chat_dto::WelcomeView<DefaultStr> =
-                serde_json::from_str(&value_text).expect("fixture DTO decodes");
+            let mut dto: chat_dto::WelcomeView =
+                catbird_server::chat_protocol::retained_json::decode_definition(
+                    &name,
+                    value.clone(),
+                )
+                .expect("fixture DTO decodes");
             if let Some(extra) = extra_data {
                 dto.inject_canonical_extra_data(extra)
                     .expect("extra_data injects");
             }
-            chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+            chat_protocol::read_projection::encode_canonical_petrel_chat_json_v1(
                 &dto,
                 definition_id,
             )
         }
         "LeafRecoveryView" => {
-            let mut dto: chat_dto::LeafRecoveryView<DefaultStr> =
-                serde_json::from_str(&value_text).expect("fixture DTO decodes");
+            let mut dto: chat_dto::LeafRecoveryView =
+                catbird_server::chat_protocol::retained_json::decode_definition(
+                    &name,
+                    value.clone(),
+                )
+                .expect("fixture DTO decodes");
             if let Some(extra) = extra_data {
                 dto.inject_canonical_extra_data(extra)
                     .expect("extra_data injects");
             }
-            chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+            chat_protocol::read_projection::encode_canonical_petrel_chat_json_v1(
                 &dto,
                 definition_id,
             )
         }
         "RecoveryWorkView" => {
-            let dto: chat_dto::RecoveryWorkView<DefaultStr> =
-                serde_json::from_str(&value_text).expect("fixture DTO decodes");
-            chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+            let dto: chat_dto::RecoveryWorkView =
+                catbird_server::chat_protocol::retained_json::decode_definition(
+                    &name,
+                    value.clone(),
+                )
+                .expect("fixture DTO decodes");
+            chat_protocol::read_projection::encode_canonical_petrel_chat_json_v1(
                 &dto,
                 definition_id,
             )
         }
         "LeafRecoveryInboxItem" => {
-            let dto: chat_dto::LeafRecoveryInboxItem<DefaultStr> =
-                serde_json::from_str(&value_text).expect("fixture DTO decodes");
-            chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+            let dto: chat_dto::LeafRecoveryInboxItem =
+                catbird_server::chat_protocol::retained_json::decode_definition(
+                    &name,
+                    value.clone(),
+                )
+                .expect("fixture DTO decodes");
+            chat_protocol::read_projection::encode_canonical_petrel_chat_json_v1(
                 &dto,
                 definition_id,
             )
         }
         "MetadataContentProjection" => {
-            let mut dto: chat_dto::MetadataContentProjection<DefaultStr> =
-                serde_json::from_str(&value_text).expect("fixture DTO decodes");
+            let mut dto: chat_dto::MetadataContentProjection =
+                catbird_server::chat_protocol::retained_json::decode_definition(
+                    &name,
+                    value.clone(),
+                )
+                .expect("fixture DTO decodes");
             if let Some(extra) = extra_data {
                 dto.inject_canonical_extra_data(extra)
                     .expect("extra_data injects");
             }
-            chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+            chat_protocol::read_projection::encode_canonical_petrel_chat_json_v1(
                 &dto,
                 definition_id,
             )
@@ -8176,8 +8211,7 @@ use chat_protocol::read_projection::{
     RetainedRecoveryWorkProjectionSource, RetainedRecoveryWorkTerminal,
     RetainedWelcomeProjectionSource,
 };
-use jacquard_common::deps::bytes::Bytes;
-use jacquard_common::deps::smol_str::SmolStr;
+use petrel_core::Bytes;
 
 fn c1_2_bytes_0_to_32() -> Vec<u8> {
     (0..32).collect()
@@ -8426,15 +8460,18 @@ fn c1_2_active_conversation_state_projects_complete_dto() {
     );
     assert_eq!(dto.coordinates.generation, 0);
     assert_eq!(dto.coordinates.state_version, 3);
-    assert_eq!(dto.coordinates.group_id, Bytes::from(c1_2_bytes_0_to_32()));
+    assert_eq!(
+        dto.coordinates.group_id,
+        Bytes(Vec::from(c1_2_bytes_0_to_32()))
+    );
     assert_eq!(dto.coordinates.epoch, 1);
     assert_eq!(
         dto.coordinates.group_context_hash,
-        Bytes::from(c1_2_bytes_32_to_64())
+        Bytes(Vec::from(c1_2_bytes_32_to_64()))
     );
     assert_eq!(
         dto.coordinates.confirmation_tag,
-        Bytes::from(c1_2_bytes_64_to_96())
+        Bytes(Vec::from(c1_2_bytes_64_to_96()))
     );
     assert_eq!(dto.coordinates.lifecycle.as_str(), "active");
     assert_eq!(dto.leaves.len(), 1);
@@ -8447,29 +8484,29 @@ fn c1_2_active_conversation_state_projects_complete_dto() {
     let snapshot = &dto.metadata_snapshot;
     assert_eq!(
         snapshot.coordinate.conversation_id,
-        Bytes::from(c1_2_bytes_0_to_16())
+        Bytes(Vec::from(c1_2_bytes_0_to_16()))
     );
     assert_eq!(snapshot.coordinate.generation, 0);
     assert_eq!(
         snapshot.coordinate.group_id,
-        Bytes::from(c1_2_bytes_0_to_32())
+        Bytes(Vec::from(c1_2_bytes_0_to_32()))
     );
     assert_eq!(snapshot.coordinate.epoch, 1);
     assert_eq!(
         snapshot.coordinate.group_context_hash,
-        Bytes::from(c1_2_bytes_32_to_64())
+        Bytes(Vec::from(c1_2_bytes_32_to_64()))
     );
     assert_eq!(
         snapshot.coordinate.confirmation_tag,
-        Bytes::from(c1_2_bytes_64_to_96())
+        Bytes(Vec::from(c1_2_bytes_64_to_96()))
     );
     assert_eq!(snapshot.origin_transition_id.as_str(), C1_2_TRANSITION_ID_1);
     assert_eq!(snapshot.metadata_version, 1);
-    assert_eq!(snapshot.nonce, Bytes::from(c1_2_nonce_12()));
-    assert_eq!(snapshot.ciphertext, Bytes::from(c1_2_bytes_0_to_64()));
+    assert_eq!(snapshot.nonce, Bytes(Vec::from(c1_2_nonce_12())));
+    assert_eq!(snapshot.ciphertext, Bytes(Vec::from(c1_2_bytes_0_to_64())));
     assert_eq!(
         snapshot.ciphertext_sha256,
-        Bytes::from(c1_2_bytes_0_to_32())
+        Bytes(Vec::from(c1_2_bytes_0_to_32()))
     );
     assert_eq!(snapshot.ciphertext_size, 64);
     assert_eq!(snapshot.author_proof.author_did.as_str(), C1_2_DID_A);
@@ -8480,7 +8517,7 @@ fn c1_2_active_conversation_state_projects_complete_dto() {
     assert_eq!(snapshot.author_proof.author_key_id.as_str(), C1_2_KEY_ID);
     assert_eq!(
         snapshot.author_proof.signature_public_key,
-        Bytes::from(c1_2_bytes_32_to_64())
+        Bytes(Vec::from(c1_2_bytes_32_to_64()))
     );
     assert_eq!(snapshot.author_proof.auth_generation_at_origin, 1);
     assert_eq!(
@@ -8664,16 +8701,16 @@ fn c1_2_close_tombstone_projects_and_state_view_refuses() {
     assert_eq!(tombstone.retired.state_version, 3);
     assert_eq!(
         tombstone.retired.group_id,
-        Bytes::from(c1_2_bytes_0_to_32())
+        Bytes(Vec::from(c1_2_bytes_0_to_32()))
     );
     assert_eq!(tombstone.retired.epoch, 1);
     assert_eq!(
         tombstone.retired.group_context_hash,
-        Bytes::from(c1_2_bytes_32_to_64())
+        Bytes(Vec::from(c1_2_bytes_32_to_64()))
     );
     assert_eq!(
         tombstone.retired.confirmation_tag,
-        Bytes::from(c1_2_bytes_64_to_96())
+        Bytes(Vec::from(c1_2_bytes_64_to_96()))
     );
     assert_eq!(tombstone.retired.lifecycle.as_str(), "active");
     assert_eq!(tombstone.terminal_seq, 9);
@@ -8699,20 +8736,23 @@ fn c1_2_pending_welcome_projects_complete_dto() {
     );
     assert_eq!(dto.coordinates.generation, 0);
     assert_eq!(dto.coordinates.state_version, 3);
-    assert_eq!(dto.coordinates.group_id, Bytes::from(c1_2_bytes_0_to_32()));
+    assert_eq!(
+        dto.coordinates.group_id,
+        Bytes(Vec::from(c1_2_bytes_0_to_32()))
+    );
     assert_eq!(dto.coordinates.epoch, 1);
     assert_eq!(
         dto.coordinates.group_context_hash,
-        Bytes::from(c1_2_bytes_32_to_64())
+        Bytes(Vec::from(c1_2_bytes_32_to_64()))
     );
     assert_eq!(
         dto.coordinates.confirmation_tag,
-        Bytes::from(c1_2_bytes_64_to_96())
+        Bytes(Vec::from(c1_2_bytes_64_to_96()))
     );
     assert_eq!(dto.coordinates.lifecycle.as_str(), "active");
     assert_eq!(dto.status.as_str(), "pending");
-    assert_eq!(dto.opaque_welcome, Bytes::from(c1_2_welcome_bytes()));
-    assert_eq!(dto.sha256, Bytes::from(c1_2_bytes_0_to_32()));
+    assert_eq!(dto.opaque_welcome, Bytes(Vec::from(c1_2_welcome_bytes())));
+    assert_eq!(dto.sha256, Bytes(Vec::from(c1_2_bytes_0_to_32())));
     assert_eq!(dto.recipient_did.as_str(), C1_2_DID_A);
     assert_eq!(dto.recipient_device_id.as_str(), C1_2_DEVICE_ID_A);
     assert_eq!(
@@ -8721,7 +8761,7 @@ fn c1_2_pending_welcome_projects_complete_dto() {
     );
     assert_eq!(
         dto.provenance.key_package_ref,
-        Bytes::from(c1_2_bytes_64_to_96())
+        Bytes(Vec::from(c1_2_bytes_64_to_96()))
     );
     assert_eq!(dto.expires_at.as_str(), C1_2_EXPIRES_AT);
     assert!(dto.extra_data.is_none());
@@ -8762,7 +8802,7 @@ fn c1_2_every_retained_leaf_recovery_status_projects_complete_view() {
         assert_eq!(reservation.requester_auth_generation, 1);
         assert_eq!(
             reservation.key_package_ref,
-            Bytes::from(c1_2_bytes_64_to_96())
+            Bytes(Vec::from(c1_2_bytes_64_to_96()))
         );
         assert_eq!(reservation.cipher_suite.as_str(), C1_2_CIPHER_SUITE);
         assert_eq!(reservation.purpose.as_str(), "leafRecovery");
@@ -8775,15 +8815,15 @@ fn c1_2_every_retained_leaf_recovery_status_projects_complete_view() {
         assert_eq!(reservation.key_package.content_type.as_str(), "keyPackage");
         assert_eq!(
             reservation.key_package.bytes,
-            Bytes::from(c1_2_bytes_0_to_32())
+            Bytes(Vec::from(c1_2_bytes_0_to_32()))
         );
         assert_eq!(
             reservation.key_package.sha256,
-            Bytes::from(c1_2_bytes_32_to_64())
+            Bytes(Vec::from(c1_2_bytes_32_to_64()))
         );
         assert_eq!(
             reservation.key_package.key_package_ref,
-            Bytes::from(c1_2_bytes_64_to_96())
+            Bytes(Vec::from(c1_2_bytes_64_to_96()))
         );
         assert!(reservation.extra_data.is_none());
         assert!(dto.extra_data.is_none());
@@ -8812,8 +8852,8 @@ fn c1_2_all_recovery_work_variants_project_with_consistent_status() {
     assert!(pending_view.extra_data.is_none());
 
     let completed = c1_2_work_source(RetainedRecoveryWorkTerminal::CompletedByTransition {
-        terminal_transition_id: SmolStr::from(C1_2_TRANSITION_ID_1),
-        terminal_at: SmolStr::from(C1_2_TERMINAL_AT_1),
+        terminal_transition_id: String::from(C1_2_TRANSITION_ID_1),
+        terminal_at: String::from(C1_2_TERMINAL_AT_1),
     });
     let dto = recovery_work(&completed).expect("completed work projects");
     let chat_dto::RecoveryWorkView::RecoveryWorkCompletedByTransitionView(completed_view) = &dto
@@ -8830,8 +8870,8 @@ fn c1_2_all_recovery_work_variants_project_with_consistent_status() {
 
     let superseded_by_transition =
         c1_2_work_source(RetainedRecoveryWorkTerminal::SupersededByTransition {
-            terminal_transition_id: SmolStr::from(C1_2_TRANSITION_ID_2),
-            terminal_at: SmolStr::from(C1_2_TERMINAL_AT_2),
+            terminal_transition_id: String::from(C1_2_TRANSITION_ID_2),
+            terminal_at: String::from(C1_2_TERMINAL_AT_2),
         });
     let dto = recovery_work(&superseded_by_transition).expect("superseded-by-transition projects");
     let chat_dto::RecoveryWorkView::RecoveryWorkSupersededByTransitionView(superseded_view) = &dto
@@ -8848,8 +8888,8 @@ fn c1_2_all_recovery_work_variants_project_with_consistent_status() {
 
     let superseded_by_revocation =
         c1_2_work_source(RetainedRecoveryWorkTerminal::SupersededByRevocation {
-            terminal_revocation_id: SmolStr::from(C1_2_REVOCATION_ID),
-            terminal_at: SmolStr::from(C1_2_TERMINAL_AT_3),
+            terminal_revocation_id: String::from(C1_2_REVOCATION_ID),
+            terminal_at: String::from(C1_2_TERMINAL_AT_3),
         });
     let dto = recovery_work(&superseded_by_revocation).expect("superseded-by-revocation projects");
     let chat_dto::RecoveryWorkView::RecoveryWorkSupersededByRevocationView(superseded_view) = &dto
@@ -8875,22 +8915,22 @@ fn c1_2_leaf_recovery_inbox_input_covers_exactly_five_variants() {
         .expect("pending work inbox input"),
         LeafRecoveryInboxInput::recovery_work_completed_by_transition(c1_2_work_source(
             RetainedRecoveryWorkTerminal::CompletedByTransition {
-                terminal_transition_id: SmolStr::from(C1_2_TRANSITION_ID_1),
-                terminal_at: SmolStr::from(C1_2_TERMINAL_AT_1),
+                terminal_transition_id: String::from(C1_2_TRANSITION_ID_1),
+                terminal_at: String::from(C1_2_TERMINAL_AT_1),
             },
         ))
         .expect("completed work inbox input"),
         LeafRecoveryInboxInput::recovery_work_superseded_by_transition(c1_2_work_source(
             RetainedRecoveryWorkTerminal::SupersededByTransition {
-                terminal_transition_id: SmolStr::from(C1_2_TRANSITION_ID_2),
-                terminal_at: SmolStr::from(C1_2_TERMINAL_AT_2),
+                terminal_transition_id: String::from(C1_2_TRANSITION_ID_2),
+                terminal_at: String::from(C1_2_TERMINAL_AT_2),
             },
         ))
         .expect("superseded-by-transition work inbox input"),
         LeafRecoveryInboxInput::recovery_work_superseded_by_revocation(c1_2_work_source(
             RetainedRecoveryWorkTerminal::SupersededByRevocation {
-                terminal_revocation_id: SmolStr::from(C1_2_REVOCATION_ID),
-                terminal_at: SmolStr::from(C1_2_TERMINAL_AT_3),
+                terminal_revocation_id: String::from(C1_2_REVOCATION_ID),
+                terminal_at: String::from(C1_2_TERMINAL_AT_3),
             },
         ))
         .expect("superseded-by-revocation work inbox input"),
@@ -8943,7 +8983,7 @@ fn c1_2_leaf_recovery_inbox_input_covers_exactly_five_variants() {
     }
 }
 
-fn item_has_no_extra_data(item: &chat_dto::LeafRecoveryInboxItem<DefaultStr>) -> bool {
+fn item_has_no_extra_data(item: &chat_dto::LeafRecoveryInboxItem) -> bool {
     match item {
         chat_dto::LeafRecoveryInboxItem::LeafRecoveryView(view) => view.extra_data.is_none(),
         chat_dto::LeafRecoveryInboxItem::RecoveryWorkPendingView(view) => view.extra_data.is_none(),
@@ -8962,8 +9002,8 @@ fn item_has_no_extra_data(item: &chat_dto::LeafRecoveryInboxItem<DefaultStr>) ->
 #[test]
 fn c1_2_inbox_rejects_wrong_terminal_shape_before_materialization() {
     let completed_source = c1_2_work_source(RetainedRecoveryWorkTerminal::CompletedByTransition {
-        terminal_transition_id: SmolStr::from(C1_2_TRANSITION_ID_1),
-        terminal_at: SmolStr::from(C1_2_TERMINAL_AT_1),
+        terminal_transition_id: String::from(C1_2_TRANSITION_ID_1),
+        terminal_at: String::from(C1_2_TERMINAL_AT_1),
     });
     let error = LeafRecoveryInboxInput::recovery_work_pending(completed_source)
         .err()
@@ -8978,8 +9018,8 @@ fn c1_2_inbox_rejects_wrong_terminal_shape_before_materialization() {
 
     let revocation_source =
         c1_2_work_source(RetainedRecoveryWorkTerminal::SupersededByRevocation {
-            terminal_revocation_id: SmolStr::from(C1_2_REVOCATION_ID),
-            terminal_at: SmolStr::from(C1_2_TERMINAL_AT_3),
+            terminal_revocation_id: String::from(C1_2_REVOCATION_ID),
+            terminal_at: String::from(C1_2_TERMINAL_AT_3),
         });
     let error = LeafRecoveryInboxInput::recovery_work_superseded_by_transition(revocation_source)
         .err()
@@ -8989,8 +9029,8 @@ fn c1_2_inbox_rejects_wrong_terminal_shape_before_materialization() {
     // Direct variant construction bypasses the checked constructor; the
     // projection's own re-check still fails before materialization.
     let completed_source = c1_2_work_source(RetainedRecoveryWorkTerminal::CompletedByTransition {
-        terminal_transition_id: SmolStr::from(C1_2_TRANSITION_ID_1),
-        terminal_at: SmolStr::from(C1_2_TERMINAL_AT_1),
+        terminal_transition_id: String::from(C1_2_TRANSITION_ID_1),
+        terminal_at: String::from(C1_2_TERMINAL_AT_1),
     });
     let input = LeafRecoveryInboxInput::RecoveryWorkPendingView(completed_source);
     let error = leaf_recovery_inbox_item(input)
@@ -9233,8 +9273,8 @@ fn c1_2_checked_constructors_reject_invalid_values_before_materialization() {
         c1_2_coordinates(),
         C1_2_CREATED_AT,
         RetainedRecoveryWorkTerminal::SupersededByRevocation {
-            terminal_revocation_id: SmolStr::from(C1_2_REVOCATION_ID),
-            terminal_at: SmolStr::from("2026-08-04T13:00:00Z"),
+            terminal_revocation_id: String::from(C1_2_REVOCATION_ID),
+            terminal_at: String::from("2026-08-04T13:00:00Z"),
         },
     )
     .err()
@@ -9287,7 +9327,7 @@ macro_rules! impl_c1_2_canonical_probe {
                     chat_protocol::read_projection::CanonicalChatJsonV1,
                     chat_protocol::read_projection::ProjectionError,
                 > {
-                    chat_protocol::read_projection::encode_canonical_generated_chat_json_v1(
+                    chat_protocol::read_projection::encode_canonical_petrel_chat_json_v1(
                         self, $def,
                     )
                 }
@@ -9297,12 +9337,12 @@ macro_rules! impl_c1_2_canonical_probe {
 }
 
 impl_c1_2_canonical_probe!(
-    chat_dto::ConversationState<DefaultStr> => "blue.catbird.chat.defs#conversationState",
-    chat_dto::ConversationInventoryItem<DefaultStr> => "blue.catbird.chat.defs#conversationInventoryItem",
-    chat_dto::WelcomeView<DefaultStr> => "blue.catbird.chat.defs#welcomeView",
-    chat_dto::LeafRecoveryView<DefaultStr> => "blue.catbird.chat.defs#leafRecoveryView",
-    chat_dto::RecoveryWorkView<DefaultStr> => "blue.catbird.chat.defs#recoveryWorkView",
-    chat_dto::LeafRecoveryInboxItem<DefaultStr> => "blue.catbird.chat.defs#leafRecoveryInboxItem",
+    chat_dto::ConversationState => "blue.catbird.chat.defs#conversationState",
+    chat_dto::ConversationInventoryItem => "blue.catbird.chat.defs#conversationInventoryItem",
+    chat_dto::WelcomeView => "blue.catbird.chat.defs#welcomeView",
+    chat_dto::LeafRecoveryView => "blue.catbird.chat.defs#leafRecoveryView",
+    chat_dto::RecoveryWorkView => "blue.catbird.chat.defs#recoveryWorkView",
+    chat_dto::LeafRecoveryInboxItem => "blue.catbird.chat.defs#leafRecoveryInboxItem",
 );
 
 #[test]

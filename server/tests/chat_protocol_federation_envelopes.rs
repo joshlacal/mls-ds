@@ -1,6 +1,6 @@
 //! Integration and unit test suite for clean federation envelopes, digests, and receipts.
 
-use catbird_atproto::generated::blue_catbird::mlsDS::{EntryLocatorV1, EnvelopeHeaderV1};
+use catbird_server::blue_catbird::mls_ds::{EntryLocatorV1, EnvelopeHeaderV1};
 use chrono::Utc;
 use p256::ecdsa::SigningKey;
 use uuid::Uuid;
@@ -22,40 +22,40 @@ fn test_signer(did: &str) -> (AckSigner, p256::ecdsa::VerifyingKey) {
 
 fn sample_header() -> EnvelopeHeaderV1 {
     EnvelopeHeaderV1 {
-        protocol_version: jacquard_common::deps::smol_str::SmolStr::from("1"),
-        received_at: catbird_server::sqlx_jacquard::chrono_to_canonical_datetime(chrono::Utc::now()),
-        delivery_id: jacquard_common::deps::smol_str::SmolStr::from(
+        protocol_version: catbird_server::blue_catbird::mls_ds::ProtocolVersion::Value1,
+        received_at: catbird_server::atproto_conv::chrono_to_canonical_datetime(chrono::Utc::now()),
+        delivery_id: String::from(
             Uuid::new_v4().hyphenated().to_string(),
         ),
-        conversation_id: jacquard_common::deps::smol_str::SmolStr::from(
+        conversation_id: String::from(
             Uuid::new_v4().hyphenated().to_string(),
         ),
-        sender_ds_did: jacquard_common::types::string::Did::new_owned(
+        sender_ds_did: petrel_core::Did::parse(
             "did:web:ds1.example.com".to_string(),
         )
         .unwrap(),
-        receiver_ds_did: jacquard_common::types::string::Did::new_owned(
+        receiver_ds_did: petrel_core::Did::parse(
             "did:web:ds2.example.com".to_string(),
         )
         .unwrap(),
-        sequencer_did: jacquard_common::types::string::Did::new_owned(
+        sequencer_did: petrel_core::Did::parse(
             "did:web:ds1.example.com".to_string(),
         )
         .unwrap(),
         sequencer_term: 1,
-        payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[42u8; 32]),
+        payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[42u8; 32])),
         extra_data: None,
     }
 }
 
 fn sample_locator() -> EntryLocatorV1 {
     EntryLocatorV1 {
-        entry_id: jacquard_common::deps::smol_str::SmolStr::from(
+        entry_id: String::from(
             Uuid::new_v4().hyphenated().to_string(),
         ),
         seq: 1,
-        accepted_payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[1u8; 32]),
-        outer_entry_fingerprint: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[2u8; 32]),
+        accepted_payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[1u8; 32])),
+        outer_entry_fingerprint: petrel_core::Bytes(<[u8]>::to_vec(&[2u8; 32])),
         extra_data: None,
     }
 }
@@ -74,7 +74,8 @@ fn test_envelope_header_validation_positive() {
 #[test]
 fn test_envelope_header_validation_negative_version() {
     let mut header = sample_header();
-    header.protocol_version = jacquard_common::deps::smol_str::SmolStr::from("2");
+    header.protocol_version =
+        catbird_server::blue_catbird::mls_ds::ProtocolVersion::Unknown("2".into());
     let err = validate_envelope_header(&header).expect_err("version != 1 must fail");
     assert!(matches!(err, FederationError::InvalidEnvelope { .. }));
 }
@@ -82,7 +83,7 @@ fn test_envelope_header_validation_negative_version() {
 #[test]
 fn test_envelope_header_validation_negative_uuid() {
     let mut header = sample_header();
-    header.delivery_id = jacquard_common::deps::smol_str::SmolStr::from("not-a-uuid");
+    header.delivery_id = String::from("not-a-uuid");
     let err = validate_envelope_header(&header).expect_err("bad deliveryId must fail");
     assert!(matches!(err, FederationError::InvalidEnvelope { .. }));
 }
@@ -91,7 +92,7 @@ fn test_envelope_header_validation_negative_uuid() {
 fn test_envelope_header_validation_negative_did() {
     let mut header = sample_header();
     header.sender_ds_did =
-        jacquard_common::types::string::Did::new_owned("did:invalid:bad".to_string()).unwrap();
+        petrel_core::Did::parse("did:invalid:bad".to_string()).unwrap();
     let err = validate_envelope_header(&header).expect_err("bad DID must fail");
     assert!(matches!(err, FederationError::InvalidEnvelope { .. }));
 }
@@ -101,8 +102,8 @@ fn test_envelope_header_validation_negative_extra_data() {
     let mut header = sample_header();
     let mut extra = std::collections::BTreeMap::new();
     extra.insert(
-        jacquard_common::deps::smol_str::SmolStr::from("unknownField"),
-        jacquard_common::types::value::Data::Null,
+        String::from("unknownField"),
+        petrel_core::Value::Null,
     );
     header.extra_data = Some(extra);
     let err = validate_envelope_header(&header).expect_err("extra fields must fail");

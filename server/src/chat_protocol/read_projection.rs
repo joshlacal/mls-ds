@@ -37,9 +37,9 @@
 //   definition, re-encodes with this encoder, and requires byte-for-byte
 //   equality.
 //
-// The generated chat DTO surface serializes every byte field, including the
-// `ArtifactHash` and `IdentifierBytes` aliases, as `{"$bytes": <padded
-// base64>}`. The normalizer also accepts byte arrays and bare base64 strings
+// Petrel emits unpadded standard base64 in byte objects. The canonicalizer
+// restores the padded spelling before hashing or writing retained bytes.
+// The normalizer also accepts byte arrays and bare padded base64 strings
 // when validating compatibility input trees, but a v2 server must not be mixed with
 // pre-v2 retained sessions: replay serves retained bytes verbatim. Stop old
 // instances, wait the full 15-minute session TTL, and only then resume v2
@@ -51,16 +51,11 @@
 use std::{cmp::Ordering, collections::HashSet, fmt, sync::OnceLock};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use catbird_atproto::generated::blue_catbird::chat as chat_dto;
-use jacquard_common::deps::{bytes::Bytes, smol_str::SmolStr};
-use jacquard_common::types::string::Did;
-use jacquard_common::DefaultStr;
-use jacquard_lexicon::{
-    lexicon::{
-        LexArrayItem, LexObject, LexObjectProperty, LexRefUnion, LexStringFormat, LexUserType,
-        LexiconDoc,
-    },
-    schema::LexiconSchema,
+use catbird_server::blue_catbird::chat as chat_dto;
+use petrel_core::{Bytes, Did};
+use petrel_lexicon::{
+    LexArray, LexInteger, LexObject, LexRefUnion, LexString, LexStringFormat, LexiconDefinition,
+    LexiconDoc,
 };
 use serde::{
     de::{self, MapAccess, SeqAccess, Visitor},
@@ -137,8 +132,6 @@ pub(crate) enum ProjectionErrorKind {
     InvalidBytesForm,
     WrongValueType,
     StringEnumViolation,
-    StringConstViolation,
-    IntegerConstViolation,
     SchemaRecursionLimit,
     InputTooLarge,
     StoredBytesNotCanonical,
@@ -362,9 +355,14 @@ fn classify_parse_error(error: serde_json::Error) -> ProjectionError {
     ProjectionError::new(kind, "", "invalid strict canonical JSON")
 }
 
-fn chat_defs_doc() -> &'static LexiconDoc<'static> {
-    static DOC: OnceLock<LexiconDoc<'static>> = OnceLock::new();
-    DOC.get_or_init(|| <chat_dto::ConversationState<DefaultStr> as LexiconSchema>::lexicon_doc())
+fn chat_defs_doc() -> &'static LexiconDoc {
+    static DOC: OnceLock<LexiconDoc> = OnceLock::new();
+    DOC.get_or_init(|| {
+        LexiconDoc::from_json_bytes(include_bytes!(
+            "../../../lexicon/blue/catbird/chat/blue.catbird.chat.defs.json"
+        ))
+        .expect("embedded blue.catbird.chat.defs schema must parse")
+    })
 }
 
 fn split_definition_id(definition_id: &str) -> Result<&str, ProjectionError> {
@@ -409,7 +407,7 @@ fn field_path(path: &str, field: &str) -> String {
 /// `{"$bytes": <standard padded base64>}` objects and verifies datetimes are
 /// the checked canonical UTC text.
 fn normalize_def(
-    doc: &LexiconDoc<'static>,
+    doc: &LexiconDoc,
     def_name: &str,
     value: &CanonValue,
     depth: usize,
@@ -430,7 +428,7 @@ fn normalize_def(
         ));
     };
     match definition {
-        LexUserType::Object(object) => {
+        LexiconDefinition::Object(object) => {
             // Request proofs retain the exact signed body tag inside generated
             // DTO extra_data. Permit only these schema-selected identities;
             // an arbitrary or mismatched tag remains an unknown-field error.
@@ -473,13 +471,13 @@ fn normalize_def(
             }
             normalize_object(doc, object, value, depth, path)
         }
-        LexUserType::Union(union) => normalize_union(doc, union, value, depth, path),
-        LexUserType::String(string) => normalize_string(string, value, path),
-        LexUserType::Integer(integer) => normalize_integer(integer, value, path),
-        LexUserType::Boolean(_) => normalize_boolean(value, path),
-        LexUserType::Bytes(_) => normalize_bytes(value, path),
-        LexUserType::Array(array) => normalize_array(doc, array, value, depth, path),
-        LexUserType::Unknown(_) => match value {
+        LexiconDefinition::Union(union) => normalize_union(doc, union, value, depth, path),
+        LexiconDefinition::String(string) => normalize_string(string, value, path),
+        LexiconDefinition::Integer(integer) => normalize_integer(integer, value, path),
+        LexiconDefinition::Boolean(_) => normalize_boolean(value, path),
+        LexiconDefinition::Bytes(_) => normalize_bytes(value, path),
+        LexiconDefinition::Array(array) => normalize_array(doc, array, value, depth, path),
+        LexiconDefinition::Unknown(_) => match value {
             CanonValue::Null => Err(ProjectionError::new(
                 ProjectionErrorKind::InvalidNull,
                 path,
@@ -487,15 +485,7 @@ fn normalize_def(
             )),
             _ => Ok(value.clone()),
         },
-        LexUserType::Record(_)
-        | LexUserType::XrpcQuery(_)
-        | LexUserType::XrpcProcedure(_)
-        | LexUserType::XrpcSubscription(_)
-        | LexUserType::Blob(_)
-        | LexUserType::Token(_)
-        | LexUserType::CidLink(_)
-        | LexUserType::PermissionSet(_)
-        | LexUserType::Space(_) => Err(ProjectionError::new(
+        _ => Err(ProjectionError::new(
             ProjectionErrorKind::UnsupportedSchema,
             path,
             "definition type is not encodable by the canonical chat encoder",
@@ -504,8 +494,8 @@ fn normalize_def(
 }
 
 fn normalize_object(
-    doc: &LexiconDoc<'static>,
-    object: &LexObject<'static>,
+    doc: &LexiconDoc,
+    object: &LexObject,
     value: &CanonValue,
     depth: usize,
     path: &str,
@@ -564,15 +554,15 @@ fn normalize_object(
 }
 
 fn normalize_property(
-    doc: &LexiconDoc<'static>,
-    property: &LexObjectProperty<'static>,
+    doc: &LexiconDoc,
+    property: &LexiconDefinition,
     value: &CanonValue,
     depth: usize,
     path: &str,
 ) -> Result<CanonValue, ProjectionError> {
     match property {
-        LexObjectProperty::Ref(reference) => {
-            let Some(name) = resolve_ref_name(reference.r#ref.as_ref()) else {
+        LexiconDefinition::Ref(reference) => {
+            let Some(name) = resolve_ref_name(&reference.target) else {
                 return Err(ProjectionError::new(
                     ProjectionErrorKind::UnsupportedSchema,
                     path,
@@ -581,14 +571,14 @@ fn normalize_property(
             };
             normalize_def(doc, name, value, depth, path)
         }
-        LexObjectProperty::Union(union) => normalize_union(doc, union, value, depth, path),
-        LexObjectProperty::Bytes(_) => normalize_bytes(value, path),
-        LexObjectProperty::Array(array) => normalize_array(doc, array, value, depth, path),
-        LexObjectProperty::Object(object) => normalize_object(doc, object, value, depth, path),
-        LexObjectProperty::Boolean(_) => normalize_boolean(value, path),
-        LexObjectProperty::Integer(integer) => normalize_integer(integer, value, path),
-        LexObjectProperty::String(string) => normalize_string(string, value, path),
-        LexObjectProperty::Unknown(_) => match value {
+        LexiconDefinition::Union(union) => normalize_union(doc, union, value, depth, path),
+        LexiconDefinition::Bytes(_) => normalize_bytes(value, path),
+        LexiconDefinition::Array(array) => normalize_array(doc, array, value, depth, path),
+        LexiconDefinition::Object(object) => normalize_object(doc, object, value, depth, path),
+        LexiconDefinition::Boolean(_) => normalize_boolean(value, path),
+        LexiconDefinition::Integer(integer) => normalize_integer(integer, value, path),
+        LexiconDefinition::String(string) => normalize_string(string, value, path),
+        LexiconDefinition::Unknown(_) => match value {
             CanonValue::Null => Err(ProjectionError::new(
                 ProjectionErrorKind::InvalidNull,
                 path,
@@ -596,7 +586,7 @@ fn normalize_property(
             )),
             _ => Ok(value.clone()),
         },
-        LexObjectProperty::CidLink(_) | LexObjectProperty::Blob(_) => Err(ProjectionError::new(
+        _ => Err(ProjectionError::new(
             ProjectionErrorKind::UnsupportedSchema,
             path,
             "property type is not encodable by the canonical chat encoder",
@@ -605,8 +595,8 @@ fn normalize_property(
 }
 
 fn normalize_union(
-    doc: &LexiconDoc<'static>,
-    union: &LexRefUnion<'static>,
+    doc: &LexiconDoc,
+    union: &LexRefUnion,
     value: &CanonValue,
     depth: usize,
     path: &str,
@@ -645,7 +635,7 @@ fn normalize_union(
     let allowed = union
         .refs
         .iter()
-        .any(|reference| reference.as_ref().strip_prefix('#') == Some(variant));
+        .any(|reference| reference.strip_prefix('#') == Some(variant));
     if !allowed {
         return Err(ProjectionError::new(
             ProjectionErrorKind::UnknownUnionTag,
@@ -660,7 +650,7 @@ fn normalize_union(
             "union variant definition is missing",
         ));
     };
-    let LexUserType::Object(variant_object) = variant_definition else {
+    let LexiconDefinition::Object(variant_object) = variant_definition else {
         return Err(ProjectionError::new(
             ProjectionErrorKind::UnsupportedSchema,
             path,
@@ -697,7 +687,20 @@ fn normalize_bytes(value: &CanonValue, path: &str) -> Result<CanonValue, Project
         CanonValue::String(text) => text.as_str(),
         CanonValue::Object(entries) if entries.len() == 1 => {
             match (&entries[0].0[..], &entries[0].1) {
-                ("$bytes", CanonValue::String(text)) => text.as_str(),
+                ("$bytes", CanonValue::String(text)) => {
+                    let padded =
+                        catbird_server::atproto_conv::padded_chat_bytes(text).map_err(|_| {
+                            ProjectionError::new(
+                                ProjectionErrorKind::NonCanonicalBase64,
+                                path,
+                                "invalid standard base64 in byte object",
+                            )
+                        })?;
+                    return Ok(CanonValue::Object(vec![(
+                        "$bytes".into(),
+                        CanonValue::String(padded),
+                    )]));
+                }
                 _ => {
                     return Err(ProjectionError::new(
                         ProjectionErrorKind::InvalidBytesForm,
@@ -760,8 +763,8 @@ fn normalize_bytes(value: &CanonValue, path: &str) -> Result<CanonValue, Project
 }
 
 fn normalize_array(
-    doc: &LexiconDoc<'static>,
-    array: &jacquard_lexicon::lexicon::LexArray<'static>,
+    doc: &LexiconDoc,
+    array: &LexArray,
     value: &CanonValue,
     depth: usize,
     path: &str,
@@ -776,7 +779,7 @@ fn normalize_array(
     let mut output = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
         let item_path = field_path(path, &index.to_string());
-        output.push(normalize_array_item(
+        output.push(normalize_property(
             doc,
             &array.items,
             item,
@@ -787,48 +790,8 @@ fn normalize_array(
     Ok(CanonValue::Array(output))
 }
 
-fn normalize_array_item(
-    doc: &LexiconDoc<'static>,
-    item: &LexArrayItem<'static>,
-    value: &CanonValue,
-    depth: usize,
-    path: &str,
-) -> Result<CanonValue, ProjectionError> {
-    match item {
-        LexArrayItem::Ref(reference) => {
-            let Some(name) = resolve_ref_name(reference.r#ref.as_ref()) else {
-                return Err(ProjectionError::new(
-                    ProjectionErrorKind::UnsupportedSchema,
-                    path,
-                    "cross-document refs are not encodable here",
-                ));
-            };
-            normalize_def(doc, name, value, depth, path)
-        }
-        LexArrayItem::Union(union) => normalize_union(doc, union, value, depth, path),
-        LexArrayItem::Bytes(_) => normalize_bytes(value, path),
-        LexArrayItem::Object(object) => normalize_object(doc, object, value, depth, path),
-        LexArrayItem::Boolean(_) => normalize_boolean(value, path),
-        LexArrayItem::Integer(integer) => normalize_integer(integer, value, path),
-        LexArrayItem::String(string) => normalize_string(string, value, path),
-        LexArrayItem::Unknown(_) => match value {
-            CanonValue::Null => Err(ProjectionError::new(
-                ProjectionErrorKind::InvalidNull,
-                path,
-                "null is not permitted here",
-            )),
-            _ => Ok(value.clone()),
-        },
-        LexArrayItem::CidLink(_) | LexArrayItem::Blob(_) => Err(ProjectionError::new(
-            ProjectionErrorKind::UnsupportedSchema,
-            path,
-            "array item type is not encodable by the canonical chat encoder",
-        )),
-    }
-}
-
 fn normalize_string(
-    string: &jacquard_lexicon::lexicon::LexString<'static>,
+    string: &LexString,
     value: &CanonValue,
     path: &str,
 ) -> Result<CanonValue, ProjectionError> {
@@ -848,29 +811,14 @@ fn normalize_string(
             )
         })?;
     }
-    if let Some(enum_values) = &string.r#enum {
-        if !enum_values.iter().any(|value| value.as_ref() == text) {
-            return Err(ProjectionError::new(
-                ProjectionErrorKind::StringEnumViolation,
-                path,
-                "string is not a member of the definition's enum",
-            ));
-        }
-    }
-    if let Some(const_value) = &string.r#const {
-        if const_value.as_ref() != text {
-            return Err(ProjectionError::new(
-                ProjectionErrorKind::StringConstViolation,
-                path,
-                "string does not match the definition's const value",
-            ));
-        }
-    }
+    // The v1 canonicalizer validates the wire shape. Semantic enum and const
+    // checks belong to the checked projection sources, preserving the frozen
+    // encoder's accepted input when loading the full Petrel lexicon.
     Ok(value.clone())
 }
 
 fn normalize_integer(
-    integer: &jacquard_lexicon::lexicon::LexInteger<'static>,
+    integer: &LexInteger,
     value: &CanonValue,
     path: &str,
 ) -> Result<CanonValue, ProjectionError> {
@@ -896,15 +844,6 @@ fn normalize_integer(
                 ProjectionErrorKind::IntegerOutOfRange,
                 path,
                 "integer exceeds the definition's maximum",
-            ));
-        }
-    }
-    if let Some(const_value) = integer.r#const {
-        if *number != const_value {
-            return Err(ProjectionError::new(
-                ProjectionErrorKind::IntegerConstViolation,
-                path,
-                "integer does not match the definition's const value",
             ));
         }
     }
@@ -1013,7 +952,7 @@ fn write_canonical_string(out: &mut Vec<u8>, text: &str) {
 /// normalization of the same tree the encoder itself writes; a writer that
 /// emitted anything non-canonical or denormalized is caught here.
 fn stored_byte_validation(
-    doc: &LexiconDoc<'static>,
+    doc: &LexiconDoc,
     def_name: &str,
     canonical: &[u8],
 ) -> Result<(), ProjectionError> {
@@ -1043,9 +982,46 @@ pub(crate) fn encode_canonical_generated_chat_json_v1<T: Serialize>(
     dto: &T,
     definition_id: &'static str,
 ) -> Result<CanonicalChatJsonV1, ProjectionError> {
+    encode_canonical_chat_json(dto, definition_id, |_| Ok(()))
+}
+
+/// Petrel ignores extension keys that collide with populated typed fields.
+/// Round-trip the generated DTO to reject a lost field at any nesting depth
+/// before writing or hashing a closed projection.
+pub(crate) fn encode_canonical_petrel_chat_json_v1<T>(
+    dto: &T,
+    definition_id: &'static str,
+) -> Result<CanonicalChatJsonV1, ProjectionError>
+where
+    T: Serialize + serde::de::DeserializeOwned + PartialEq,
+{
+    encode_canonical_chat_json(dto, definition_id, |bytes| {
+        let decoded: T = serde_json::from_slice(bytes).map_err(|_| {
+            ProjectionError::new(
+                ProjectionErrorKind::SerializationFailed,
+                "",
+                "generated DTO round-trip failed",
+            )
+        })?;
+        if decoded != *dto {
+            return Err(ProjectionError::new(
+                ProjectionErrorKind::DuplicateKey,
+                "",
+                "generated extension collides with a declared field",
+            ));
+        }
+        Ok(())
+    })
+}
+
+fn encode_canonical_chat_json<T: Serialize>(
+    dto: &T,
+    definition_id: &'static str,
+    check_dto: impl FnOnce(&[u8]) -> Result<(), ProjectionError>,
+) -> Result<CanonicalChatJsonV1, ProjectionError> {
     let def_name = split_definition_id(definition_id)?;
     let doc = chat_defs_doc();
-    if doc.id.as_ref() != CHAT_NSID {
+    if doc.id != CHAT_NSID {
         return Err(ProjectionError::new(
             ProjectionErrorKind::UnsupportedSchema,
             "",
@@ -1067,6 +1043,7 @@ pub(crate) fn encode_canonical_generated_chat_json_v1<T: Serialize>(
         ));
     }
     let tree = parse_strict_canonical_json(&bytes)?;
+    check_dto(&bytes)?;
     let normalized = normalize_def(doc, def_name, &tree, 0, "")?;
     let mut canonical = Vec::with_capacity(bytes.len() + bytes.len() / 8);
     write_canonical_value(&mut canonical, &normalized);
@@ -1081,9 +1058,7 @@ pub(crate) fn encode_canonical_generated_chat_json_v1<T: Serialize>(
 // ============================================================================
 // C1-2: checked projection source types and the six projection functions.
 //
-// The generated lexicon doc drops enum/const constraints (verified: zero
-// r#enum/r#const in the generated doc), so THESE checked sources are the sole
-// guarantee of status/value correctness: every constructor validates the
+// Checked sources enforce protocol constraints before serialization. Constructors validate the
 // closed enum vocabulary, the canonical UTC datetime text, safe integer
 // bounds, the exact pinned byte lengths, strict input ordering, and the
 // cross-field consistency rules of the DTO documentation BEFORE any DTO is
@@ -1160,9 +1135,13 @@ fn checked_nonempty(value: &str, path: &str) -> Result<(), ProjectionError> {
     Ok(())
 }
 
-fn checked_enum(value: &str, allowed: &[&str], path: &str) -> Result<(), ProjectionError> {
+fn checked_enum<T: std::str::FromStr<Err = std::convert::Infallible>>(
+    value: &str,
+    allowed: &[&str],
+    path: &str,
+) -> Result<T, ProjectionError> {
     if allowed.contains(&value) {
-        Ok(())
+        Ok(catbird_server::atproto_conv::open_enum(value))
     } else {
         Err(ProjectionError::new(
             ProjectionErrorKind::StringEnumViolation,
@@ -1172,14 +1151,19 @@ fn checked_enum(value: &str, allowed: &[&str], path: &str) -> Result<(), Project
     }
 }
 
-fn checked_datetime(value: &str, path: &str) -> Result<(), ProjectionError> {
-    CanonicalTimestamp::parse(value).map(|_| ()).map_err(|_| {
+fn checked_datetime(
+    value: &str,
+    path: &str,
+) -> Result<chat_dto::CanonicalDatetime, ProjectionError> {
+    let invalid = || {
         ProjectionError::new(
             ProjectionErrorKind::InvalidDatetime,
             path,
             "datetime is not the checked canonical UTC text",
         )
-    })
+    };
+    CanonicalTimestamp::parse(value).map_err(|_| invalid())?;
+    chat_dto::CanonicalDatetime::parse(value).map_err(|_| invalid())
 }
 
 fn checked_sequence(value: i64, minimum: i64, path: &str) -> Result<(), ProjectionError> {
@@ -1204,8 +1188,8 @@ fn checked_exact_bytes(value: &[u8], expected: usize, path: &str) -> Result<(), 
     Ok(())
 }
 
-fn checked_did(value: &str, path: &str) -> Result<Did<SmolStr>, ProjectionError> {
-    Did::new(SmolStr::from(value)).map_err(|_| {
+fn checked_did(value: &str, path: &str) -> Result<Did, ProjectionError> {
+    Did::parse(value).map_err(|_| {
         ProjectionError::new(
             ProjectionErrorKind::InvalidDid,
             path,
@@ -1221,14 +1205,14 @@ fn source_inconsistency(path: &str, reason: &'static str) -> ProjectionError {
 /// Checked conversation coordinates (`blue.catbird.chat.defs#conversationCoordinates`).
 #[derive(Eq, PartialEq)]
 pub(crate) struct CheckedConversationCoordinates {
-    conversation_id: SmolStr,
+    conversation_id: String,
     generation: i64,
     state_version: i64,
     group_id: Bytes,
     epoch: i64,
     group_context_hash: Bytes,
     confirmation_tag: Bytes,
-    lifecycle: SmolStr,
+    lifecycle: chat_dto::Lifecycle,
 }
 
 impl CheckedConversationCoordinates {
@@ -1246,29 +1230,29 @@ impl CheckedConversationCoordinates {
         checked_sequence(generation, 0, "coordinates.generation")?;
         checked_sequence(state_version, 0, "coordinates.stateVersion")?;
         checked_sequence(epoch, 0, "coordinates.epoch")?;
-        checked_enum(
+        let checked_lifecycle = checked_enum(
             lifecycle,
             &[LIFECYCLE_ACTIVE, LIFECYCLE_SUPERSEDED],
             "coordinates.lifecycle",
         )?;
         Ok(Self {
-            conversation_id: SmolStr::from(conversation_id),
+            conversation_id: String::from(conversation_id),
             generation,
             state_version,
-            group_id: Bytes::copy_from_slice(group_id),
+            group_id: Bytes(group_id.to_vec()),
             epoch,
-            group_context_hash: Bytes::copy_from_slice(group_context_hash),
-            confirmation_tag: Bytes::copy_from_slice(confirmation_tag),
-            lifecycle: SmolStr::from(lifecycle),
+            group_context_hash: Bytes(group_context_hash.to_vec()),
+            confirmation_tag: Bytes(confirmation_tag.to_vec()),
+            lifecycle: checked_lifecycle,
         })
     }
 }
 
 /// Checked invitation provenance (`blue.catbird.chat.defs#invitationProvenance`).
 pub(crate) struct CheckedInvitationProvenance {
-    invitation_transition_id: SmolStr,
-    invited_by_did: Did<SmolStr>,
-    invited_by_device_id: SmolStr,
+    invitation_transition_id: String,
+    invited_by_did: Did,
+    invited_by_device_id: String,
 }
 
 impl CheckedInvitationProvenance {
@@ -1286,9 +1270,9 @@ impl CheckedInvitationProvenance {
             "invitationProvenance.invitedByDeviceId",
         )?;
         Ok(Self {
-            invitation_transition_id: SmolStr::from(invitation_transition_id),
+            invitation_transition_id: String::from(invitation_transition_id),
             invited_by_did: checked_did(invited_by_did, "invitationProvenance.invitedByDid")?,
-            invited_by_device_id: SmolStr::from(invited_by_device_id),
+            invited_by_device_id: String::from(invited_by_device_id),
         })
     }
 }
@@ -1298,11 +1282,11 @@ impl CheckedInvitationProvenance {
 /// `genesis` forbids `joinKeyPackageRef`; `keyPackage` requires it (the
 /// consumed Add package's exact RefHash).
 pub(crate) struct CheckedDeviceLeafView {
-    user_did: Did<SmolStr>,
-    device_id: SmolStr,
-    leaf_origin: SmolStr,
-    key_id: SmolStr,
-    device_status: SmolStr,
+    user_did: Did,
+    device_id: String,
+    leaf_origin: chat_dto::LeafOrigin,
+    key_id: String,
+    device_status: chat_dto::DeviceStatus,
     join_key_package_ref: Option<Bytes>,
 }
 
@@ -1317,12 +1301,12 @@ impl CheckedDeviceLeafView {
     ) -> Result<Self, ProjectionError> {
         checked_nonempty(device_id, "leaf.deviceId")?;
         checked_nonempty(key_id, "leaf.keyId")?;
-        checked_enum(
+        let checked_leaf_origin = checked_enum(
             leaf_origin,
             &[LEAF_ORIGIN_GENESIS, LEAF_ORIGIN_KEY_PACKAGE],
             "leaf.leafOrigin",
         )?;
-        checked_enum(
+        let checked_device_status = checked_enum(
             device_status,
             &[DEVICE_STATUS_ACTIVE, DEVICE_STATUS_REVOKED],
             "leaf.deviceStatus",
@@ -1340,14 +1324,14 @@ impl CheckedDeviceLeafView {
                     "a keyPackage leaf requires joinKeyPackageRef",
                 ))
             }
-            (_, bytes) => bytes.map(Bytes::copy_from_slice),
+            (_, bytes) => bytes.map(|value| Bytes(value.to_vec())),
         };
         Ok(Self {
             user_did: checked_did(user_did, "leaf.userDid")?,
-            device_id: SmolStr::from(device_id),
-            leaf_origin: SmolStr::from(leaf_origin),
-            key_id: SmolStr::from(key_id),
-            device_status: SmolStr::from(device_status),
+            device_id: String::from(device_id),
+            leaf_origin: checked_leaf_origin,
+            key_id: String::from(key_id),
+            device_status: checked_device_status,
             join_key_package_ref,
         })
     }
@@ -1359,9 +1343,9 @@ impl CheckedDeviceLeafView {
 /// provenance; a group pending participant is a member, the sole direct
 /// invitee is admin.
 pub(crate) struct CheckedParticipantView {
-    user_did: Did<SmolStr>,
-    role: SmolStr,
-    status: SmolStr,
+    user_did: Did,
+    role: chat_dto::MemberRole,
+    status: chat_dto::ParticipantStatus,
     leaf_count: i64,
     invitation_provenance: Option<CheckedInvitationProvenance>,
 }
@@ -1409,12 +1393,12 @@ impl CheckedParticipantView {
         leaf_count: i64,
         invitation_provenance: Option<CheckedInvitationProvenance>,
     ) -> Result<Self, ProjectionError> {
-        checked_enum(
+        let checked_role = checked_enum(
             role,
             &[MEMBER_ROLE_ADMIN, MEMBER_ROLE_MEMBER],
             "participant.role",
         )?;
-        checked_enum(
+        let checked_status = checked_enum(
             status,
             &[PARTICIPANT_STATUS_PENDING, PARTICIPANT_STATUS_ACTIVE],
             "participant.status",
@@ -1436,8 +1420,8 @@ impl CheckedParticipantView {
         }
         Ok(Self {
             user_did: checked_did(user_did, "participant.userDid")?,
-            role: SmolStr::from(role),
-            status: SmolStr::from(status),
+            role: checked_role,
+            status: checked_status,
             leaf_count,
             invitation_provenance,
         })
@@ -1446,15 +1430,15 @@ impl CheckedParticipantView {
 
 /// Checked metadata author proof (`blue.catbird.chat.defs#metadataAuthorProof`).
 pub(crate) struct CheckedMetadataAuthorProof {
-    author_did: Did<SmolStr>,
-    author_device_id: SmolStr,
-    author_key_id: SmolStr,
+    author_did: Did,
+    author_device_id: String,
+    author_key_id: String,
     signature_public_key: Bytes,
     auth_generation_at_origin: i64,
-    origin_transition_id: SmolStr,
+    origin_transition_id: String,
     origin_seq: i64,
-    role_at_origin: SmolStr,
-    device_status_at_origin: SmolStr,
+    role_at_origin: String,
+    device_status_at_origin: String,
 }
 
 impl CheckedMetadataAuthorProof {
@@ -1487,14 +1471,14 @@ impl CheckedMetadataAuthorProof {
         checked_nonempty(device_status_at_origin, "authorProof.deviceStatusAtOrigin")?;
         Ok(Self {
             author_did: checked_did(author_did, "authorProof.authorDid")?,
-            author_device_id: SmolStr::from(author_device_id),
-            author_key_id: SmolStr::from(author_key_id),
-            signature_public_key: Bytes::copy_from_slice(signature_public_key),
+            author_device_id: String::from(author_device_id),
+            author_key_id: String::from(author_key_id),
+            signature_public_key: Bytes(signature_public_key.to_vec()),
             auth_generation_at_origin,
-            origin_transition_id: SmolStr::from(origin_transition_id),
+            origin_transition_id: String::from(origin_transition_id),
             origin_seq,
-            role_at_origin: SmolStr::from(role_at_origin),
-            device_status_at_origin: SmolStr::from(device_status_at_origin),
+            role_at_origin: String::from(role_at_origin),
+            device_status_at_origin: String::from(device_status_at_origin),
         })
     }
 }
@@ -1504,10 +1488,10 @@ impl CheckedMetadataAuthorProof {
 /// The binding purpose is exactly `metadata`; an attachment-purpose upload
 /// cannot inhabit the metadata snapshot.
 pub(crate) struct CheckedMetadataAvatarBinding {
-    blob_id: SmolStr,
+    blob_id: String,
     ciphertext_sha256: Bytes,
     ciphertext_size: i64,
-    purpose: SmolStr,
+    purpose: String,
 }
 
 impl CheckedMetadataAvatarBinding {
@@ -1531,10 +1515,10 @@ impl CheckedMetadataAvatarBinding {
             ));
         }
         Ok(Self {
-            blob_id: SmolStr::from(blob_id),
-            ciphertext_sha256: Bytes::copy_from_slice(ciphertext_sha256),
+            blob_id: String::from(blob_id),
+            ciphertext_sha256: Bytes(ciphertext_sha256.to_vec()),
             ciphertext_size,
-            purpose: SmolStr::from(purpose),
+            purpose: String::from(purpose),
         })
     }
 }
@@ -1566,12 +1550,12 @@ impl CheckedMetadataCryptoContext {
         checked_sequence(generation, 0, "metadataCryptoContext.generation")?;
         checked_sequence(epoch, 0, "metadataCryptoContext.epoch")?;
         Ok(Self {
-            conversation_id: Bytes::copy_from_slice(conversation_id),
+            conversation_id: Bytes(conversation_id.to_vec()),
             generation,
-            group_id: Bytes::copy_from_slice(group_id),
+            group_id: Bytes(group_id.to_vec()),
             epoch,
-            group_context_hash: Bytes::copy_from_slice(group_context_hash),
-            confirmation_tag: Bytes::copy_from_slice(confirmation_tag),
+            group_context_hash: Bytes(group_context_hash.to_vec()),
+            confirmation_tag: Bytes(confirmation_tag.to_vec()),
         })
     }
 }
@@ -1579,7 +1563,7 @@ impl CheckedMetadataCryptoContext {
 /// Checked metadata snapshot (`blue.catbird.chat.defs#metadataSnapshot`).
 pub(crate) struct CheckedMetadataSnapshot {
     coordinate: CheckedMetadataCryptoContext,
-    origin_transition_id: SmolStr,
+    origin_transition_id: String,
     metadata_version: i64,
     nonce: Bytes,
     ciphertext: Bytes,
@@ -1613,11 +1597,11 @@ impl CheckedMetadataSnapshot {
         checked_sequence(ciphertext_size, 16, "metadataSnapshot.ciphertextSize")?;
         Ok(Self {
             coordinate,
-            origin_transition_id: SmolStr::from(origin_transition_id),
+            origin_transition_id: String::from(origin_transition_id),
             metadata_version,
-            nonce: Bytes::copy_from_slice(nonce),
-            ciphertext: Bytes::copy_from_slice(ciphertext),
-            ciphertext_sha256: Bytes::copy_from_slice(ciphertext_sha256),
+            nonce: Bytes(nonce.to_vec()),
+            ciphertext: Bytes(ciphertext.to_vec()),
+            ciphertext_sha256: Bytes(ciphertext_sha256.to_vec()),
             ciphertext_size,
             author_proof,
             avatar_binding,
@@ -1627,8 +1611,8 @@ impl CheckedMetadataSnapshot {
 
 /// Checked key-package artifact (`blue.catbird.chat.defs#keyPackageArtifact`).
 pub(crate) struct CheckedKeyPackageArtifact {
-    framing: SmolStr,
-    content_type: SmolStr,
+    framing: String,
+    content_type: String,
     bytes: Bytes,
     sha256: Bytes,
     key_package_ref: Bytes,
@@ -1651,29 +1635,29 @@ impl CheckedKeyPackageArtifact {
             "keyPackage.keyPackageRef",
         )?;
         Ok(Self {
-            framing: SmolStr::from(framing),
-            content_type: SmolStr::from(content_type),
-            bytes: Bytes::copy_from_slice(bytes),
-            sha256: Bytes::copy_from_slice(sha256),
-            key_package_ref: Bytes::copy_from_slice(key_package_ref),
+            framing: String::from(framing),
+            content_type: String::from(content_type),
+            bytes: Bytes(bytes.to_vec()),
+            sha256: Bytes(sha256.to_vec()),
+            key_package_ref: Bytes(key_package_ref.to_vec()),
         })
     }
 }
 
 /// Checked leaf-recovery reservation (`blue.catbird.chat.defs#leafRecoveryReservation`).
 pub(crate) struct CheckedLeafRecoveryReservation {
-    recovery_request_id: SmolStr,
-    conversation_id: SmolStr,
+    recovery_request_id: String,
+    conversation_id: String,
     bound_coordinate: CheckedConversationCoordinates,
-    requester_did: Did<SmolStr>,
-    requester_device_id: SmolStr,
-    requester_key_id: SmolStr,
+    requester_did: Did,
+    requester_device_id: String,
+    requester_key_id: String,
     requester_auth_generation: i64,
     key_package_ref: Bytes,
-    cipher_suite: SmolStr,
-    purpose: SmolStr,
-    status: SmolStr,
-    expires_at: SmolStr,
+    cipher_suite: chat_dto::CipherSuite,
+    purpose: String,
+    status: chat_dto::ReservationStatus,
+    expires_at: chat_dto::CanonicalDatetime,
     key_package: CheckedKeyPackageArtifact,
 }
 
@@ -1708,9 +1692,10 @@ impl CheckedLeafRecoveryReservation {
             EXACT_KEY_PACKAGE_REF_BYTES,
             "reservation.keyPackageRef",
         )?;
-        checked_enum(cipher_suite, &[CIPHER_SUITE_V1], "reservation.cipherSuite")?;
+        let checked_cipher_suite =
+            checked_enum(cipher_suite, &[CIPHER_SUITE_V1], "reservation.cipherSuite")?;
         checked_nonempty(purpose, "reservation.purpose")?;
-        checked_enum(
+        let checked_status = checked_enum(
             status,
             &[
                 RESERVATION_STATUS_ACTIVE,
@@ -1720,20 +1705,20 @@ impl CheckedLeafRecoveryReservation {
             ],
             "reservation.status",
         )?;
-        checked_datetime(expires_at, "reservation.expiresAt")?;
+        let expires_at = checked_datetime(expires_at, "reservation.expiresAt")?;
         Ok(Self {
-            recovery_request_id: SmolStr::from(recovery_request_id),
-            conversation_id: SmolStr::from(conversation_id),
+            recovery_request_id: String::from(recovery_request_id),
+            conversation_id: String::from(conversation_id),
             bound_coordinate,
             requester_did: checked_did(requester_did, "reservation.requesterDid")?,
-            requester_device_id: SmolStr::from(requester_device_id),
-            requester_key_id: SmolStr::from(requester_key_id),
+            requester_device_id: String::from(requester_device_id),
+            requester_key_id: String::from(requester_key_id),
             requester_auth_generation,
-            key_package_ref: Bytes::copy_from_slice(key_package_ref),
-            cipher_suite: SmolStr::from(cipher_suite),
-            purpose: SmolStr::from(purpose),
-            status: SmolStr::from(status),
-            expires_at: SmolStr::from(expires_at),
+            key_package_ref: Bytes(key_package_ref.to_vec()),
+            cipher_suite: checked_cipher_suite,
+            purpose: String::from(purpose),
+            status: checked_status,
+            expires_at,
             key_package,
         })
     }
@@ -1741,7 +1726,7 @@ impl CheckedLeafRecoveryReservation {
 
 /// Checked recovery-Welcome provenance (`blue.catbird.chat.defs#recoveryWelcomeProvenance`).
 pub(crate) struct CheckedWelcomeProvenance {
-    recovery_request_id: SmolStr,
+    recovery_request_id: String,
     key_package_ref: Bytes,
 }
 
@@ -1757,8 +1742,8 @@ impl CheckedWelcomeProvenance {
             "provenance.keyPackageRef",
         )?;
         Ok(Self {
-            recovery_request_id: SmolStr::from(recovery_request_id),
-            key_package_ref: Bytes::copy_from_slice(key_package_ref),
+            recovery_request_id: String::from(recovery_request_id),
+            key_package_ref: Bytes(key_package_ref.to_vec()),
         })
     }
 }
@@ -1774,40 +1759,40 @@ pub(crate) enum ConversationProjectionSource {
 }
 
 pub(crate) struct CheckedConversationState {
-    direct_request: Option<chat_dto::DirectRequestState<DefaultStr>>,
-    cipher_suite: SmolStr,
-    conversation_kind: SmolStr,
+    direct_request: Option<chat_dto::DirectRequestState>,
+    cipher_suite: chat_dto::CipherSuite,
+    conversation_kind: chat_dto::ConversationKind,
     coordinates: CheckedConversationCoordinates,
     leaves: Vec<CheckedDeviceLeafView>,
     metadata_snapshot: CheckedMetadataSnapshot,
     participants: Vec<CheckedParticipantView>,
-    sequencer_did: Did<SmolStr>,
+    sequencer_did: Did,
     sequencer_term: i64,
     snapshot_seq: i64,
 }
 
 pub(crate) struct CheckedConversationRemoval {
-    conversation_id: SmolStr,
-    user_did: Did<SmolStr>,
-    device_id: SmolStr,
-    membership_interval_id: SmolStr,
-    removed_at: SmolStr,
+    conversation_id: String,
+    user_did: Did,
+    device_id: String,
+    membership_interval_id: String,
+    removed_at: chat_dto::CanonicalDatetime,
     terminal_seq: i64,
 }
 
 pub(crate) struct CheckedConversationClose {
-    closed_at: SmolStr,
-    closed_by_did: Did<SmolStr>,
-    closed_by_device_id: SmolStr,
-    conversation_id: SmolStr,
-    conversation_kind: SmolStr,
+    closed_at: chat_dto::CanonicalDatetime,
+    closed_by_did: Did,
+    closed_by_device_id: String,
+    conversation_id: String,
+    conversation_kind: chat_dto::ConversationKind,
     retired: CheckedConversationCoordinates,
     terminal_seq: i64,
 }
 impl ConversationProjectionSource {
     pub(crate) fn with_direct_request(
         mut self,
-        request: chat_dto::DirectRequestState<DefaultStr>,
+        request: chat_dto::DirectRequestState,
     ) -> Result<Self, ProjectionError> {
         let Self::State(state) = &mut self else {
             return Err(source_inconsistency(
@@ -1815,7 +1800,7 @@ impl ConversationProjectionSource {
                 "request state requires conversation state",
             ));
         };
-        if state.conversation_kind != CONVERSATION_KIND_DIRECT {
+        if state.conversation_kind.as_str() != CONVERSATION_KIND_DIRECT {
             return Err(source_inconsistency(
                 "directRequest",
                 "request state requires direct conversation",
@@ -1836,8 +1821,8 @@ impl ConversationProjectionSource {
         sequencer_term: i64,
         snapshot_seq: i64,
     ) -> Result<Self, ProjectionError> {
-        checked_enum(cipher_suite, &[CIPHER_SUITE_V1], "cipherSuite")?;
-        checked_enum(
+        let checked_cipher_suite = checked_enum(cipher_suite, &[CIPHER_SUITE_V1], "cipherSuite")?;
+        let checked_conversation_kind = checked_enum(
             conversation_kind,
             &[CONVERSATION_KIND_DIRECT, CONVERSATION_KIND_GROUP],
             "conversationKind",
@@ -1867,8 +1852,8 @@ impl ConversationProjectionSource {
         }
         Ok(Self::State(CheckedConversationState {
             direct_request: None,
-            cipher_suite: SmolStr::from(cipher_suite),
-            conversation_kind: SmolStr::from(conversation_kind),
+            cipher_suite: checked_cipher_suite,
+            conversation_kind: checked_conversation_kind,
             coordinates,
             leaves,
             metadata_snapshot,
@@ -1890,14 +1875,14 @@ impl ConversationProjectionSource {
         checked_nonempty(conversation_id, "removal.conversationId")?;
         checked_nonempty(device_id, "removal.deviceId")?;
         checked_nonempty(membership_interval_id, "removal.membershipIntervalId")?;
-        checked_datetime(removed_at, "removal.removedAt")?;
+        let removed_at = checked_datetime(removed_at, "removal.removedAt")?;
         checked_sequence(terminal_seq, 1, "removal.terminalSeq")?;
         Ok(Self::Removal(CheckedConversationRemoval {
-            conversation_id: SmolStr::from(conversation_id),
+            conversation_id: String::from(conversation_id),
             user_did: checked_did(user_did, "removal.userDid")?,
-            device_id: SmolStr::from(device_id),
-            membership_interval_id: SmolStr::from(membership_interval_id),
-            removed_at: SmolStr::from(removed_at),
+            device_id: String::from(device_id),
+            membership_interval_id: String::from(membership_interval_id),
+            removed_at,
             terminal_seq,
         }))
     }
@@ -1911,10 +1896,10 @@ impl ConversationProjectionSource {
         retired: CheckedConversationCoordinates,
         terminal_seq: i64,
     ) -> Result<Self, ProjectionError> {
-        checked_datetime(closed_at, "close.closedAt")?;
+        let closed_at = checked_datetime(closed_at, "close.closedAt")?;
         checked_nonempty(closed_by_device_id, "close.closedByDeviceId")?;
         checked_nonempty(conversation_id, "close.conversationId")?;
-        checked_enum(
+        let checked_conversation_kind = checked_enum(
             conversation_kind,
             &[CONVERSATION_KIND_DIRECT, CONVERSATION_KIND_GROUP],
             "close.conversationKind",
@@ -1927,11 +1912,11 @@ impl ConversationProjectionSource {
             ));
         }
         Ok(Self::Close(CheckedConversationClose {
-            closed_at: SmolStr::from(closed_at),
+            closed_at,
             closed_by_did: checked_did(closed_by_did, "close.closedByDid")?,
-            closed_by_device_id: SmolStr::from(closed_by_device_id),
-            conversation_id: SmolStr::from(conversation_id),
-            conversation_kind: SmolStr::from(conversation_kind),
+            closed_by_device_id: String::from(closed_by_device_id),
+            conversation_id: String::from(conversation_id),
+            conversation_kind: checked_conversation_kind,
             retired,
             terminal_seq,
         }))
@@ -1945,17 +1930,17 @@ impl ConversationProjectionSource {
 /// `expiresAt` is the canonical UTC datetime representation of the exact
 /// consumed Add KeyPackage not_after Unix second.
 pub(crate) struct RetainedWelcomeProjectionSource {
-    welcome_id: SmolStr,
-    conversation_id: SmolStr,
+    welcome_id: String,
+    conversation_id: String,
     transition_seq: i64,
     coordinates: CheckedConversationCoordinates,
-    status: SmolStr,
+    status: chat_dto::WelcomeStatus,
     opaque_welcome: Bytes,
     sha256: Bytes,
-    recipient_did: Did<SmolStr>,
-    recipient_device_id: SmolStr,
+    recipient_did: Did,
+    recipient_device_id: String,
     provenance: CheckedWelcomeProvenance,
-    expires_at: SmolStr,
+    expires_at: chat_dto::CanonicalDatetime,
 }
 
 impl RetainedWelcomeProjectionSource {
@@ -1976,7 +1961,7 @@ impl RetainedWelcomeProjectionSource {
         checked_nonempty(welcome_id, "welcome.welcomeId")?;
         checked_nonempty(conversation_id, "welcome.conversationId")?;
         checked_sequence(transition_seq, 1, "welcome.transitionSeq")?;
-        checked_enum(
+        let checked_status = checked_enum(
             status,
             &[
                 WELCOME_STATUS_PENDING,
@@ -1989,7 +1974,7 @@ impl RetainedWelcomeProjectionSource {
         )?;
         checked_exact_bytes(sha256, EXACT_SHA256_BYTES, "welcome.sha256")?;
         checked_nonempty(recipient_device_id, "welcome.recipientDeviceId")?;
-        checked_datetime(expires_at, "welcome.expiresAt")?;
+        let expires_at = checked_datetime(expires_at, "welcome.expiresAt")?;
         if coordinates.conversation_id.as_str() != conversation_id {
             return Err(source_inconsistency(
                 "welcome.coordinates.conversationId",
@@ -1997,17 +1982,17 @@ impl RetainedWelcomeProjectionSource {
             ));
         }
         Ok(Self {
-            welcome_id: SmolStr::from(welcome_id),
-            conversation_id: SmolStr::from(conversation_id),
+            welcome_id: String::from(welcome_id),
+            conversation_id: String::from(conversation_id),
             transition_seq,
             coordinates,
-            status: SmolStr::from(status),
-            opaque_welcome: Bytes::copy_from_slice(opaque_welcome),
-            sha256: Bytes::copy_from_slice(sha256),
+            status: checked_status,
+            opaque_welcome: Bytes(opaque_welcome.to_vec()),
+            sha256: Bytes(sha256.to_vec()),
             recipient_did: checked_did(recipient_did, "welcome.recipientDid")?,
-            recipient_device_id: SmolStr::from(recipient_device_id),
+            recipient_device_id: String::from(recipient_device_id),
             provenance,
-            expires_at: SmolStr::from(expires_at),
+            expires_at,
         })
     }
 }
@@ -2019,17 +2004,17 @@ impl RetainedWelcomeProjectionSource {
 /// retained view status (open->active, fulfilled->consumed,
 /// cancelled->released, superseded->released, expired->expired).
 pub(crate) struct RetainedLeafRecoveryProjectionSource {
-    recovery_request_id: SmolStr,
-    conversation_id: SmolStr,
-    requester_did: Did<SmolStr>,
-    requester_device_id: SmolStr,
-    recovery_kind: SmolStr,
+    recovery_request_id: String,
+    conversation_id: String,
+    requester_did: Did,
+    requester_device_id: String,
+    recovery_kind: chat_dto::LeafRecoveryKind,
     bound_coordinate: CheckedConversationCoordinates,
-    status: SmolStr,
-    requested_at: SmolStr,
-    expires_at: SmolStr,
+    status: chat_dto::LeafRecoveryStatus,
+    requested_at: chat_dto::CanonicalDatetime,
+    expires_at: chat_dto::CanonicalDatetime,
     reservation: CheckedLeafRecoveryReservation,
-    signed_request: Option<chat_dto::SignedLeafRecoveryRequest<DefaultStr>>,
+    signed_request: Option<chat_dto::SignedLeafRecoveryRequest>,
 }
 
 impl RetainedLeafRecoveryProjectionSource {
@@ -2054,12 +2039,12 @@ impl RetainedLeafRecoveryProjectionSource {
         checked_nonempty(recovery_request_id, "leafRecovery.recoveryRequestId")?;
         checked_nonempty(conversation_id, "leafRecovery.conversationId")?;
         checked_nonempty(requester_device_id, "leafRecovery.requesterDeviceId")?;
-        checked_enum(
+        let checked_recovery_kind = checked_enum(
             recovery_kind,
             &[LEAF_RECOVERY_KIND_ADD, LEAF_RECOVERY_KIND_REPLACE],
             "leafRecovery.recoveryKind",
         )?;
-        checked_enum(
+        let checked_status = checked_enum(
             status,
             &[
                 LEAF_RECOVERY_STATUS_OPEN,
@@ -2070,8 +2055,8 @@ impl RetainedLeafRecoveryProjectionSource {
             ],
             "leafRecovery.status",
         )?;
-        checked_datetime(requested_at, "leafRecovery.requestedAt")?;
-        checked_datetime(expires_at, "leafRecovery.expiresAt")?;
+        let requested_at = checked_datetime(requested_at, "leafRecovery.requestedAt")?;
+        let expires_at = checked_datetime(expires_at, "leafRecovery.expiresAt")?;
         if reservation.recovery_request_id.as_str() != recovery_request_id {
             return Err(source_inconsistency(
                 "reservation.recoveryRequestId",
@@ -2133,15 +2118,15 @@ impl RetainedLeafRecoveryProjectionSource {
             }
         };
         Ok(Self {
-            recovery_request_id: SmolStr::from(recovery_request_id),
-            conversation_id: SmolStr::from(conversation_id),
+            recovery_request_id: String::from(recovery_request_id),
+            conversation_id: String::from(conversation_id),
             requester_did: checked_did(requester_did, "leafRecovery.requesterDid")?,
-            requester_device_id: SmolStr::from(requester_device_id),
-            recovery_kind: SmolStr::from(recovery_kind),
+            requester_device_id: String::from(requester_device_id),
+            recovery_kind: checked_recovery_kind,
             bound_coordinate,
-            status: SmolStr::from(status),
-            requested_at: SmolStr::from(requested_at),
-            expires_at: SmolStr::from(expires_at),
+            status: checked_status,
+            requested_at,
+            expires_at,
             reservation,
             signed_request,
         })
@@ -2163,8 +2148,8 @@ pub(crate) fn retained_signed_leaf_recovery_request(
     recovery_kind: &str,
     key_id: &str,
     auth_generation: i64,
-    mut bound: chat_dto::ConversationCoordinates<DefaultStr>,
-) -> Result<chat_dto::SignedLeafRecoveryRequest<DefaultStr>, ProjectionError> {
+    mut bound: chat_dto::ConversationCoordinates,
+) -> Result<chat_dto::SignedLeafRecoveryRequest, ProjectionError> {
     const PATH: &str = "leafRecovery.signedRequest";
     let not_canonical = || {
         ProjectionError::new(
@@ -2188,16 +2173,12 @@ pub(crate) fn retained_signed_leaf_recovery_request(
         &mut presented,
     )
     .map_err(|_| not_canonical())?;
-    let signed: chat_dto::SignedLeafRecoveryRequest<DefaultStr> =
+    let signed: chat_dto::SignedLeafRecoveryRequest =
         serde_json::from_value(presented).map_err(|_| not_canonical())?;
-    let body = &signed.body;
-    // The signed body keeps its exact `$type` (already checked by the
-    // canonical decoder) in DTO extra_data; nothing else may ride along.
-    let body_type_only = body
-        .extra_data
-        .as_ref()
-        .is_some_and(|extra| extra.len() == 1 && extra.contains_key("$type"));
-    if signed.extra_data.is_some() || !body_type_only || body.prior.extra_data.is_some() {
+    // The generated closed union validates the exact $type and removes it before
+    // decoding its member. Any remaining extension field is unexpected.
+    let chat_dto::SignedLeafRecoveryRequestBody::LeafRecoveryRequestBody(body) = &signed.body;
+    if signed.extra_data.is_some() || body.extra_data.is_some() || body.prior.extra_data.is_some() {
         return Err(not_canonical());
     }
     // The retained bound coordinate carries the conversation's current
@@ -2226,16 +2207,16 @@ pub(crate) fn retained_signed_leaf_recovery_request(
 pub(crate) enum RetainedRecoveryWorkTerminal {
     Pending,
     CompletedByTransition {
-        terminal_transition_id: SmolStr,
-        terminal_at: SmolStr,
+        terminal_transition_id: String,
+        terminal_at: String,
     },
     SupersededByTransition {
-        terminal_transition_id: SmolStr,
-        terminal_at: SmolStr,
+        terminal_transition_id: String,
+        terminal_at: String,
     },
     SupersededByRevocation {
-        terminal_revocation_id: SmolStr,
-        terminal_at: SmolStr,
+        terminal_revocation_id: String,
+        terminal_at: String,
     },
 }
 
@@ -2243,14 +2224,14 @@ pub(crate) enum RetainedRecoveryWorkTerminal {
 /// work/conversation/recipient/source fields plus exactly one terminal arm
 /// consistent with its status.
 pub(crate) struct RetainedRecoveryWorkProjectionSource {
-    recovery_work_id: SmolStr,
-    conversation_id: SmolStr,
-    recipient_did: Did<SmolStr>,
-    recipient_device_id: SmolStr,
-    source_kind: SmolStr,
-    source_id: SmolStr,
+    recovery_work_id: String,
+    conversation_id: String,
+    recipient_did: Did,
+    recipient_device_id: String,
+    source_kind: chat_dto::RecoveryWorkSourceKind,
+    source_id: String,
     source_coordinate: CheckedConversationCoordinates,
-    created_at: SmolStr,
+    created_at: chat_dto::CanonicalDatetime,
     terminal: RetainedRecoveryWorkTerminal,
 }
 
@@ -2270,7 +2251,7 @@ impl RetainedRecoveryWorkProjectionSource {
         checked_nonempty(recovery_work_id, "recoveryWork.recoveryWorkId")?;
         checked_nonempty(conversation_id, "recoveryWork.conversationId")?;
         checked_nonempty(recipient_device_id, "recoveryWork.recipientDeviceId")?;
-        checked_enum(
+        let checked_source_kind = checked_enum(
             source_kind,
             &[
                 WORK_SOURCE_KIND_WELCOME_EXPIRED,
@@ -2279,7 +2260,7 @@ impl RetainedRecoveryWorkProjectionSource {
             "recoveryWork.sourceKind",
         )?;
         checked_nonempty(source_id, "recoveryWork.sourceId")?;
-        checked_datetime(created_at, "recoveryWork.createdAt")?;
+        let created_at = checked_datetime(created_at, "recoveryWork.createdAt")?;
         match &terminal {
             RetainedRecoveryWorkTerminal::Pending => {}
             RetainedRecoveryWorkTerminal::CompletedByTransition {
@@ -2308,14 +2289,14 @@ impl RetainedRecoveryWorkProjectionSource {
             ));
         }
         Ok(Self {
-            recovery_work_id: SmolStr::from(recovery_work_id),
-            conversation_id: SmolStr::from(conversation_id),
+            recovery_work_id: String::from(recovery_work_id),
+            conversation_id: String::from(conversation_id),
             recipient_did: checked_did(recipient_did, "recoveryWork.recipientDid")?,
-            recipient_device_id: SmolStr::from(recipient_device_id),
-            source_kind: SmolStr::from(source_kind),
-            source_id: SmolStr::from(source_id),
+            recipient_device_id: String::from(recipient_device_id),
+            source_kind: checked_source_kind,
+            source_id: String::from(source_id),
             source_coordinate,
-            created_at: SmolStr::from(created_at),
+            created_at,
             terminal,
         })
     }
@@ -2400,7 +2381,7 @@ fn require_terminal_shape(
 
 pub(crate) fn conversation_coordinates_dto(
     coordinates: &CheckedConversationCoordinates,
-) -> chat_dto::ConversationCoordinates<DefaultStr> {
+) -> chat_dto::ConversationCoordinates {
     chat_dto::ConversationCoordinates {
         conversation_id: coordinates.conversation_id.clone(),
         generation: coordinates.generation,
@@ -2420,7 +2401,7 @@ pub(crate) fn conversation_coordinates_dto(
 /// semantics) and fails before any state materializes.
 pub(crate) fn conversation_state_view(
     source: &ConversationProjectionSource,
-) -> Result<chat_dto::ConversationState<DefaultStr>, ProjectionError> {
+) -> Result<chat_dto::ConversationState, ProjectionError> {
     let ConversationProjectionSource::State(state) = source else {
         return Err(ProjectionError::new(
             ProjectionErrorKind::NoConversationStateProjection,
@@ -2543,141 +2524,13 @@ pub(crate) fn conversation_state_view(
 /// materializes the close tombstone.
 pub(crate) fn conversation_inventory_item(
     source: &ConversationProjectionSource,
-) -> Result<chat_dto::ConversationInventoryItem<DefaultStr>, ProjectionError> {
+) -> Result<chat_dto::ConversationInventoryItem, ProjectionError> {
     match source {
         ConversationProjectionSource::State(state) => Ok(
             chat_dto::ConversationInventoryItem::ConversationInventoryState(Box::new(
                 chat_dto::ConversationInventoryState {
                     direct_request: state.direct_request.clone(),
-                    state: chat_dto::ConversationState {
-                        direct_request: state.direct_request.clone(),
-                        cipher_suite: state.cipher_suite.clone(),
-                        conversation_kind: state.conversation_kind.clone(),
-                        coordinates: conversation_coordinates_dto(&state.coordinates),
-                        leaves: state
-                            .leaves
-                            .iter()
-                            .map(|leaf| chat_dto::DeviceLeafView {
-                                user_did: leaf.user_did.clone(),
-                                device_id: leaf.device_id.clone(),
-                                leaf_origin: leaf.leaf_origin.clone(),
-                                key_id: leaf.key_id.clone(),
-                                device_status: leaf.device_status.clone(),
-                                join_key_package_ref: leaf.join_key_package_ref.clone(),
-                                extra_data: None,
-                            })
-                            .collect(),
-                        metadata_snapshot: chat_dto::MetadataSnapshot {
-                            coordinate: chat_dto::MetadataCryptoContext {
-                                conversation_id: state
-                                    .metadata_snapshot
-                                    .coordinate
-                                    .conversation_id
-                                    .clone(),
-                                generation: state.metadata_snapshot.coordinate.generation,
-                                group_id: state.metadata_snapshot.coordinate.group_id.clone(),
-                                epoch: state.metadata_snapshot.coordinate.epoch,
-                                group_context_hash: state
-                                    .metadata_snapshot
-                                    .coordinate
-                                    .group_context_hash
-                                    .clone(),
-                                confirmation_tag: state
-                                    .metadata_snapshot
-                                    .coordinate
-                                    .confirmation_tag
-                                    .clone(),
-                                extra_data: None,
-                            },
-                            origin_transition_id: state
-                                .metadata_snapshot
-                                .origin_transition_id
-                                .clone(),
-                            metadata_version: state.metadata_snapshot.metadata_version,
-                            nonce: state.metadata_snapshot.nonce.clone(),
-                            ciphertext: state.metadata_snapshot.ciphertext.clone(),
-                            ciphertext_sha256: state.metadata_snapshot.ciphertext_sha256.clone(),
-                            ciphertext_size: state.metadata_snapshot.ciphertext_size,
-                            author_proof: chat_dto::MetadataAuthorProof {
-                                author_did: state.metadata_snapshot.author_proof.author_did.clone(),
-                                author_device_id: state
-                                    .metadata_snapshot
-                                    .author_proof
-                                    .author_device_id
-                                    .clone(),
-                                author_key_id: state
-                                    .metadata_snapshot
-                                    .author_proof
-                                    .author_key_id
-                                    .clone(),
-                                signature_public_key: state
-                                    .metadata_snapshot
-                                    .author_proof
-                                    .signature_public_key
-                                    .clone(),
-                                auth_generation_at_origin: state
-                                    .metadata_snapshot
-                                    .author_proof
-                                    .auth_generation_at_origin,
-                                origin_transition_id: state
-                                    .metadata_snapshot
-                                    .author_proof
-                                    .origin_transition_id
-                                    .clone(),
-                                origin_seq: state.metadata_snapshot.author_proof.origin_seq,
-                                role_at_origin: state
-                                    .metadata_snapshot
-                                    .author_proof
-                                    .role_at_origin
-                                    .clone(),
-                                device_status_at_origin: state
-                                    .metadata_snapshot
-                                    .author_proof
-                                    .device_status_at_origin
-                                    .clone(),
-                                extra_data: None,
-                            },
-                            avatar_binding: state.metadata_snapshot.avatar_binding.as_ref().map(
-                                |binding| chat_dto::MetadataAvatarBinding {
-                                    blob_id: binding.blob_id.clone(),
-                                    ciphertext_sha256: binding.ciphertext_sha256.clone(),
-                                    ciphertext_size: binding.ciphertext_size,
-                                    purpose: binding.purpose.clone(),
-                                    extra_data: None,
-                                },
-                            ),
-                            extra_data: None,
-                        },
-                        participants: state
-                            .participants
-                            .iter()
-                            .map(|participant| chat_dto::ParticipantView {
-                                user_did: participant.user_did.clone(),
-                                role: participant.role.clone(),
-                                status: participant.status.clone(),
-                                leaf_count: participant.leaf_count,
-                                invitation_provenance: participant
-                                    .invitation_provenance
-                                    .as_ref()
-                                    .map(|provenance| chat_dto::InvitationProvenance {
-                                        invitation_transition_id: provenance
-                                            .invitation_transition_id
-                                            .clone(),
-                                        invited_by_did: provenance.invited_by_did.clone(),
-                                        invited_by_device_id: provenance
-                                            .invited_by_device_id
-                                            .clone(),
-                                        extra_data: None,
-                                    }),
-                                labyrinth_head: None,
-                                extra_data: None,
-                            })
-                            .collect(),
-                        sequencer_did: Some(state.sequencer_did.clone()),
-                        sequencer_term: Some(state.sequencer_term),
-                        snapshot_seq: state.snapshot_seq,
-                        extra_data: None,
-                    },
+                    state: conversation_state_view(source)?,
                     extra_data: None,
                 },
             )),
@@ -2688,7 +2541,7 @@ pub(crate) fn conversation_inventory_item(
                     conversation_id: removal.conversation_id.clone(),
                     device_id: removal.device_id.clone(),
                     membership_interval_id: removal.membership_interval_id.clone(),
-                    removed_at: chat_dto::CanonicalDatetime::raw_str(removal.removed_at.as_str()),
+                    removed_at: removal.removed_at.clone(),
                     terminal_seq: removal.terminal_seq,
                     user_did: removal.user_did.clone(),
                     extra_data: None,
@@ -2698,7 +2551,7 @@ pub(crate) fn conversation_inventory_item(
         ConversationProjectionSource::Close(close) => Ok(
             chat_dto::ConversationInventoryItem::ConversationCloseTombstone(Box::new(
                 chat_dto::ConversationCloseTombstone {
-                    closed_at: chat_dto::CanonicalDatetime::raw_str(close.closed_at.as_str()),
+                    closed_at: close.closed_at.clone(),
                     closed_by_device_id: close.closed_by_device_id.clone(),
                     closed_by_did: close.closed_by_did.clone(),
                     conversation_id: close.conversation_id.clone(),
@@ -2715,11 +2568,11 @@ pub(crate) fn conversation_inventory_item(
 /// Project the retained Welcome source to the generated `WelcomeView` DTO.
 pub(crate) fn welcome_view(
     source: &RetainedWelcomeProjectionSource,
-) -> Result<chat_dto::WelcomeView<DefaultStr>, ProjectionError> {
+) -> Result<chat_dto::WelcomeView, ProjectionError> {
     Ok(chat_dto::WelcomeView {
         conversation_id: source.conversation_id.clone(),
         coordinates: conversation_coordinates_dto(&source.coordinates),
-        expires_at: chat_dto::CanonicalDatetime::raw_str(source.expires_at.as_str()),
+        expires_at: source.expires_at.clone(),
         opaque_welcome: source.opaque_welcome.clone(),
         provenance: chat_dto::RecoveryWelcomeProvenance {
             key_package_ref: source.provenance.key_package_ref.clone(),
@@ -2740,23 +2593,21 @@ pub(crate) fn welcome_view(
 /// `LeafRecoveryView` DTO.
 pub(crate) fn leaf_recovery_view(
     source: &RetainedLeafRecoveryProjectionSource,
-) -> Result<chat_dto::LeafRecoveryView<DefaultStr>, ProjectionError> {
+) -> Result<chat_dto::LeafRecoveryView, ProjectionError> {
     Ok(chat_dto::LeafRecoveryView {
         bound_coordinate: conversation_coordinates_dto(&source.bound_coordinate),
         conversation_id: source.conversation_id.clone(),
-        expires_at: chat_dto::CanonicalDatetime::raw_str(source.expires_at.as_str()),
+        expires_at: source.expires_at.clone(),
         recovery_kind: source.recovery_kind.clone(),
         recovery_request_id: source.recovery_request_id.clone(),
-        requested_at: chat_dto::CanonicalDatetime::raw_str(source.requested_at.as_str()),
+        requested_at: source.requested_at.clone(),
         requester_device_id: source.requester_device_id.clone(),
         requester_did: source.requester_did.clone(),
         reservation: chat_dto::LeafRecoveryReservation {
             bound_coordinate: conversation_coordinates_dto(&source.reservation.bound_coordinate),
             cipher_suite: source.reservation.cipher_suite.clone(),
             conversation_id: source.reservation.conversation_id.clone(),
-            expires_at: chat_dto::CanonicalDatetime::raw_str(
-                source.reservation.expires_at.as_str(),
-            ),
+            expires_at: source.reservation.expires_at.clone(),
             key_package: chat_dto::KeyPackageArtifact {
                 bytes: source.reservation.key_package.bytes.clone(),
                 content_type: source.reservation.key_package.content_type.clone(),
@@ -2784,18 +2635,18 @@ pub(crate) fn leaf_recovery_view(
 fn recovery_work_common_fields(
     source: &RetainedRecoveryWorkProjectionSource,
 ) -> (
-    SmolStr,
+    String,
     chat_dto::CanonicalDatetime,
-    SmolStr,
-    Did<SmolStr>,
-    SmolStr,
-    chat_dto::ConversationCoordinates<DefaultStr>,
-    SmolStr,
-    SmolStr,
+    String,
+    Did,
+    String,
+    chat_dto::ConversationCoordinates,
+    String,
+    chat_dto::RecoveryWorkSourceKind,
 ) {
     (
         source.conversation_id.clone(),
-        chat_dto::CanonicalDatetime::raw_str(source.created_at.as_str()),
+        source.created_at.clone(),
         source.recipient_device_id.clone(),
         source.recipient_did.clone(),
         source.recovery_work_id.clone(),
@@ -2807,7 +2658,7 @@ fn recovery_work_common_fields(
 
 fn recovery_work_pending_dto(
     source: &RetainedRecoveryWorkProjectionSource,
-) -> chat_dto::RecoveryWorkPendingView<DefaultStr> {
+) -> chat_dto::RecoveryWorkPendingView {
     let (
         conversation_id,
         created_at,
@@ -2827,14 +2678,14 @@ fn recovery_work_pending_dto(
         source_coordinate,
         source_id,
         source_kind,
-        status: SmolStr::from(WORK_STATUS_PENDING),
+        status: String::from(WORK_STATUS_PENDING),
         extra_data: None,
     }
 }
 
 fn recovery_work_completed_by_transition_dto(
     source: &RetainedRecoveryWorkProjectionSource,
-) -> chat_dto::RecoveryWorkCompletedByTransitionView<DefaultStr> {
+) -> Result<chat_dto::RecoveryWorkCompletedByTransitionView, ProjectionError> {
     let (
         conversation_id,
         created_at,
@@ -2852,7 +2703,7 @@ fn recovery_work_completed_by_transition_dto(
     else {
         unreachable!("the caller checked the terminal shape");
     };
-    chat_dto::RecoveryWorkCompletedByTransitionView {
+    Ok(chat_dto::RecoveryWorkCompletedByTransitionView {
         conversation_id,
         created_at,
         recipient_device_id,
@@ -2861,16 +2712,16 @@ fn recovery_work_completed_by_transition_dto(
         source_coordinate,
         source_id,
         source_kind,
-        status: SmolStr::from(WORK_STATUS_COMPLETED),
+        status: String::from(WORK_STATUS_COMPLETED),
         terminal_transition_id: terminal_transition_id.clone(),
-        terminal_at: chat_dto::CanonicalDatetime::raw_str(terminal_at.as_str()),
+        terminal_at: checked_datetime(terminal_at, "recoveryWork.terminalAt")?,
         extra_data: None,
-    }
+    })
 }
 
 fn recovery_work_superseded_by_transition_dto(
     source: &RetainedRecoveryWorkProjectionSource,
-) -> chat_dto::RecoveryWorkSupersededByTransitionView<DefaultStr> {
+) -> Result<chat_dto::RecoveryWorkSupersededByTransitionView, ProjectionError> {
     let (
         conversation_id,
         created_at,
@@ -2888,7 +2739,7 @@ fn recovery_work_superseded_by_transition_dto(
     else {
         unreachable!("the caller checked the terminal shape");
     };
-    chat_dto::RecoveryWorkSupersededByTransitionView {
+    Ok(chat_dto::RecoveryWorkSupersededByTransitionView {
         conversation_id,
         created_at,
         recipient_device_id,
@@ -2897,16 +2748,16 @@ fn recovery_work_superseded_by_transition_dto(
         source_coordinate,
         source_id,
         source_kind,
-        status: SmolStr::from(WORK_STATUS_SUPERSEDED),
+        status: String::from(WORK_STATUS_SUPERSEDED),
         terminal_transition_id: terminal_transition_id.clone(),
-        terminal_at: chat_dto::CanonicalDatetime::raw_str(terminal_at.as_str()),
+        terminal_at: checked_datetime(terminal_at, "recoveryWork.terminalAt")?,
         extra_data: None,
-    }
+    })
 }
 
 fn recovery_work_superseded_by_revocation_dto(
     source: &RetainedRecoveryWorkProjectionSource,
-) -> chat_dto::RecoveryWorkSupersededByRevocationView<DefaultStr> {
+) -> Result<chat_dto::RecoveryWorkSupersededByRevocationView, ProjectionError> {
     let (
         conversation_id,
         created_at,
@@ -2924,7 +2775,7 @@ fn recovery_work_superseded_by_revocation_dto(
     else {
         unreachable!("the caller checked the terminal shape");
     };
-    chat_dto::RecoveryWorkSupersededByRevocationView {
+    Ok(chat_dto::RecoveryWorkSupersededByRevocationView {
         conversation_id,
         created_at,
         recipient_device_id,
@@ -2933,11 +2784,11 @@ fn recovery_work_superseded_by_revocation_dto(
         source_coordinate,
         source_id,
         source_kind,
-        status: SmolStr::from(WORK_STATUS_SUPERSEDED),
+        status: String::from(WORK_STATUS_SUPERSEDED),
         terminal_revocation_id: terminal_revocation_id.clone(),
-        terminal_at: chat_dto::CanonicalDatetime::raw_str(terminal_at.as_str()),
+        terminal_at: checked_datetime(terminal_at, "recoveryWork.terminalAt")?,
         extra_data: None,
-    }
+    })
 }
 
 /// Project the retained recovery-work source to the generated
@@ -2945,7 +2796,7 @@ fn recovery_work_superseded_by_revocation_dto(
 /// terminal arm, so every arm is consistent with its status by construction.
 pub(crate) fn recovery_work(
     source: &RetainedRecoveryWorkProjectionSource,
-) -> Result<chat_dto::RecoveryWorkView<DefaultStr>, ProjectionError> {
+) -> Result<chat_dto::RecoveryWorkView, ProjectionError> {
     Ok(match &source.terminal {
         RetainedRecoveryWorkTerminal::Pending => {
             chat_dto::RecoveryWorkView::RecoveryWorkPendingView(Box::new(
@@ -2954,17 +2805,17 @@ pub(crate) fn recovery_work(
         }
         RetainedRecoveryWorkTerminal::CompletedByTransition { .. } => {
             chat_dto::RecoveryWorkView::RecoveryWorkCompletedByTransitionView(Box::new(
-                recovery_work_completed_by_transition_dto(source),
+                recovery_work_completed_by_transition_dto(source)?,
             ))
         }
         RetainedRecoveryWorkTerminal::SupersededByTransition { .. } => {
             chat_dto::RecoveryWorkView::RecoveryWorkSupersededByTransitionView(Box::new(
-                recovery_work_superseded_by_transition_dto(source),
+                recovery_work_superseded_by_transition_dto(source)?,
             ))
         }
         RetainedRecoveryWorkTerminal::SupersededByRevocation { .. } => {
             chat_dto::RecoveryWorkView::RecoveryWorkSupersededByRevocationView(Box::new(
-                recovery_work_superseded_by_revocation_dto(source),
+                recovery_work_superseded_by_revocation_dto(source)?,
             ))
         }
     })
@@ -2975,7 +2826,7 @@ pub(crate) fn recovery_work(
 /// shape; the projection re-checks the pair before materialization.
 pub(crate) fn leaf_recovery_inbox_item(
     input: LeafRecoveryInboxInput,
-) -> Result<chat_dto::LeafRecoveryInboxItem<DefaultStr>, ProjectionError> {
+) -> Result<chat_dto::LeafRecoveryInboxItem, ProjectionError> {
     match input {
         LeafRecoveryInboxInput::LeafRecoveryView(source) => {
             Ok(chat_dto::LeafRecoveryInboxItem::LeafRecoveryView(Box::new(
@@ -2999,7 +2850,7 @@ pub(crate) fn leaf_recovery_inbox_item(
             })?;
             Ok(
                 chat_dto::LeafRecoveryInboxItem::RecoveryWorkCompletedByTransitionView(Box::new(
-                    recovery_work_completed_by_transition_dto(&source),
+                    recovery_work_completed_by_transition_dto(&source)?,
                 )),
             )
         }
@@ -3012,7 +2863,7 @@ pub(crate) fn leaf_recovery_inbox_item(
             })?;
             Ok(
                 chat_dto::LeafRecoveryInboxItem::RecoveryWorkSupersededByTransitionView(Box::new(
-                    recovery_work_superseded_by_transition_dto(&source),
+                    recovery_work_superseded_by_transition_dto(&source)?,
                 )),
             )
         }
@@ -3025,7 +2876,7 @@ pub(crate) fn leaf_recovery_inbox_item(
             })?;
             Ok(
                 chat_dto::LeafRecoveryInboxItem::RecoveryWorkSupersededByRevocationView(Box::new(
-                    recovery_work_superseded_by_revocation_dto(&source),
+                    recovery_work_superseded_by_revocation_dto(&source)?,
                 )),
             )
         }
@@ -3356,11 +3207,7 @@ mod tests {
 
     #[test]
     fn normalize_union_requires_variant_members() {
-        // The generated lexicon doc carries no `enum`/`const` constraints
-        // (verified: zero r#enum/r#const in the generated doc), so a wrong
-        // status value passes the member walk; the missing terminal members
-        // still reject. Status/value correctness is enforced by the checked
-        // sources (C1-2) and the generated `validate()`, not by this encoder.
+        // This v1 structural walk delegates status semantics to checked sources.
         let doc = chat_defs_doc();
         let name = "recoveryWorkView";
         let common = |tag: &str, status: &str| {
@@ -3420,8 +3267,7 @@ mod tests {
         assert_eq!(error.kind(), ProjectionErrorKind::MissingField);
         assert!(error.to_string().contains("terminalTransitionId"));
 
-        // All members present: the union normalizes (the doc carries no
-        // status const, so `pending` here is structurally accepted).
+        // All structural members are present, including the terminal coordinate.
         let mut value = common(
             "blue.catbird.chat.defs#recoveryWorkCompletedByTransitionView",
             "pending",

@@ -2325,7 +2325,8 @@ fn leaf_recovery_response_from_rows(
         )
         .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
         response["recovery"]["signedRequest"] =
-            serde_json::to_value(signed).map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
+            catbird_server::atproto_conv::wire_json_value(&signed)
+                .map_err(|_| RecoveryRepositoryError::InvalidDurableRow)?;
     }
     serde_json::to_vec(&response).map_err(|_| RecoveryRepositoryError::InvalidDurableRow)
 }

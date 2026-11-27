@@ -6,8 +6,7 @@
 // transaction and never accepts caller-authored execution artifacts.
 
 use chrono::{DateTime, Utc};
-use jacquard_common::deps::{bytes::Bytes, smol_str::SmolStr};
-use jacquard_common::DefaultStr;
+use petrel_core::Bytes;
 use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Transaction};
 use thiserror::Error;
@@ -47,7 +46,7 @@ use super::{
         SignedOperationReplayPostStateProof,
     },
 };
-use catbird_atproto::generated::blue_catbird::chat as chat_dto;
+use catbird_server::blue_catbird::chat as chat_dto;
 
 const REVOKE_DEVICE_NSID: &str = "blue.catbird.chat.revokeDevice";
 const G6_REPLAY_POST_STATE_DOMAIN: &[u8] = b"CATBIRD-CHAT-G6-REPLAY-POST-STATE\0";
@@ -355,30 +354,29 @@ struct CanonicalDeviceRevocationResponse {
 
 impl CanonicalDeviceRevocationResponse {
     fn from_device(device: &DeviceDirectoryView) -> Result<Self, DeviceRevocationFacadeError> {
-        let output = chat_dto::revoke_device::RevokeDeviceOutput::<DefaultStr> {
+        let output = chat_dto::revoke_device::Output {
             device: chat_dto::DeviceView {
                 auth_generation: device.auth_generation,
                 available_package_count: device.available_package_count,
-                created_at: crate::sqlx_jacquard::chrono_to_datetime(device.created_at),
-                device_id: SmolStr::from(device.device_id.to_string()),
-                device_name: Some(SmolStr::from(device.device_name.as_str())),
+                created_at: crate::atproto_conv::chrono_to_datetime(device.created_at),
+                device_id: String::from(device.device_id.to_string()),
+                device_name: Some(String::from(device.device_name.as_str())),
                 dormant_at: device
                     .dormant_at
-                    .map(crate::sqlx_jacquard::chrono_to_datetime),
-                key_id: SmolStr::from(device.key_id.as_str()),
-                last_active_at: Some(crate::sqlx_jacquard::chrono_to_datetime(
+                    .map(crate::atproto_conv::chrono_to_datetime),
+                key_id: String::from(device.key_id.as_str()),
+                last_active_at: Some(crate::atproto_conv::chrono_to_datetime(
                     device.last_active_at,
                 )),
                 reserved_package_count: device.reserved_package_count,
-                signature_public_key: Bytes::from(device.signing_public_key.clone()),
-                status: SmolStr::from(device.status.as_str()),
-                updated_at: crate::sqlx_jacquard::chrono_to_datetime(device.updated_at),
+                signature_public_key: Bytes(Vec::from(device.signing_public_key.clone())),
+                status: catbird_server::atproto_conv::open_enum(device.status.as_str()),
+                updated_at: crate::atproto_conv::chrono_to_datetime(device.updated_at),
                 extra_data: None,
             },
-            extra_data: None,
         };
-        let body =
-            serde_json::to_vec(&output).map_err(|_| DeviceRevocationFacadeError::Integrity)?;
+        let body = catbird_server::atproto_conv::wire_json_bytes(&output)
+            .map_err(|_| DeviceRevocationFacadeError::Integrity)?;
         let body_sha256 = Sha256::digest(&body).into();
         Ok(Self {
             status: 200,

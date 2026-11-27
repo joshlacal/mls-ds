@@ -8,7 +8,6 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
-use catbird_atproto::generated::blue_catbird::mlsDS::FederationReceiptV1;
 use catbird_mls::chat_v2::transcript::strict_json::decode_strict_json;
 use catbird_mls::chat_v2::transcript::{
     project_signed_body, SignedMutationKind, SigningTranscript,
@@ -19,6 +18,7 @@ use mls_e2e_tests::federation::{boot_two_node_cluster, TwoNodeCluster};
 use mls_e2e_tests::mls_engine::MlsEngine;
 use p256::ecdsa::SigningKey as P256SigningKey;
 use p256::pkcs8::DecodePrivateKey;
+use petrel_catbird::generated::blue::catbird::mls_ds::defs::FederationReceiptV1;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -934,15 +934,15 @@ async fn wait_for_signed_receipt(
                     && sequencer_did.as_str() == cluster.ds1_service_did.as_str()
                     && receipt.sequencer_term == sequencer_term
                     && sequencer_term == 0
-                    && receipt.envelope_sha256.as_ref() == envelope_sha256.as_slice()
-                    && receipt.result_sha256.as_ref() == result_sha256.as_slice()
+                    && receipt.envelope_sha256.0.as_slice() == envelope_sha256.as_slice()
+                    && receipt.result_sha256.0.as_slice() == result_sha256.as_slice()
                     && response_source_entry_id == source_entry_id
                     && receipt.source_locator.seq == source_entry_seq
-                    && receipt.source_locator.accepted_payload_sha256.as_ref()
+                    && receipt.source_locator.accepted_payload_sha256.0.as_slice()
                         == accepted_payload_sha256.as_slice()
-                    && receipt.source_locator.outer_entry_fingerprint.as_ref()
+                    && receipt.source_locator.outer_entry_fingerprint.0.as_slice()
                         == outer_entry_fingerprint.as_slice()
-                    && receipt.signature.as_ref() == signature.as_slice()
+                    && receipt.signature.0.as_slice() == signature.as_slice()
                     && response_completed_at == completed_at,
                 "signed {endpoint} receipt body does not match its delivery, signer audience, source entry, or stored evidence"
             );
@@ -964,9 +964,9 @@ async fn wait_for_signed_receipt(
                 receipt.completed_at.as_str(),
             );
             if receiver_ds_did == cluster.ds1_service_did {
-                cluster.verify_ds1_signature(&canonical, receipt.signature.as_ref())?;
+                cluster.verify_ds1_signature(&canonical, receipt.signature.0.as_slice())?;
             } else {
-                cluster.verify_ds2_signature(&canonical, receipt.signature.as_ref())?;
+                cluster.verify_ds2_signature(&canonical, receipt.signature.0.as_slice())?;
             }
             return Ok(completed_at);
         }

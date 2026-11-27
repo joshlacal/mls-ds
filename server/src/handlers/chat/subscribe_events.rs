@@ -2,6 +2,7 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use crate::blue_catbird::chat::SubscriptionMessage;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -10,9 +11,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use catbird_atproto::generated::blue_catbird::chat::SubscriptionMessage;
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::realtime::StreamEvent;
 use crate::{
@@ -42,33 +42,14 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// only the outer union discriminator to the header and preserves nested union
 /// tags and byte strings without a JSON intermediate.
 fn encode_subscription_frame(message: &SubscriptionMessage) -> Result<Vec<u8>, ()> {
-    #[derive(Serialize)]
-    struct Header {
-        op: i64,
-        t: &'static str,
-    }
-    let (message_type, body) = match message {
-        SubscriptionMessage::EventEnvelope(envelope) => (
-            "blue.catbird.chat.defs#eventEnvelope",
-            serde_ipld_dagcbor::to_vec(envelope).map_err(|_| ())?,
-        ),
-        SubscriptionMessage::TypingEvent(typing) => (
-            "blue.catbird.chat.defs#typingEvent",
-            serde_ipld_dagcbor::to_vec(typing).map_err(|_| ())?,
-        ),
-    };
-    let mut frame = serde_ipld_dagcbor::to_vec(&Header {
-        op: 1,
-        t: message_type,
-    })
-    .map_err(|_| ())?;
-    frame.extend_from_slice(&body);
-    Ok(frame)
+    petrel_core::subscription::encode_subscription_message::<
+        crate::blue_catbird::chat::subscribe_events::SubscribeEvents,
+    >(message)
+    .map_err(|_| ())
 }
 
-// The generated subscription parameter module is feature-gated by
-// catbird-atproto's client-side `streaming` feature. Keep the server extractor
-// exact and minimal while all emitted protocol objects remain generated DTOs.
+// Validate the ticket and cursor, including duplicate and size checks,
+// before the one-use ticket is consumed.
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 pub struct SubscribeEventsQuery {
     pub cursor: String,

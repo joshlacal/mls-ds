@@ -1,11 +1,12 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.19
 
 # ---------- builder ----------
 FROM rust:1.97.1-bookworm AS builder
 
 WORKDIR /build
 
-COPY --from=catbird-atproto / /catbird-atproto
+COPY --from=petrel --exclude=target / /Petrel/rust
+COPY --from=petrel-catbird --exclude=target / /PetrelCatbird/rust/petrel-catbird
 # server/Cargo.toml: labyrinth-protocol = { path = "../../labyrinth/labyrinth-protocol" }
 COPY --from=labyrinth-protocol / /labyrinth/labyrinth-protocol
 

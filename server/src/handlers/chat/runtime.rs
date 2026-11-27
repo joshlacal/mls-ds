@@ -563,9 +563,8 @@ impl ChatRuntime {
         // The clean handler already produced the generated DTO. Deserialize
         // that exact payload instead of reducing it to the legacy cursor/DID
         // shape: actor device, expiry, and typing id are protocol fields.
-        let Ok(typing) = serde_json::from_value::<
-            catbird_atproto::generated::blue_catbird::chat::TypingEvent,
-        >(event) else {
+        let Ok(typing) = serde_json::from_value::<crate::blue_catbird::chat::TypingEvent>(event)
+        else {
             return;
         };
         let conversation_id = typing.conversation_id.to_string();

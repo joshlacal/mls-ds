@@ -60,17 +60,15 @@ cid = { version = "0.11", features = ["serde"] }
 # Auth/JWT
 jsonwebtoken = "9"
 
-# Jacquard (ATProto types)
-catbird-atproto = { path = "../../catbird-atproto", features = ["namespace-atproto-space", "namespace-bluecatbird"] }
-atproto-spaces = { path = "../../catbird-atproto/atproto-spaces" }
+# Petrel Rust (ATProto types, lexicon runtime, Spaces). Sibling path deps:
+# CI checks out joshlacal/Petrel and joshlacal/PetrelCatbird next to this repo.
+petrel-core = { path = "../../Petrel/rust/petrel-core", features = ["chrono"] }
+petrel-crypto = { path = "../../Petrel/rust/petrel-crypto" }
+petrel-lexicon = { path = "../../Petrel/rust/petrel-lexicon" }
+petrel-spaces = { path = "../../Petrel/rust/petrel-spaces" }
+petrel-catbird = { path = "../../PetrelCatbird/rust/petrel-catbird" }
 labyrinth-protocol = { path = "../../labyrinth/labyrinth-protocol" }
-jacquard-common = { git = "https://github.com/joshlacal/jacquard", rev = "7a695dd560c0da2df578f6088e3db1e6026e3825" }
-jacquard-axum = { git = "https://github.com/joshlacal/jacquard", rev = "7a695dd560c0da2df578f6088e3db1e6026e3825" }
-jacquard-derive = { git = "https://github.com/joshlacal/jacquard", rev = "7a695dd560c0da2df578f6088e3db1e6026e3825" }
-jacquard-lexicon = { git = "https://github.com/joshlacal/jacquard", rev = "7a695dd560c0da2df578f6088e3db1e6026e3825" }
 serde_html_form = "0.4"
-miette = "7"
-rustversion = "1"
 bytes = "1"
 
 # HTTP client (for DID resolution)

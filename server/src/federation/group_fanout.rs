@@ -296,7 +296,7 @@ async fn prepare_fanout(
     let space_uri = match stored_space_uri {
         Some(uri) => uri,
         // `at:space/{sequencer}/blue.catbird.labyrinth.conversation/{convo}-{generation}`
-        None => atproto_spaces::SpaceUri::conversation(
+        None => crate::space_host::conversation_space_ref(
             &sequencer_did,
             &format!("{convo_id}-{generation}"),
         )

@@ -98,6 +98,7 @@ pub mod direct_request_transcript;
 pub(crate) mod dpop;
 #[cfg(any(test, feature = "test-support"))]
 pub mod dpop;
+pub mod retained_json;
 
 pub mod error;
 pub mod federation_routing;

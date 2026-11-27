@@ -1,4 +1,7 @@
 [workspace]
+# Build the delivery service by default. The legacy lexicon generator remains
+# available to the explicit code-generation command.
+default-members = ["server"]
 members = ["server", "codegen"]
 exclude = ["e2e-tests", "e2e-birdaemon"]
 resolver = "2"

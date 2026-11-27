@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
-use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::{
-    SubmitCommit, SubmitCommitOutput,
+use crate::blue_catbird::mls_ds::submit_commit::{
+    Input as SubmitCommit, Output as SubmitCommitOutput,
 };
-use jacquard_common::DefaultStr;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
@@ -52,7 +51,7 @@ impl RemoteCommitSubmitter {
         pool: &PgPool,
         sequencer_ds_did: &str,
         sequencer_term: u64,
-        envelope: &SubmitCommit<DefaultStr>,
+        envelope: &SubmitCommit,
         expected_entry_id: uuid::Uuid,
         expected_seq: u64,
         expected_accepted_payload_sha256: [u8; 32],
@@ -71,9 +70,16 @@ impl RemoteCommitSubmitter {
             .service_auth
             .sign_request(sequencer_ds_did, SUBMIT_COMMIT_NSID)?;
 
+        let envelope_json = catbird_server::atproto_conv::wire_json_value(envelope)
+            .map_err(FederationError::Json)?;
         let resp = match self
             .outbound
-            .call_procedure_pinned(&destination, SUBMIT_COMMIT_NSID, &auth_token, envelope)
+            .call_procedure_pinned(
+                &destination,
+                SUBMIT_COMMIT_NSID,
+                &auth_token,
+                &envelope_json,
+            )
             .await
         {
             Ok(r) => r,
@@ -106,10 +112,11 @@ impl RemoteCommitSubmitter {
             }
         };
         let output: SubmitCommitOutput =
-            serde_json::from_slice(&resp.response_bytes).map_err(|e| {
-                FederationError::InvalidEnvelope {
-                    reason: format!("failed to parse submitCommit response: {e}"),
-                }
+            catbird_server::chat_protocol::retained_json::decode_submit_commit_output(
+                &resp.response_bytes,
+            )
+            .map_err(|e| FederationError::InvalidEnvelope {
+                reason: format!("failed to parse submitCommit response: {e}"),
             })?;
         let receipt = &output.receipt;
 
@@ -203,7 +210,7 @@ impl RemoteCommitSubmitter {
                 ),
             });
         }
-        if receipt.envelope_sha256.as_ref() != envelope.header.payload_sha256.as_ref() {
+        if receipt.envelope_sha256.0.as_slice() != envelope.header.payload_sha256.0.as_slice() {
             return Err(FederationError::InvalidEnvelope {
                 reason: "receipt envelope_sha256 mismatch".to_string(),
             });
@@ -211,7 +218,7 @@ impl RemoteCommitSubmitter {
         let submit_transition_response_bytes =
             result_bytes_for_receipt(SUBMIT_COMMIT_NSID, &resp.response_bytes)?;
         let result_sha256: [u8; 32] = Sha256::digest(&submit_transition_response_bytes).into();
-        if receipt.result_sha256.as_ref() != &result_sha256[..] {
+        if receipt.result_sha256.0.as_slice() != &result_sha256[..] {
             return Err(FederationError::InvalidEnvelope {
                 reason: "receipt result_sha256 mismatch".to_string(),
             });
@@ -231,14 +238,14 @@ impl RemoteCommitSubmitter {
                 reason: "receipt/output seq mismatch with local expected seq".to_string(),
             });
         }
-        if receipt.source_locator.accepted_payload_sha256.as_ref()
+        if receipt.source_locator.accepted_payload_sha256.0.as_slice()
             != &expected_accepted_payload_sha256[..]
         {
             return Err(FederationError::InvalidEnvelope {
                 reason: "receipt source_locator accepted_payload_sha256 mismatch".to_string(),
             });
         }
-        if receipt.source_locator.outer_entry_fingerprint.as_ref()
+        if receipt.source_locator.outer_entry_fingerprint.0.as_slice()
             != &expected_outer_entry_fingerprint[..]
         {
             return Err(FederationError::InvalidEnvelope {

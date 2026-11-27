@@ -26,7 +26,7 @@ pub struct OutboundClient {
     request_timeout: Duration,
 }
 
-use catbird_atproto::generated::blue_catbird::mlsDS::FederationReceiptV1;
+use crate::blue_catbird::mls_ds::FederationReceiptV1;
 
 /// Response from a remote DS.
 #[derive(Debug, Deserialize, Clone, Default)]

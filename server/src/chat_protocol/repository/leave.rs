@@ -665,14 +665,28 @@ fn response_for_plan(
         }
         _ => return Err(LeaveFacadeError::UnsupportedMutation),
     };
-    let bytes =
-        serde_json::to_vec(&body).map_err(|_| LeaveFacadeError::InvalidCanonicalMaterial)?;
+    fn encode<T: serde::de::DeserializeOwned + petrel_core::ToValue>(
+        endpoint: &str,
+        value: serde_json::Value,
+    ) -> serde_json::Result<Vec<u8>> {
+        use catbird_server::chat_protocol::retained_json::{decode_output, encode_output};
+        let dto: T = decode_output(endpoint, value)?;
+        encode_output(endpoint, &dto)
+    }
+    use catbird_server::blue_catbird::chat;
     let valid = match parsed.kind {
-        SignedMutationKind::LeaveRequest | SignedMutationKind::ZeroLeafLeave => serde_json::from_slice::<catbird_atproto::generated::blue_catbird::chat::request_leave::RequestLeaveOutput>(&bytes).and_then(|v|serde_json::to_vec(&v)),
-        SignedMutationKind::LeaveCancellation => serde_json::from_slice::<catbird_atproto::generated::blue_catbird::chat::cancel_leave::CancelLeaveOutput>(&bytes).and_then(|v|serde_json::to_vec(&v)),
-        SignedMutationKind::ConversationClose => serde_json::from_slice::<catbird_atproto::generated::blue_catbird::chat::close_conversation::CloseConversationOutput>(&bytes).and_then(|v|serde_json::to_vec(&v)),
+        SignedMutationKind::LeaveRequest | SignedMutationKind::ZeroLeafLeave => {
+            encode::<chat::request_leave::Output>("blue.catbird.chat.requestLeave", body)
+        }
+        SignedMutationKind::LeaveCancellation => {
+            encode::<chat::cancel_leave::Output>("blue.catbird.chat.cancelLeave", body)
+        }
+        SignedMutationKind::ConversationClose => {
+            encode::<chat::close_conversation::Output>("blue.catbird.chat.closeConversation", body)
+        }
         _ => return Err(LeaveFacadeError::UnsupportedMutation),
-    }.map_err(|_| LeaveFacadeError::InvalidCanonicalMaterial)?;
+    }
+    .map_err(|_| LeaveFacadeError::InvalidCanonicalMaterial)?;
     // Generated DTO serialization is the response byte authority. Its field
     // order differs from serde_json::Value even for the same valid object.
     Ok(valid)

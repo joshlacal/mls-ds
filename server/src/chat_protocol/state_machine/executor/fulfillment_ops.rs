@@ -604,30 +604,20 @@ pub(in crate::chat_protocol::state_machine::executor) async fn apply_leaf_recove
             .try_into()
             .map_err(|_| ExecutorError::InconsistentPlan("invalid tree summary sha256"))?;
 
-        let coordinates = catbird_atproto::generated::blue_catbird::chat::ConversationCoordinates {
-            conversation_id: jacquard_common::deps::smol_str::SmolStr::from(
-                conversation_id.hyphenated().to_string(),
-            ),
+        let coordinates = catbird_server::blue_catbird::chat::ConversationCoordinates {
+            conversation_id: String::from(conversation_id.hyphenated().to_string()),
             generation,
             state_version,
             epoch,
-            group_id: jacquard_common::deps::bytes::Bytes::copy_from_slice(coordinate.group_id()),
-            group_context_hash: jacquard_common::deps::bytes::Bytes::copy_from_slice(
-                coordinate.group_context_hash(),
-            ),
-            confirmation_tag: jacquard_common::deps::bytes::Bytes::copy_from_slice(
-                coordinate.confirmation_tag(),
-            ),
-            lifecycle: jacquard_common::deps::smol_str::SmolStr::from(
-                match coordinate.lifecycle() {
-                    crate::chat_protocol::snapshot::PublicGroupSnapshotLifecycle::Active => {
-                        "active"
-                    }
-                    crate::chat_protocol::snapshot::PublicGroupSnapshotLifecycle::Superseded => {
-                        "superseded"
-                    }
-                },
-            ),
+            group_id: petrel_core::Bytes(<[u8]>::to_vec(coordinate.group_id())),
+            group_context_hash: petrel_core::Bytes(<[u8]>::to_vec(coordinate.group_context_hash())),
+            confirmation_tag: petrel_core::Bytes(<[u8]>::to_vec(coordinate.confirmation_tag())),
+            lifecycle: catbird_server::atproto_conv::open_enum(match coordinate.lifecycle() {
+                crate::chat_protocol::snapshot::PublicGroupSnapshotLifecycle::Active => "active",
+                crate::chat_protocol::snapshot::PublicGroupSnapshotLifecycle::Superseded => {
+                    "superseded"
+                }
+            }),
             extra_data: None,
         };
 

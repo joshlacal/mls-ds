@@ -186,10 +186,7 @@ fn firewalled(
     home: &CleanSlateDsProcess,
     pds: &SpacesPds,
 ) -> Arc<ClientTransport> {
-    let transport = Arc::new(ClientTransport::new(vec![
-        home.base_url.clone(),
-        pds.base_url.clone(),
-    ]));
+    let transport = Arc::new(pds.client_transport(&home.base_url));
     transport.set_account(did, key.clone(), &home.service_did, &pds.base_url, session);
     transport
 }

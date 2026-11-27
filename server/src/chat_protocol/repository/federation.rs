@@ -5,12 +5,13 @@
 
 use std::str::FromStr;
 
-use catbird_atproto::generated::blue_catbird::chat::{
+use catbird_server::blue_catbird::chat::{
     CommitEntry, ConversationCoordinates, DeviceId, OperationId,
 };
-use catbird_atproto::generated::blue_catbird::mlsDS::{
-    deliver_message::DeliverMessageOutput, deliver_welcome::DeliverWelcomeOutput,
-    submit_commit::SubmitCommitOutput, EntryLocatorV1, EnvelopeHeaderV1, FederationReceiptV1,
+use catbird_server::blue_catbird::mls_ds::{
+    deliver_message::Output as DeliverMessageOutput,
+    deliver_welcome::Output as DeliverWelcomeOutput, submit_commit::Output as SubmitCommitOutput,
+    EntryLocatorV1, EnvelopeHeaderV1, FederationReceiptV1,
 };
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
@@ -335,14 +336,14 @@ pub async fn insert_delivery_receipt(
     .bind(receipt.receiver_ds_did.as_str())
     .bind(receipt.sequencer_did.as_str())
     .bind(receipt.sequencer_term)
-    .bind(&*receipt.envelope_sha256)
-    .bind(&*receipt.result_sha256)
+    .bind(&receipt.envelope_sha256.0)
+    .bind(&receipt.result_sha256.0)
     .bind(source_locator.entry_id)
     .bind(source_locator.seq as i64)
     .bind(&source_locator.outer_entry_fingerprint[..])
     .bind(response_bytes)
     .bind(&response_sha256)
-    .bind(&*receipt.signature)
+    .bind(&receipt.signature.0)
     .bind(completed_at_dt)
     .execute(&mut **tx)
     .await
@@ -766,8 +767,8 @@ pub async fn deliver_welcome_mailbox(
         || stored_gen != coordinates.generation
         || stored_sv != coordinates.state_version
         || stored_epoch != coordinates.epoch
-        || stored_gid != coordinates.group_id.as_ref()
-        || state_gid != coordinates.group_id.as_ref()
+        || stored_gid != coordinates.group_id.0.as_slice()
+        || state_gid != coordinates.group_id.0.as_slice()
         || state_epoch != coordinates.epoch
         || stored_snap_sha256 != public_snapshot_sha256
         || stored_tree_sha256 != tree_summary_sha256
@@ -901,10 +902,10 @@ pub async fn deliver_welcome_mailbox(
     let output = DeliverWelcomeOutput {
         accepted: true,
         receipt,
-        extra_data: None,
     };
 
-    let response_bytes = serde_json::to_vec(&output).map_err(FederationError::Json)?;
+    let response_bytes =
+        catbird_server::atproto_conv::wire_json_bytes(&output).map_err(FederationError::Json)?;
 
     insert_delivery_receipt(tx, &output.receipt, &entry_locator, &response_bytes).await?;
 
@@ -1824,10 +1825,9 @@ pub async fn deliver_message_replication(
                     let output = DeliverMessageOutput {
                         accepted: true,
                         receipt,
-                        extra_data: None,
                     };
-                    let response_bytes =
-                        serde_json::to_vec(&output).map_err(FederationError::Json)?;
+                    let response_bytes = catbird_server::atproto_conv::wire_json_bytes(&output)
+                        .map_err(FederationError::Json)?;
                     insert_delivery_receipt(tx, &output.receipt, &locator, &response_bytes).await?;
                     return Ok(output);
                 }
@@ -1905,10 +1905,10 @@ pub async fn deliver_message_replication(
     let output = DeliverMessageOutput {
         accepted: true,
         receipt,
-        extra_data: None,
     };
 
-    let response_bytes = serde_json::to_vec(&output).map_err(FederationError::Json)?;
+    let response_bytes =
+        catbird_server::atproto_conv::wire_json_bytes(&output).map_err(FederationError::Json)?;
 
     if !seq_exists {
         match prelude::insert_operation_completion_record(
@@ -1977,7 +1977,10 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
         check_delivery_receipt(tx, SUBMIT_COMMIT_NSID, &header, &envelope_digest, None).await?
     {
         let cached_output: SubmitCommitOutput =
-            serde_json::from_slice(&cached_bytes).map_err(FederationError::Json)?;
+            catbird_server::chat_protocol::retained_json::decode_submit_commit_output(
+                &cached_bytes,
+            )
+            .map_err(FederationError::Json)?;
         return Ok(cached_output);
     }
 
@@ -2282,112 +2285,122 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
     let transcript_bytes = mutation.transcript_bytes().to_vec();
 
     // Shared operation claim via the federated prelude (replaces handwritten SQL).
-    let operation_binding = match prepare_federated_operation(
-        tx,
-        &admission,
-        &mutation,
-        &signed_request_bytes,
-    )
-    .await
-    .map_err(|e| prelude_failure(e, "federated operation arbitration failed"))?
-    {
-        FederatedOperationArbitration::First(reservation) => {
-            let binding = reservation.binding().clone();
-            claim_federated_operation(tx, reservation)
-                .await
-                .map_err(|e| prelude_failure(e, "federated operation claim failed"))?;
-            Some(binding)
-        }
-        FederatedOperationArbitration::Replay(response) => {
-            if response.status() != 200 || response.response_bytes().is_empty() {
-                return Err(FederationError::CommitConflict {
-                    convo_id: header.conversation_id.to_string(),
-                    current_epoch: 0,
-                });
+    let operation_binding =
+        match prepare_federated_operation(tx, &admission, &mutation, &signed_request_bytes)
+            .await
+            .map_err(|e| prelude_failure(e, "federated operation arbitration failed"))?
+        {
+            FederatedOperationArbitration::First(reservation) => {
+                let binding = reservation.binding().clone();
+                claim_federated_operation(tx, reservation)
+                    .await
+                    .map_err(|e| prelude_failure(e, "federated operation claim failed"))?;
+                Some(binding)
             }
-            // New delivery ID for same operation returns canonical outcome + new receipt.
-            // Read the stored source locator from the transition's entry.
-            let replay_locator: Option<(Uuid, i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
-                r#"
+            FederatedOperationArbitration::Replay(response) => {
+                if response.status() != 200 || response.response_bytes().is_empty() {
+                    return Err(FederationError::CommitConflict {
+                        convo_id: header.conversation_id.to_string(),
+                        current_epoch: 0,
+                    });
+                }
+                // New delivery ID for same operation returns canonical outcome + new receipt.
+                // Read the stored source locator from the transition's entry.
+                let replay_locator: Option<(Uuid, i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+                    r#"
                 SELECT entry_id, seq, accepted_payload_sha256, outer_entry_fingerprint
                   FROM chat.entries
                  WHERE transition_id = $1
                 "#,
-            )
-            .bind(parsed.transition_id)
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(FederationError::Database)?;
+                )
+                .bind(parsed.transition_id)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(FederationError::Database)?;
 
-            let Some((entry_id, seq, accepted_payload_sha256, outer_entry_fingerprint)) =
-                replay_locator
-            else {
-                return Err(FederationError::CommitConflict {
-                    convo_id: header.conversation_id.to_string(),
-                    current_epoch: 0,
-                });
-            };
-            let replay_source_locator = ValidatedEntryLocator {
-                entry_id,
-                seq: seq as u64,
-                accepted_payload_sha256: accepted_payload_sha256.as_slice().try_into().map_err(
-                    |_| FederationError::InvalidEnvelope {
-                        reason: "stored source locator payload hash not 32 bytes".to_string(),
-                    },
-                )?,
-                outer_entry_fingerprint: outer_entry_fingerprint.as_slice().try_into().map_err(
-                    |_| FederationError::InvalidEnvelope {
-                        reason: "stored source locator fingerprint not 32 bytes".to_string(),
-                    },
-                )?,
-            };
+                let Some((entry_id, seq, accepted_payload_sha256, outer_entry_fingerprint)) =
+                    replay_locator
+                else {
+                    return Err(FederationError::CommitConflict {
+                        convo_id: header.conversation_id.to_string(),
+                        current_epoch: 0,
+                    });
+                };
+                let replay_source_locator = ValidatedEntryLocator {
+                    entry_id,
+                    seq: seq as u64,
+                    accepted_payload_sha256: accepted_payload_sha256
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| FederationError::InvalidEnvelope {
+                            reason: "stored source locator payload hash not 32 bytes".to_string(),
+                        })?,
+                    outer_entry_fingerprint: outer_entry_fingerprint
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| FederationError::InvalidEnvelope {
+                            reason: "stored source locator fingerprint not 32 bytes".to_string(),
+                        })?,
+                };
 
-            let now = crate::sim_hooks::current_utc();
-            let result_sha256: [u8; 32] = Sha256::digest(response.response_bytes()).into();
-            let receipt = sign_receipt(
-                ack_signer,
-                SUBMIT_COMMIT_NSID,
-                header.delivery_id,
-                header.conversation_id,
-                &header.sender_ds_did,
-                &header.receiver_ds_did,
-                &header.sequencer_did,
-                header.sequencer_term,
-                envelope_digest,
-                result_sha256,
-                replay_source_locator.clone(),
-                now,
-            )?;
+                let now = crate::sim_hooks::current_utc();
+                let result_sha256: [u8; 32] = Sha256::digest(response.response_bytes()).into();
+                let receipt = sign_receipt(
+                    ack_signer,
+                    SUBMIT_COMMIT_NSID,
+                    header.delivery_id,
+                    header.conversation_id,
+                    &header.sender_ds_did,
+                    &header.receiver_ds_did,
+                    &header.sequencer_did,
+                    header.sequencer_term,
+                    envelope_digest,
+                    result_sha256,
+                    replay_source_locator.clone(),
+                    now,
+                )?;
 
-            let st_output: catbird_atproto::generated::blue_catbird::chat::submit_transition::SubmitTransitionOutput<
-                jacquard_common::DefaultStr,
-            > = serde_json::from_slice(response.response_bytes()).map_err(FederationError::Json)?;
+                let st_output: catbird_server::blue_catbird::chat::submit_transition::Output =
+                    serde_json::from_slice(response.response_bytes())
+                        .and_then(|value| {
+                            catbird_server::chat_protocol::retained_json::decode_output(
+                                "blue.catbird.chat.submitTransition",
+                                value,
+                            )
+                        })
+                        .map_err(FederationError::Json)?;
 
-            let commit_entry_dto = match st_output.entry {
-                catbird_atproto::generated::blue_catbird::chat::ConversationEntry::CommitEntry(
-                    entry,
-                ) => *entry,
-                _ => {
-                    return Err(FederationError::InvalidEnvelope {
-                        reason: "expected commitEntry in submitTransition output".to_string(),
-                    })
-                }
-            };
+                let commit_entry_dto = match st_output.entry {
+                    catbird_server::blue_catbird::chat::ConversationEntry::CommitEntry(entry) => {
+                        *entry
+                    }
+                    _ => {
+                        return Err(FederationError::InvalidEnvelope {
+                            reason: "expected commitEntry in submitTransition output".to_string(),
+                        })
+                    }
+                };
 
-            let output = SubmitCommitOutput {
-                commit_entry: commit_entry_dto,
-                coordinates: st_output.coordinates,
-                receipt,
-                welcomes: vec![],
-                extra_data: None,
-            };
+                let output = SubmitCommitOutput {
+                    commit_entry: commit_entry_dto,
+                    coordinates: st_output.coordinates,
+                    receipt,
+                    welcomes: vec![],
+                };
 
-            let response_bytes = serde_json::to_vec(&output).map_err(FederationError::Json)?;
-            insert_delivery_receipt(tx, &output.receipt, &replay_source_locator, &response_bytes)
+                let response_bytes = catbird_server::atproto_conv::wire_json_value(&output)
+                    .and_then(|value| serde_json::to_vec(&value))
+                    .map_err(FederationError::Json)?;
+                insert_delivery_receipt(
+                    tx,
+                    &output.receipt,
+                    &replay_source_locator,
+                    &response_bytes,
+                )
                 .await?;
-            return Ok(output);
-        }
-    };
+                return Ok(output);
+            }
+        };
     let entry = build_verified_control_entry(
         mutation,
         &endpoint,
@@ -2551,14 +2564,18 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
         now,
     )?;
 
-    let st_output: catbird_atproto::generated::blue_catbird::chat::submit_transition::SubmitTransitionOutput<
-        jacquard_common::DefaultStr,
-    > = serde_json::from_slice(response.as_bytes()).map_err(FederationError::Json)?;
+    let st_output: catbird_server::blue_catbird::chat::submit_transition::Output =
+        serde_json::from_slice(response.as_bytes())
+            .and_then(|value| {
+                catbird_server::chat_protocol::retained_json::decode_output(
+                    "blue.catbird.chat.submitTransition",
+                    value,
+                )
+            })
+            .map_err(FederationError::Json)?;
 
     let commit_entry_dto = match st_output.entry {
-        catbird_atproto::generated::blue_catbird::chat::ConversationEntry::CommitEntry(entry) => {
-            *entry
-        }
+        catbird_server::blue_catbird::chat::ConversationEntry::CommitEntry(entry) => *entry,
         _ => {
             return Err(FederationError::InvalidEnvelope {
                 reason: "expected commitEntry in submitTransition output".to_string(),
@@ -2571,10 +2588,11 @@ pub async fn submit_commit_sequencing<T: PublicTransport>(
         coordinates: st_output.coordinates,
         receipt,
         welcomes: vec![],
-        extra_data: None,
     };
 
-    let response_bytes = serde_json::to_vec(&output).map_err(FederationError::Json)?;
+    let response_bytes = catbird_server::atproto_conv::wire_json_value(&output)
+        .and_then(|value| serde_json::to_vec(&value))
+        .map_err(FederationError::Json)?;
 
     // Complete the shared operation claim exactly as the local prelude does.
     let Some(binding) = operation_binding else {
@@ -3216,10 +3234,9 @@ pub async fn enqueue_federated_message_job(
     seq: u64,
     sequencer_term: u64,
 ) -> Result<Uuid, FederationError> {
-    use catbird_atproto::generated::blue_catbird::mlsDS::deliver_message::DeliverMessage;
-    use jacquard_common::deps::bytes::Bytes;
-    use jacquard_common::deps::smol_str::SmolStr;
-    use jacquard_common::types::string::Did;
+    use catbird_server::blue_catbird::mls_ds::deliver_message::Input as DeliverMessage;
+    use petrel_core::Bytes;
+    use petrel_core::Did;
 
     let delivery_id = crate::sim_hooks::mint_entry_uuid_v4(
         b"mlsDS.deliverMessage",
@@ -3279,49 +3296,49 @@ pub async fn enqueue_federated_message_job(
         &entry.signed_request_bytes,
     )?;
 
-    let msg = DeliverMessage::<jacquard_common::DefaultStr> {
+    let msg = DeliverMessage {
         header: EnvelopeHeaderV1 {
-            protocol_version: SmolStr::from("1"),
-            delivery_id: SmolStr::from(delivery_id.hyphenated().to_string()),
-            conversation_id: SmolStr::from(conversation_id.hyphenated().to_string()),
-            sender_ds_did: Did::new_owned(self_base_did).map_err(|_| {
+            protocol_version: catbird_server::atproto_conv::open_enum("1"),
+            delivery_id: String::from(delivery_id.hyphenated().to_string()),
+            conversation_id: String::from(conversation_id.hyphenated().to_string()),
+            sender_ds_did: Did::parse(self_base_did).map_err(|_| {
                 FederationError::InvalidEnvelope {
                     reason: "invalid sender DID".to_string(),
                 }
             })?,
-            receiver_ds_did: Did::new_owned(canonical_did(target_ds_did).to_string()).map_err(
+            receiver_ds_did: Did::parse(canonical_did(target_ds_did).to_string()).map_err(
                 |_| FederationError::InvalidEnvelope {
                     reason: "invalid receiver DID".to_string(),
                 },
             )?,
-            sequencer_did: Did::new_owned(service_did_base()).map_err(|_| {
+            sequencer_did: Did::parse(service_did_base()).map_err(|_| {
                 FederationError::InvalidEnvelope {
                     reason: "invalid sequencer DID".to_string(),
                 }
             })?,
             sequencer_term: sequencer_term as i64,
-            received_at: crate::sqlx_jacquard::chrono_to_canonical_datetime(entry.received_at),
-            payload_sha256: Bytes::copy_from_slice(&envelope_sha256),
+            received_at: crate::atproto_conv::chrono_to_canonical_datetime(entry.received_at),
+            payload_sha256: Bytes(<[u8]>::to_vec(&envelope_sha256)),
             extra_data: None,
         },
-        recipient_did: Did::new_owned(recipient_did.to_string()).map_err(|_| {
+        recipient_did: Did::parse(recipient_did.to_string()).map_err(|_| {
             FederationError::InvalidEnvelope {
                 reason: "invalid recipient DID".to_string(),
             }
         })?,
         entry_locator: EntryLocatorV1 {
-            entry_id: SmolStr::from(locator.entry_id.hyphenated().to_string()),
+            entry_id: String::from(locator.entry_id.hyphenated().to_string()),
             seq: locator.seq as i64,
-            accepted_payload_sha256: Bytes::copy_from_slice(&locator.accepted_payload_sha256),
-            outer_entry_fingerprint: Bytes::copy_from_slice(&locator.outer_entry_fingerprint),
+            accepted_payload_sha256: Bytes(<[u8]>::to_vec(&locator.accepted_payload_sha256)),
+            outer_entry_fingerprint: Bytes(<[u8]>::to_vec(&locator.outer_entry_fingerprint)),
             extra_data: None,
         },
-        entry_bytes: Bytes::copy_from_slice(&entry.accepted_payload_bytes),
-        signed_request_bytes: Bytes::copy_from_slice(&entry.signed_request_bytes),
-        extra_data: None,
+        entry_bytes: Bytes(<[u8]>::to_vec(&entry.accepted_payload_bytes)),
+        signed_request_bytes: Bytes(<[u8]>::to_vec(&entry.signed_request_bytes)),
     };
 
-    let payload = serde_json::to_vec(&msg).map_err(FederationError::Json)?;
+    let payload =
+        catbird_server::atproto_conv::wire_json_bytes(&msg).map_err(FederationError::Json)?;
     let payload_sha256: [u8; 32] = Sha256::digest(&payload).into();
 
     insert_federation_outbox_job(
@@ -3384,10 +3401,9 @@ pub async fn enqueue_federated_welcome_job(
     tree_summary_sha256: &[u8; 32],
     sequencer_term: u64,
 ) -> Result<Uuid, FederationError> {
-    use catbird_atproto::generated::blue_catbird::mlsDS::deliver_welcome::DeliverWelcome;
-    use jacquard_common::deps::bytes::Bytes;
-    use jacquard_common::deps::smol_str::SmolStr;
-    use jacquard_common::types::string::Did;
+    use catbird_server::blue_catbird::mls_ds::deliver_welcome::Input as DeliverWelcome;
+    use petrel_core::Bytes;
+    use petrel_core::Did;
 
     let delivery_id = crate::sim_hooks::mint_entry_uuid_v4(
         b"mlsDS.deliverWelcome",
@@ -3476,58 +3492,58 @@ pub async fn enqueue_federated_welcome_job(
         tree_summary_sha256,
     )?;
 
-    let msg = DeliverWelcome::<jacquard_common::DefaultStr> {
+    let msg = DeliverWelcome {
         header: EnvelopeHeaderV1 {
-            protocol_version: SmolStr::from("1"),
-            delivery_id: SmolStr::from(delivery_id.hyphenated().to_string()),
-            conversation_id: SmolStr::from(conversation_id.hyphenated().to_string()),
-            sender_ds_did: Did::new_owned(self_base_did).map_err(|_| {
+            protocol_version: catbird_server::atproto_conv::open_enum("1"),
+            delivery_id: String::from(delivery_id.hyphenated().to_string()),
+            conversation_id: String::from(conversation_id.hyphenated().to_string()),
+            sender_ds_did: Did::parse(self_base_did).map_err(|_| {
                 FederationError::InvalidEnvelope {
                     reason: "invalid sender DID".to_string(),
                 }
             })?,
-            receiver_ds_did: Did::new_owned(canonical_did(target_ds_did).to_string()).map_err(
+            receiver_ds_did: Did::parse(canonical_did(target_ds_did).to_string()).map_err(
                 |_| FederationError::InvalidEnvelope {
                     reason: "invalid receiver DID".to_string(),
                 },
             )?,
-            sequencer_did: Did::new_owned(service_did_base()).map_err(|_| {
+            sequencer_did: Did::parse(service_did_base()).map_err(|_| {
                 FederationError::InvalidEnvelope {
                     reason: "invalid sequencer DID".to_string(),
                 }
             })?,
             sequencer_term: sequencer_term as i64,
-            received_at: crate::sqlx_jacquard::chrono_to_canonical_datetime(entry.received_at),
-            payload_sha256: Bytes::copy_from_slice(&envelope_sha256),
+            received_at: crate::atproto_conv::chrono_to_canonical_datetime(entry.received_at),
+            payload_sha256: Bytes(<[u8]>::to_vec(&envelope_sha256)),
             extra_data: None,
         },
-        recipient_did: Did::new_owned(recipient_did.to_string()).map_err(|_| {
+        recipient_did: Did::parse(recipient_did.to_string()).map_err(|_| {
             FederationError::InvalidEnvelope {
                 reason: "invalid recipient DID".to_string(),
             }
         })?,
-        recipient_device_id: SmolStr::from(recipient_device_id.hyphenated().to_string()),
-        welcome_id: SmolStr::from(welcome_id.hyphenated().to_string()),
-        recovery_request_id: SmolStr::from(recovery_request_id.hyphenated().to_string()),
-        key_package_ref: Bytes::copy_from_slice(key_package_ref),
-        welcome_bytes: Bytes::copy_from_slice(welcome_bytes),
-        welcome_sha256: Bytes::copy_from_slice(welcome_sha256),
-        entry_bytes: Bytes::copy_from_slice(&entry.accepted_payload_bytes),
-        signed_request_bytes: Bytes::copy_from_slice(&entry.signed_request_bytes),
+        recipient_device_id: String::from(recipient_device_id.hyphenated().to_string()),
+        welcome_id: String::from(welcome_id.hyphenated().to_string()),
+        recovery_request_id: String::from(recovery_request_id.hyphenated().to_string()),
+        key_package_ref: Bytes(<[u8]>::to_vec(key_package_ref)),
+        welcome_bytes: Bytes(<[u8]>::to_vec(welcome_bytes)),
+        welcome_sha256: Bytes(<[u8]>::to_vec(welcome_sha256)),
+        entry_bytes: Bytes(<[u8]>::to_vec(&entry.accepted_payload_bytes)),
+        signed_request_bytes: Bytes(<[u8]>::to_vec(&entry.signed_request_bytes)),
         entry_locator: EntryLocatorV1 {
-            entry_id: SmolStr::from(locator.entry_id.hyphenated().to_string()),
+            entry_id: String::from(locator.entry_id.hyphenated().to_string()),
             seq: locator.seq as i64,
-            accepted_payload_sha256: Bytes::copy_from_slice(&locator.accepted_payload_sha256),
-            outer_entry_fingerprint: Bytes::copy_from_slice(&locator.outer_entry_fingerprint),
+            accepted_payload_sha256: Bytes(<[u8]>::to_vec(&locator.accepted_payload_sha256)),
+            outer_entry_fingerprint: Bytes(<[u8]>::to_vec(&locator.outer_entry_fingerprint)),
             extra_data: None,
         },
         coordinates,
-        public_snapshot_sha256: Bytes::copy_from_slice(public_snapshot_sha256),
-        tree_summary_sha256: Bytes::copy_from_slice(tree_summary_sha256),
-        extra_data: None,
+        public_snapshot_sha256: Bytes(<[u8]>::to_vec(public_snapshot_sha256)),
+        tree_summary_sha256: Bytes(<[u8]>::to_vec(tree_summary_sha256)),
     };
 
-    let payload = serde_json::to_vec(&msg).map_err(FederationError::Json)?;
+    let payload =
+        catbird_server::atproto_conv::wire_json_bytes(&msg).map_err(FederationError::Json)?;
     let payload_sha256: [u8; 32] = Sha256::digest(&payload).into();
 
     insert_federation_outbox_job(
@@ -3570,16 +3586,10 @@ pub fn build_federated_commit_envelope(
     signed_request_bytes: &[u8],
     sequencer_term: u64,
     received_at: &CanonicalTimestamp,
-) -> Result<
-    catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit<
-        jacquard_common::DefaultStr,
-    >,
-    FederationError,
-> {
-    use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit;
-    use jacquard_common::deps::bytes::Bytes;
-    use jacquard_common::deps::smol_str::SmolStr;
-    use jacquard_common::types::string::Did;
+) -> Result<catbird_server::blue_catbird::mls_ds::submit_commit::Input, FederationError> {
+    use catbird_server::blue_catbird::mls_ds::submit_commit::Input as SubmitCommit;
+    use petrel_core::Bytes;
+    use petrel_core::Did;
 
     let delivery_id =
         derive_submit_commit_delivery_id(conversation_id, transition_id, sequencer_ds_did);
@@ -3601,33 +3611,30 @@ pub fn build_federated_commit_envelope(
     let envelope_sha256 =
         compute_commit_envelope_digest(&envelope_header_for_digest, signed_request_bytes)?;
 
-    let msg = SubmitCommit::<jacquard_common::DefaultStr> {
+    let msg = SubmitCommit {
         header: EnvelopeHeaderV1 {
-            protocol_version: SmolStr::from("1"),
-            delivery_id: SmolStr::from(delivery_id.hyphenated().to_string()),
-            conversation_id: SmolStr::from(conversation_id.hyphenated().to_string()),
-            sender_ds_did: Did::new_owned(self_base_did).map_err(|_| {
+            protocol_version: catbird_server::atproto_conv::open_enum("1"),
+            delivery_id: String::from(delivery_id.hyphenated().to_string()),
+            conversation_id: String::from(conversation_id.hyphenated().to_string()),
+            sender_ds_did: Did::parse(self_base_did).map_err(|_| {
                 FederationError::InvalidEnvelope {
                     reason: "invalid sender DID".to_string(),
                 }
             })?,
-            receiver_ds_did: Did::new_owned(target.clone()).map_err(|_| {
+            receiver_ds_did: Did::parse(target.clone()).map_err(|_| {
                 FederationError::InvalidEnvelope {
                     reason: "invalid receiver DID".to_string(),
                 }
             })?,
-            sequencer_did: Did::new_owned(target).map_err(|_| {
-                FederationError::InvalidEnvelope {
-                    reason: "invalid sequencer DID".to_string(),
-                }
+            sequencer_did: Did::parse(target).map_err(|_| FederationError::InvalidEnvelope {
+                reason: "invalid sequencer DID".to_string(),
             })?,
             sequencer_term: sequencer_term as i64,
-            received_at: crate::sqlx_jacquard::canonical_to_datetime(received_at),
-            payload_sha256: Bytes::copy_from_slice(&envelope_sha256),
+            received_at: crate::atproto_conv::canonical_to_datetime(received_at),
+            payload_sha256: Bytes(<[u8]>::to_vec(&envelope_sha256)),
             extra_data: None,
         },
-        signed_request_bytes: Bytes::copy_from_slice(signed_request_bytes),
-        extra_data: None,
+        signed_request_bytes: Bytes(<[u8]>::to_vec(signed_request_bytes)),
     };
 
     Ok(msg)

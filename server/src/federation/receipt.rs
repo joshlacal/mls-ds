@@ -6,9 +6,9 @@ use sha2::{Digest, Sha256};
 
 use super::envelope::{DELIVER_MESSAGE_NSID, DELIVER_WELCOME_NSID, SUBMIT_COMMIT_NSID};
 use super::errors::FederationError;
-use catbird_atproto::generated::blue_catbird::chat::submit_transition::SubmitTransitionOutput;
-use catbird_atproto::generated::blue_catbird::chat::ConversationEntry;
-use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommitOutput;
+use crate::blue_catbird::chat::submit_transition::Output as SubmitTransitionOutput;
+use crate::blue_catbird::chat::ConversationEntry;
+use crate::blue_catbird::mls_ds::submit_commit::Output as SubmitCommitOutput;
 use serde_json::Value;
 use uuid::Uuid;
 /// Baseline verification method used before the first receipt-key rotation.
@@ -1302,20 +1302,28 @@ pub(crate) fn result_bytes_for_receipt(
         DELIVER_WELCOME_NSID | DELIVER_MESSAGE_NSID => Ok(b"{\"accepted\":true}".to_vec()),
         SUBMIT_COMMIT_NSID => {
             let output: SubmitCommitOutput =
-                serde_json::from_slice(response_bytes).map_err(|e| {
-                    FederationError::InvalidEnvelope {
-                        reason: format!(
-                            "failed to parse submitCommit response for receipt result: {e}"
-                        ),
-                    }
+                catbird_server::chat_protocol::retained_json::decode_submit_commit_output(
+                    response_bytes,
+                )
+                .map_err(|e| FederationError::InvalidEnvelope {
+                    reason: format!(
+                        "failed to parse submitCommit response for receipt result: {e}"
+                    ),
                 })?;
             let st_output = SubmitTransitionOutput {
                 coordinates: output.coordinates,
                 entry: ConversationEntry::CommitEntry(Box::new(output.commit_entry)),
                 welcomes: vec![],
-                extra_data: None,
             };
-            serde_json::to_vec(&st_output).map_err(|e| FederationError::InvalidEnvelope {
+            let source: serde_json::Value =
+                serde_json::from_slice(response_bytes).map_err(FederationError::Json)?;
+            let source = serde_json::json!({"entry": source["commitEntry"], "coordinates": source["coordinates"], "welcomes": []});
+            catbird_server::chat_protocol::retained_json::encode_output_with_source(
+                "blue.catbird.chat.submitTransition",
+                &st_output,
+                Some(&source),
+            )
+            .map_err(|e| FederationError::InvalidEnvelope {
                 reason: format!("failed to serialize reconstructed submitTransition response: {e}"),
             })
         }
@@ -2430,6 +2438,12 @@ mod tests {
         let resp_bytes = json_str.into_bytes();
         let result = result_bytes_for_receipt(SUBMIT_COMMIT_NSID, &resp_bytes).unwrap();
 
+        // Captured from the original Rust submitTransition receipt serializer.
+        assert_eq!(result.len(), 3242);
+        assert_eq!(
+            hex::encode(Sha256::digest(&result)),
+            "75b1dd5d43aac9edd9d136f1d5de35304e788cfcd45ed2e268a3745fc5b71e5c"
+        );
         let parsed_st: serde_json::Value = serde_json::from_slice(&result).unwrap();
         assert_eq!(parsed_st["coordinates"]["epoch"], 1);
         assert_eq!(parsed_st["entry"]["seq"], 1);

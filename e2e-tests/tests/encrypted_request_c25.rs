@@ -258,14 +258,7 @@ async fn publish(w: &World, sender: usize) -> anyhow::Result<Published> {
             sequencer_receipt_authority_key: w.server.sequencer_receipt_public_key.clone(),
             text: format!("C25 introduction {sender}"),
             invitation: None,
-            metadata: GroupMetadataV1 {
-                version: 1,
-                title: String::new(),
-                description: String::new(),
-                avatar_blob_locator: None,
-                avatar_content_type: None,
-                space_avatar: None,
-            },
+            metadata: GroupMetadataV1::new("", ""),
         })?;
     let b = &journal.bootstrap;
     let mut body = prepare["body"].clone();

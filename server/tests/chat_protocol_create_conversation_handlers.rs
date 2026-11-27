@@ -1256,7 +1256,7 @@ async fn exercise_generated_transition_handler(origin: GeneratedTransitionOrigin
         origin.name(),
         String::from_utf8_lossy(&first_response)
     );
-    let output: catbird_atproto::blue_catbird::chat::submit_transition::SubmitTransitionOutput =
+    let output: catbird_server::blue_catbird::chat::submit_transition::Output =
         serde_json::from_slice(&first_response)
             .expect("generated Rust decodes actual submit response");
     assert_eq!(output.coordinates.state_version, 1);
@@ -1361,7 +1361,7 @@ async fn exercise_generated_transition_handler(origin: GeneratedTransitionOrigin
         "{}",
         String::from_utf8_lossy(&read_response)
     );
-    let read_output: catbird_atproto::blue_catbird::chat::get_entries::GetEntriesOutput =
+    let read_output: catbird_server::blue_catbird::chat::get_entries::Output =
         serde_json::from_slice(&read_response)
             .expect("generated Rust decodes actual getEntries response");
     assert_eq!(read_output.entries.len(), 2);
@@ -1419,7 +1419,7 @@ async fn exercise_generated_transition_handler(origin: GeneratedTransitionOrigin
         "{}",
         String::from_utf8_lossy(&state_response)
     );
-    let state_output: catbird_atproto::blue_catbird::chat::get_conversation_state::GetConversationStateOutput =
+    let state_output: catbird_server::blue_catbird::chat::get_conversation_state::Output =
         serde_json::from_slice(&state_response)
             .expect("generated Rust decodes actual getConversationState response");
     assert_eq!(state_output.state.coordinates, output.coordinates);

@@ -31,16 +31,11 @@ use std::{
     },
 };
 
-use atproto_spaces::{
-    http_signature::sign_credential_request,
-    kem::{encapsulate_p256, encode_p256_did_key},
-    mac::{
-        format_accept_signature, verify_commit_mac, verify_record_mac, MacProfile,
-        ACCEPT_SIGNATURE_HEADER,
-    },
-    star::read_star_repo_authenticated,
-    tokens::{mint_space_token, SpaceSigningKey, SpaceTokenClaims, SpaceTokenKind},
-};
+#[path = "common/space_fixtures.rs"]
+mod space_fixtures;
+use petrel_spaces::{encapsulate_p256, format_accept_signature, MacProfile};
+use space_fixtures::{did_key, signed_headers};
+
 use axum::{
     body::Body,
     extract::{FromRef, Query, State},
@@ -2107,7 +2102,7 @@ async fn nov12_space_host_and_fc03_space_relays_end_to_end() {
     let sender_pds_key = P256SigningKey::from_bytes((&[0x72_u8; 32]).into()).unwrap();
     let recipient_pds_key = P256SigningKey::from_bytes((&[0x73_u8; 32]).into()).unwrap();
     let charlie_pds_key = P256SigningKey::from_bytes((&[0x75_u8; 32]).into()).unwrap();
-    let authority_kem = encode_p256_did_key(&P256PublicKey::from(authority_key.verifying_key()));
+    let authority_kem = did_key(&P256PublicKey::from(authority_key.verifying_key()));
     let authority_doc = json!({
         "id": authority_did,
         "verificationMethod": [
@@ -2236,24 +2231,9 @@ async fn nov12_space_host_and_fc03_space_relays_end_to_end() {
     //    millisecond `.000Z` `expiresAt`.
     let now_sec = Utc::now().timestamp() as u64;
     let pop_key = P256SigningKey::from_bytes((&[0x74_u8; 32]).into()).unwrap();
-    let cnf_kid = encode_p256_did_key(&P256PublicKey::from(pop_key.verifying_key()));
-    let del_token = mint_space_token(
-        SpaceTokenKind::Delegation,
-        &SpaceSigningKey::P256 {
-            signing_key: sender_pds_key.clone(),
-            kid: "#atproto".to_string(),
-        },
-        &SpaceTokenClaims {
-            iss: user_did.clone(),
-            sub: space_uri.clone(),
-            aud: Some(format!("{authority_did}#atproto_pds")),
-            iat: now_sec,
-            exp: now_sec + 60,
-            jti: "w2d-del-1".into(),
-            cnf_kid: None,
-        },
-    )
-    .unwrap();
+    let cnf_kid = did_key(&P256PublicKey::from(pop_key.verifying_key()));
+    let del_token =
+        space_fixtures::delegation(&sender_pds_key, &user_did, &space_uri, "w2d-del-1", now_sec);
 
     let syncer_token = "w2d-subscriber-token-0123456789abcdef";
     let (cred_status, cred_body) = http::send(
@@ -2333,23 +2313,13 @@ async fn nov12_space_host_and_fc03_space_relays_end_to_end() {
     }
 
     // Subsequent `relaySpaceCredential` returns the populated `spaceRev`!
-    let del_token_rev = mint_space_token(
-        SpaceTokenKind::Delegation,
-        &SpaceSigningKey::P256 {
-            signing_key: sender_pds_key.clone(),
-            kid: "#atproto".to_string(),
-        },
-        &SpaceTokenClaims {
-            iss: user_did.clone(),
-            sub: space_uri.clone(),
-            aud: Some(format!("{authority_did}#atproto_pds")),
-            iat: now_sec,
-            exp: now_sec + 60,
-            jti: "w2d-del-spacerev".into(),
-            cnf_kid: None,
-        },
-    )
-    .unwrap();
+    let del_token_rev = space_fixtures::delegation(
+        &sender_pds_key,
+        &user_did,
+        &space_uri,
+        "w2d-del-spacerev",
+        now_sec,
+    );
     let (cred2_status, cred2_body) = http::send(
         home_router.clone(),
         http::unsigned_json_request(
@@ -2375,9 +2345,9 @@ async fn nov12_space_host_and_fc03_space_relays_end_to_end() {
     // 2. `relaySpaceRead` allows `com.atproto.space.listWriters`, forwards `acceptSignature`, and
     //    preserves `Atproto-Space-Commit`, `Signature-Input`, `Signature`, and `Vary`!
     let encap = encapsulate_p256(&authority_kem).expect("encapsulate P-256");
-    let accept_sig = format_accept_signature(MacProfile::Commit, &encap.key_share_did_key).unwrap();
+    let accept_sig = format_accept_signature(MacProfile::Commit, &encap.key_share).unwrap();
     let pop_secret = P256Secret::from_slice(&pop_key.to_bytes()).unwrap();
-    let signed_hdrs = sign_credential_request(
+    let signed_hdrs = signed_headers(
         &pop_secret,
         &cred_jwt,
         authority_did,
@@ -2487,23 +2457,13 @@ async fn nov12_space_host_and_fc03_space_relays_end_to_end() {
     .await
     .expect("remove charlie from conversation membership");
 
-    let del_token_2 = mint_space_token(
-        SpaceTokenKind::Delegation,
-        &SpaceSigningKey::P256 {
-            signing_key: charlie_pds_key,
-            kid: "#atproto".to_string(),
-        },
-        &SpaceTokenClaims {
-            iss: charlie_did.to_owned(),
-            sub: space_uri.clone(),
-            aud: Some(format!("{authority_did}#atproto_pds")),
-            iat: now_sec,
-            exp: now_sec + 60,
-            jti: "w2d-del-removed".into(),
-            cnf_kid: None,
-        },
-    )
-    .unwrap();
+    let del_token_2 = space_fixtures::delegation(
+        &charlie_pds_key,
+        &charlie_did,
+        &space_uri,
+        "w2d-del-removed",
+        now_sec,
+    );
     let (denied_status, denied_bytes) = http::send_bytes(
         home_router.clone(),
         http::unsigned_json_request(
@@ -2576,7 +2536,7 @@ async fn d1_get_mailbox_keys_record_verifies_signed_car_proofs_over_http() {
     let target_did = "did:web:mailbox-target-w2d.catbird.blue";
     let pds_secret = P256Secret::from_slice(&[0x81_u8; 32]).unwrap();
     let wrong_secret = P256Secret::from_slice(&[0x82_u8; 32]).unwrap();
-    let pds_did_key = encode_p256_did_key(&pds_secret.public_key());
+    let pds_did_key = did_key(&pds_secret.public_key());
 
     let val_7 = sample_mailbox_value(7);
     let (valid_car, valid_cids) = build_signed_repo_car(
@@ -2998,7 +2958,7 @@ async fn r2_pending_approval_get_own_devices_labyrinth_self_reads_and_epoch_self
     let alice_did = "did:web:alice-recovery-r2.catbird.blue".to_owned();
     let pds_secret = P256Secret::from_slice(&[0x61_u8; 32]).unwrap();
     let alice_signing = p256::ecdsa::SigningKey::from_slice(&[0x61_u8; 32]).unwrap();
-    let pds_multibase = encode_p256_did_key(&pds_secret.public_key())
+    let pds_multibase = did_key(&pds_secret.public_key())
         .strip_prefix("did:key:")
         .unwrap()
         .to_owned();
@@ -4058,7 +4018,7 @@ async fn r2_spaces_nov12_client_attestation_notify_null_memberspace_check_access
     let client_att_key = P256SigningKey::from_bytes((&[0x95_u8; 32]).into()).unwrap();
     let wrong_att_key = P256SigningKey::from_bytes((&[0x96_u8; 32]).into()).unwrap();
 
-    let authority_kem = encode_p256_did_key(&P256PublicKey::from(authority_key.verifying_key()));
+    let authority_kem = did_key(&P256PublicKey::from(authority_key.verifying_key()));
     let authority_doc = json!({
         "id": authority_did,
         "verificationMethod": [
@@ -4157,26 +4117,10 @@ async fn r2_spaces_nov12_client_attestation_notify_null_memberspace_check_access
     let now_sec = Utc::now().timestamp() as u64;
     let pop_key = P256SigningKey::from_bytes((&[0x97_u8; 32]).into()).unwrap();
     let pop_secret = P256Secret::from_slice(&pop_key.to_bytes()).unwrap();
-    let cnf_kid = encode_p256_did_key(&P256PublicKey::from(pop_key.verifying_key()));
+    let cnf_kid = did_key(&P256PublicKey::from(pop_key.verifying_key()));
 
     let mint_del = |issuer: &str, sk: &P256SigningKey, jti: &str| {
-        mint_space_token(
-            SpaceTokenKind::Delegation,
-            &SpaceSigningKey::P256 {
-                signing_key: sk.clone(),
-                kid: "#atproto".to_string(),
-            },
-            &SpaceTokenClaims {
-                iss: issuer.to_owned(),
-                sub: space_uri.clone(),
-                aud: Some(format!("{authority_did}#atproto_pds")),
-                iat: now_sec,
-                exp: now_sec + 60,
-                jti: jti.to_owned(),
-                cnf_kid: None,
-            },
-        )
-        .unwrap()
+        space_fixtures::delegation(&sk, &issuer, &space_uri, jti, now_sec)
     };
 
     // 1. Finding 4 + Finding 5(a):
@@ -4205,23 +4149,13 @@ async fn r2_spaces_nov12_client_attestation_notify_null_memberspace_check_access
         reqwest::StatusCode::BAD_REQUEST
     );
 
-    let bad_client_att = mint_space_token(
-        SpaceTokenKind::ClientAttestation,
-        &SpaceSigningKey::P256 {
-            signing_key: wrong_att_key,
-            kid: "oauth-client-k1".to_string(),
-        },
-        &SpaceTokenClaims {
-            iss: client_id.to_owned(),
-            sub: client_id.to_owned(),
-            aud: Some(format!("{authority_did}#atproto_pds")),
-            iat: now_sec,
-            exp: now_sec + 120,
-            jti: "r2-bad-att-1".to_owned(),
-            cnf_kid: None,
-        },
-    )
-    .unwrap();
+    let bad_client_att = space_fixtures::client_attestation(
+        &wrong_att_key,
+        &client_id,
+        authority_did,
+        "r2-bad-att-1",
+        now_sec,
+    );
     let bad_att_resp = http_client
         .post(format!(
             "http://{remote_addr}/xrpc/com.atproto.space.authorizeSpaceSync"
@@ -4239,23 +4173,13 @@ async fn r2_spaces_nov12_client_attestation_notify_null_memberspace_check_access
     let bad_att_json: Value = bad_att_resp.json().await.unwrap();
     assert_eq!(bad_att_json["error"], "InvalidClientAttestation");
 
-    let valid_client_att = mint_space_token(
-        SpaceTokenKind::ClientAttestation,
-        &SpaceSigningKey::P256 {
-            signing_key: client_att_key,
-            kid: "oauth-client-k1".to_string(),
-        },
-        &SpaceTokenClaims {
-            iss: client_id.to_owned(),
-            sub: client_id.to_owned(),
-            aud: Some(format!("{authority_did}#atproto_pds")),
-            iat: now_sec,
-            exp: now_sec + 120,
-            jti: "r2-ok-att-1".to_owned(),
-            cnf_kid: None,
-        },
-    )
-    .unwrap();
+    let valid_client_att = space_fixtures::client_attestation(
+        &client_att_key,
+        &client_id,
+        authority_did,
+        "r2-ok-att-1",
+        now_sec,
+    );
     let (st_relay_cred, relay_cred_body) = http::send(
         home_router.clone(),
         http::unsigned_json_request(
@@ -4501,7 +4425,7 @@ async fn r2_spaces_nov12_client_attestation_notify_null_memberspace_check_access
         .unwrap();
     assert_eq!(rm_mem_resp.status(), reqwest::StatusCode::OK);
 
-    let out_hdrs = sign_credential_request(
+    let out_hdrs = signed_headers(
         &pop_secret,
         &out_cred_jwt,
         authority_did,
@@ -4579,9 +4503,8 @@ async fn r2_spaces_nov12_client_attestation_notify_null_memberspace_check_access
 
     // Verify `com.atproto.space.getRecord` via `relaySpaceRead` + `Atproto-Space-Record` MAC!
     let encap_rec = encapsulate_p256(&authority_kem).expect("encap record MAC");
-    let accept_rec =
-        format_accept_signature(MacProfile::Record, &encap_rec.key_share_did_key).unwrap();
-    let rec_hdrs = sign_credential_request(
+    let accept_rec = format_accept_signature(MacProfile::Record, &encap_rec.key_share).unwrap();
+    let rec_hdrs = signed_headers(
         &pop_secret,
         &cred_jwt,
         &user_did,
@@ -4614,9 +4537,9 @@ async fn r2_spaces_nov12_client_attestation_notify_null_memberspace_check_access
     );
     let get_rec_resp = home_router.clone().oneshot(get_rec_req).await.unwrap();
     assert_eq!(get_rec_resp.status(), StatusCode::OK);
-    verify_record_mac(
+    space_fixtures::verify_record(
         &encap_rec.shared_secret,
-        &encap_rec.key_share_did_key,
+        &encap_rec.key_share,
         get_rec_resp.headers(),
         &cids[0].1,
         &cids[0].2,
@@ -4637,10 +4560,9 @@ async fn r2_spaces_nov12_client_attestation_notify_null_memberspace_check_access
     // + `Atproto-Space-Commit` MAC + `read_star_repo_authenticated` LtHash1024 verification!
     let encap_commit = encapsulate_p256(&authority_kem).expect("encap commit MAC");
     let accept_commit =
-        format_accept_signature(MacProfile::Commit, &encap_commit.key_share_did_key).unwrap();
+        format_accept_signature(MacProfile::Commit, &encap_commit.key_share).unwrap();
     let repo_hdrs =
-        sign_credential_request(&pop_secret, &cred_jwt, &user_did, now_sec, "r2-get-repo-1")
-            .unwrap();
+        signed_headers(&pop_secret, &cred_jwt, &user_did, now_sec, "r2-get-repo-1").unwrap();
     let get_repo_query = format!(
         "space={}&repo={}",
         urlencoding::encode(&space_uri),
@@ -4675,21 +4597,26 @@ async fn r2_spaces_nov12_client_attestation_notify_null_memberspace_check_access
     let star_bytes = axum::body::to_bytes(get_repo_resp.into_body(), 1024 * 1024)
         .await
         .unwrap();
-    let parsed_star = read_star_repo_authenticated(&star_bytes, &space_uri, &user_did, |meta| {
-        verify_commit_mac(
-            &encap_commit.shared_secret,
-            &encap_commit.key_share_did_key,
-            &resp_headers,
-            &space_uri,
-            &user_did,
-            &meta.rev,
-            &meta.data,
-        )
-    })
-    .expect("STAR v0.2 archive + Atproto-Space-Commit MAC + LtHash1024 must verify");
+    let commit = space_fixtures::verified_commit(
+        &encap_commit.shared_secret,
+        &encap_commit.key_share,
+        &resp_headers,
+        &space_uri,
+        &user_did,
+    )
+    .unwrap();
+    let parsed_star = petrel_spaces::read_star_repo_authenticated(
+        &star_bytes,
+        &commit.space,
+        Some(&commit.repo),
+        Some(&commit.rev),
+        Some(&commit.data),
+        1024 * 1024,
+    )
+    .expect("verify MAC-authenticated STAR writer, revision, and set hash");
     assert_eq!(parsed_star.records.len(), 2);
-    assert_eq!(parsed_star.records[0].rkey, "3k2rec0000001");
-    assert_eq!(parsed_star.records[1].rkey, "3k2rec0000002");
+    assert_eq!(parsed_star.records[0].rkey.as_str(), "3k2rec0000001");
+    assert_eq!(parsed_star.records[1].rkey.as_str(), "3k2rec0000002");
 
     pool_home.close().await;
     pool_remote.close().await;

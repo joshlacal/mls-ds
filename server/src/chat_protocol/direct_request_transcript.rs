@@ -1596,7 +1596,7 @@ macro_rules! endpoint_lexicons {
 
 /// Every chat endpoint whose output (or subscription message) schema reaches a
 /// bytes field.
-fn endpoint_output_schema(nsid: &str) -> Option<&'static Value> {
+pub(super) fn endpoint_output_schema(nsid: &str) -> Option<&'static Value> {
     static SCHEMAS: std::sync::OnceLock<std::collections::HashMap<&'static str, Value>> =
         std::sync::OnceLock::new();
     SCHEMAS
@@ -1668,7 +1668,7 @@ pub fn present_endpoint_output(nsid: &str, raw: Vec<u8>) -> Result<Vec<u8>> {
 }
 
 /// Endpoint lexicons reference `blue.catbird.chat.defs#x`; defs use `#x`.
-fn read_ref_name(reference: &str) -> Option<&str> {
+pub(super) fn read_ref_name(reference: &str) -> Option<&str> {
     reference
         .strip_prefix("blue.catbird.chat.defs")
         .unwrap_or(reference)
@@ -1694,6 +1694,13 @@ fn present_read_schema(schema: &Value, value: &mut Value, depth: usize) -> Resul
                     return Err(error("noncanonical bytes presentation"));
                 }
                 *value = serde_json::json!({ "$bytes": encoded });
+            } else if let Some(encoded) = value.get_mut("$bytes") {
+                let text = encoded
+                    .as_str()
+                    .ok_or_else(|| error("invalid bytes presentation"))?;
+                *encoded = Value::String(
+                    catbird_server::atproto_conv::padded_chat_bytes(text).map_err(error)?,
+                );
             }
         }
         Some("object") => {
@@ -2129,7 +2136,7 @@ mod read_presentation_tests {
             "requestId": checked.body()["requestId"],
             "senderDid": checked.body()["actorDid"],
         });
-        let _: catbird_atproto::generated::blue_catbird::chat::DirectRequestState =
+        let _: catbird_server::blue_catbird::chat::DirectRequestState =
             crate::chat_protocol::transcript::decode_direct_request_generated_view(
                 &serde_json::to_vec(&state).unwrap(),
                 "directRequestState",

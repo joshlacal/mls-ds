@@ -40,8 +40,10 @@
 //!    the recovery code; the revoked tablet can no longer open the mailbox.
 //!
 //! Requires `clean_slate_federation_fixture` in mls-ds/target/debug (built with
-//! `--features test-support`) and a loopback PostgreSQL on 127.0.0.1:5432 whose
-//! OS-user role can create databases (each run creates and drops its own):
+//! `--features test-support`) and a loopback PostgreSQL instance whose role can
+//! create databases. Each run creates and drops its own database. Set
+//! `CLEAN_SLATE_PG_ADMIN_URL` for a private instance on another port.
+//! The default is `postgresql://127.0.0.1:5432/postgres`.
 //!
 //! ```sh
 //! cargo build --manifest-path server/Cargo.toml --features test-support \
@@ -93,10 +95,7 @@ impl DeviceUnderTest {
         ds: &CleanSlateDsProcess,
         pds: &SpacesPds,
     ) -> Result<Self> {
-        let transport = Arc::new(ClientTransport::new(vec![
-            ds.base_url.clone(),
-            pds.base_url.clone(),
-        ]));
+        let transport = Arc::new(pds.client_transport(&ds.base_url));
         transport.set_account(did, key.clone(), DS_DID, &pds.base_url, pds_session);
         let config = CatbirdMlsClientConfig {
             storage_root: root.join(label).to_string_lossy().into(),
@@ -126,7 +125,16 @@ impl DeviceUnderTest {
         let client = self.client.clone();
         tokio::task::spawn_blocking(move || call(&client))
             .await?
-            .with_context(|| self.label.clone())
+            .with_context(|| {
+                let Some(exchange) = self.transport.exchanges().pop() else {
+                    return self.label.clone();
+                };
+                let endpoint = exchange.url.split('?').next().unwrap_or(&exchange.url);
+                format!(
+                    "{}: {} {endpoint} returned {}",
+                    self.label, exchange.method, exchange.status
+                )
+            })
     }
 
     async fn send(&self, cid: &str, text: &str) -> Result<String> {
@@ -498,10 +506,10 @@ async fn labyrinth_backup_restore_import_and_revocation_against_live_mlsds() -> 
             .await?
     };
     anyhow::ensure!(
-        rotated.epoch_seq > epoch0,
+        rotated.status.epoch_seq > epoch0,
         "revocation opens a new epoch ({rotated:?})"
     );
-    let head1 = epoch_head(&ds, ALICE, rotated.epoch_seq as i64).await?;
+    let head1 = epoch_head(&ds, ALICE, rotated.status.epoch_seq as i64).await?;
     anyhow::ensure!(head1 != head0);
     let revoked = mailbox_devices(&pds, ALICE)?
         .into_iter()
@@ -519,9 +527,12 @@ async fn labyrinth_backup_restore_import_and_revocation_against_live_mlsds() -> 
             .collect();
     // The tablet's restore opened the epoch it joined; the revocation's epoch excludes it.
     anyhow::ensure!(
-        !memberships.is_empty() && memberships.iter().all(|epoch| *epoch < rotated.epoch_seq),
+        !memberships.is_empty()
+            && memberships
+                .iter()
+                .all(|epoch| *epoch < rotated.status.epoch_seq),
         "tablet epoch memberships {memberships:?} (revocation epoch {})",
-        rotated.epoch_seq
+        rotated.status.epoch_seq
     );
 
     let third = phone.send(&cid, "after rotation").await?;
@@ -612,7 +623,7 @@ async fn labyrinth_backup_restore_import_and_revocation_against_live_mlsds() -> 
     );
     println!(
         "phone revoked the tablet (epoch {}); post-rotation sends address only the new epoch; tablet refused: {refusal}",
-        rotated.epoch_seq
+        rotated.status.epoch_seq
     );
 
     // The only refusals are absence probes: records not written yet (the next

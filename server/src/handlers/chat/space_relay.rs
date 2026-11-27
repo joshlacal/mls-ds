@@ -6,14 +6,15 @@
 
 use std::sync::Arc;
 
+use crate::blue_catbird::chat::{
+    relay_space_credential::Input as RelaySpaceCredential,
+    relay_space_read::Input as RelaySpaceRead,
+};
 use axum::{
     body::Bytes,
     extract::State,
     http::{header::CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-};
-use catbird_atproto::generated::blue_catbird::chat::{
-    relay_space_credential::RelaySpaceCredential, relay_space_read::RelaySpaceRead,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -320,7 +321,10 @@ mod tests {
         let authority = "did:web:credential-relay-denial.example";
         let space = format!("at:space/{authority}/blue.catbird.labyrinth.mailbox/self");
         let pop = p256::SecretKey::from_slice(&[0x31; 32]).unwrap();
-        let kid = atproto_spaces::kem::encode_p256_did_key(&pop.public_key());
+        let kid = petrel_spaces::SigningKeyPair::from_p256_bytes(&pop.to_bytes())
+            .unwrap()
+            .did_key()
+            .unwrap();
         let upstream = Arc::new(Mutex::new((StatusCode::OK, json!({}))));
         let router = Router::new().route(
             "/xrpc/com.atproto.space.authorizeSpaceSync",
@@ -369,7 +373,10 @@ mod tests {
         let authority = "did:web:credential-relay-signed-denial.example";
         let space = format!("at:space/{authority}/blue.catbird.labyrinth.conversation/c-0");
         let pop = p256::SecretKey::from_slice(&[0x32; 32]).unwrap();
-        let kid = atproto_spaces::kem::encode_p256_did_key(&pop.public_key());
+        let kid = petrel_spaces::SigningKeyPair::from_p256_bytes(&pop.to_bytes())
+            .unwrap()
+            .did_key()
+            .unwrap();
         let signed: &[u8] =
             br#"{ "message":"not an active member" , "denial":"h.p.s","error":"NotAuthorized"}"#;
         let upstream = Arc::new(Mutex::new(signed.to_vec()));
@@ -425,7 +432,10 @@ mod tests {
         let target = "did:web:space-relay-outage.example";
         let space = format!("at:space/{target}/blue.catbird.labyrinth.mailbox/self");
         let pop = p256::SecretKey::from_slice(&[0x31; 32]).unwrap();
-        let kid = atproto_spaces::kem::encode_p256_did_key(&pop.public_key());
+        let kid = petrel_spaces::SigningKeyPair::from_p256_bytes(&pop.to_bytes())
+            .unwrap()
+            .did_key()
+            .unwrap();
         let upstream = Arc::new(Mutex::new(StatusCode::OK));
         let document = Arc::new(Mutex::new(StatusCode::OK));
         let answer = {

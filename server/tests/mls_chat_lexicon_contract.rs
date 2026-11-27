@@ -1,11 +1,11 @@
 //! Executable guard for the clean `blue.catbird.chat` Lexicon corpus.
 //!
 //! The Python companion freezes semantic shapes and runs negative mutations.
-//! This test additionally parses every document with the same Jacquard parser
+//! This test additionally parses every document with the same Petrel parser
 //! used by this repository and enforces an exact canonical/server manifest.
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use jacquard_lexicon::lexicon::LexiconDoc;
+use petrel_lexicon::LexiconDoc;
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -78,12 +78,11 @@ fn validate_corpus(corpus: &BTreeMap<String, Vec<u8>>, label: &str) {
             .unwrap_or_else(|error| panic!("{label}/{filename} must be UTF-8: {error}"));
         let value: Value = serde_json::from_str(source)
             .unwrap_or_else(|error| panic!("{label}/{filename} must be JSON: {error}"));
-        let reparsed = serde_json::to_value(
-            serde_json::from_str::<LexiconDoc<'_>>(source).unwrap_or_else(|error| {
-                panic!("{label}/{filename} must parse as a Jacquard Lexicon: {error}")
-            }),
-        )
-        .unwrap_or_else(|error| panic!("{label}/{filename} Lexicon must serialize: {error}"));
+        let reparsed =
+            serde_json::to_value(LexiconDoc::from_json_bytes(bytes).unwrap_or_else(|error| {
+                panic!("{label}/{filename} must parse as a Petrel Lexicon: {error}")
+            }))
+            .unwrap_or_else(|error| panic!("{label}/{filename} Lexicon must serialize: {error}"));
         assert_eq!(
             reparsed["lexicon"], value["lexicon"],
             "{label}/{filename} Lexicon version drift"

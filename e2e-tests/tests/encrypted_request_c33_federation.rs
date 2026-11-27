@@ -1141,14 +1141,7 @@ async fn run_c33_orientation(reverse: bool) -> anyhow::Result<()> {
             sequencer_receipt_authority_key: server_a.sequencer_receipt_public_key.clone(),
             text: "Hello from Alice over Catbird MLS Federation".into(),
             invitation: None,
-            metadata: GroupMetadataV1 {
-                version: 1,
-                title: String::new(),
-                description: String::new(),
-                avatar_blob_locator: None,
-                avatar_content_type: None,
-                space_avatar: None,
-            },
+            metadata: GroupMetadataV1::new("", ""),
         })?;
 
     let bootstrap = &journal.bootstrap;
@@ -2925,14 +2918,7 @@ async fn c33_two_authority_concurrent_first_sends_and_delivery_retry_e2e() -> an
             sequencer_receipt_authority_key: server_a.sequencer_receipt_public_key.clone(),
             text: "Converged authoritative direct request".into(),
             invitation: None,
-            metadata: GroupMetadataV1 {
-                version: 1,
-                title: String::new(),
-                description: String::new(),
-                avatar_blob_locator: None,
-                avatar_content_type: None,
-                space_avatar: None,
-            },
+            metadata: GroupMetadataV1::new("", ""),
         })?;
 
     let bootstrap = &journal.bootstrap;

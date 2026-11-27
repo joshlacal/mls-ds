@@ -26,7 +26,6 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, Postgres, Transaction};
 use uuid::Uuid;
@@ -85,16 +84,9 @@ pub struct Admission {
     pub read: Option<ReadProof>,
 }
 
-/// `labyrinthWriteBody`.
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct WriteBodyWire {
-    pub(crate) operation_id: String,
-    pub(crate) actor_device_id: String,
-    pub(crate) endpoint_nsid: String,
-    pub(crate) payload_sha256: String,
-    pub(crate) signed_at: String,
-}
+#[path = "write_body_wire.rs"]
+mod write_body_wire;
+pub(crate) use write_body_wire::WriteBodyWire;
 
 /// The verified parts of a `labyrinthWriteBody`.
 #[derive(Clone, Debug)]

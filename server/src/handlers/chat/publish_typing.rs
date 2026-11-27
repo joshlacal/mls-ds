@@ -63,7 +63,7 @@ async fn publish(
         .get("typing")
         .cloned()
         .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;
-    let roundtrip: catbird_atproto::generated::blue_catbird::chat::publish_typing::PublishTypingOutput =
+    let roundtrip: crate::blue_catbird::chat::publish_typing::Output =
         serde_json::from_value(response_value.clone())
             .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
     let _ = serde_json::to_value(roundtrip).map_err(|_| ChatFailure::invariant(ENDPOINT))?;

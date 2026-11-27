@@ -9,11 +9,11 @@ use crate::{
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ResolveDeliveryServiceOutput<'a> {
-    did: jacquard_common::types::string::Did,
-    endpoint: jacquard_common::CowStr<'a>,
+pub struct ResolveDeliveryServiceOutput {
+    did: petrel_core::Did,
+    endpoint: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    supported_cipher_suites: Option<Vec<jacquard_common::CowStr<'a>>>,
+    supported_cipher_suites: Option<Vec<String>>,
 }
 
 /// GET /xrpc/blue.catbird.chat.resolveDeliveryService
@@ -24,11 +24,11 @@ pub async fn resolve(
     State(resolver): State<Arc<DsResolver>>,
     _auth_user: AuthUser,
     axum::extract::Query(query): axum::extract::Query<ResolveParams>,
-) -> Result<Json<ResolveDeliveryServiceOutput<'static>>, FederationError> {
+) -> Result<Json<ResolveDeliveryServiceOutput>, FederationError> {
     let user_did = &query.did;
     let ds_endpoint = resolver.resolve(user_did).await?;
 
-    let did = crate::sqlx_jacquard::try_string_to_did(user_did).map_err(|e| {
+    let did = crate::atproto_conv::try_string_to_did(user_did).map_err(|e| {
         FederationError::ResolutionFailed {
             did: user_did.clone(),
             kind: crate::federation::ResolutionFailureKind::InvalidDid(e),
@@ -36,9 +36,7 @@ pub async fn resolve(
     })?;
 
     let endpoint =
-        jacquard_common::types::string::UriValue::<jacquard_common::DefaultStr>::new_owned(
-            &ds_endpoint.endpoint,
-        )
+        petrel_core::Uri::parse(ds_endpoint.endpoint.as_str())
         .map_err(|e| FederationError::ResolutionFailed {
             did: user_did.clone(),
             kind: crate::federation::ResolutionFailureKind::InvalidUrl(format!(
@@ -50,7 +48,6 @@ pub async fn resolve(
     let supported_cipher_suites = ds_endpoint.supported_cipher_suites.map(|suites| {
         suites
             .into_iter()
-            .map(jacquard_common::CowStr::from)
             .collect()
     });
 
@@ -62,7 +59,7 @@ pub async fn resolve(
 
     Ok(Json(ResolveDeliveryServiceOutput {
         did,
-        endpoint: jacquard_common::CowStr::Owned(endpoint.as_str().into()),
+        endpoint: endpoint.into_string(),
         supported_cipher_suites,
     }))
 }

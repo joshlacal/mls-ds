@@ -2,6 +2,9 @@
 
 use std::sync::Arc;
 
+use crate::blue_catbird::chat::get_subscription_ticket::{
+    Input as GetSubscriptionTicket, Output as GetSubscriptionTicketOutput,
+};
 use axum::{
     body::Bytes,
     extract::{RawQuery, State},
@@ -9,19 +12,15 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use catbird_atproto::generated::blue_catbird::chat::get_subscription_ticket::{
-    GetSubscriptionTicket, GetSubscriptionTicketOutput,
-};
-use jacquard_common::DefaultStr;
 use uuid::Uuid;
 
 use crate::{
+    atproto_conv::chrono_to_datetime,
     chat_protocol::validation::{CanonicalHttpMethod, CanonicalUuidV4},
     chat_protocol::{
         error::{ChatEndpoint, ChatProtocolErrorCode},
         repository::ticket::{mint_subscription_ticket_for_admission, TicketRepositoryError},
     },
-    sqlx_jacquard::chrono_to_datetime,
     storage::DbPool,
 };
 
@@ -51,7 +50,7 @@ pub(super) async fn handle(
         return ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
             .into_response();
     }
-    let input: GetSubscriptionTicket<DefaultStr> = match serde_json::from_slice(&body) {
+    let input: GetSubscriptionTicket = match serde_json::from_slice(&body) {
         Ok(input) => input,
         Err(_) => {
             return ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidRequest)
@@ -68,7 +67,7 @@ async fn issue(
     pool: &DbPool,
     runtime: &ChatRuntime,
     headers: &HeaderMap,
-    input: GetSubscriptionTicket<DefaultStr>,
+    input: GetSubscriptionTicket,
 ) -> Result<Response, ChatFailure> {
     context::require_cutover(runtime, ENDPOINT)?;
     CanonicalUuidV4::parse(input.actor_device_id.as_ref())
@@ -121,8 +120,8 @@ async fn issue(
         .subscription_endpoint()
         .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?
         .to_owned();
-    let endpoint = jacquard_common::types::string::UriValue::<DefaultStr>::new_owned(endpoint)
-        .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
+    let endpoint =
+        petrel_core::Uri::parse(endpoint).map_err(|_| ChatFailure::invariant(ENDPOINT))?;
     // Retained scope keeps bare base64; the read presents lexicon bytes (as getConversations does).
     let inventory_scope = match inventory_scope {
         Some(mut scope) => {
@@ -140,9 +139,9 @@ async fn issue(
         endpoint,
         expires_at: chrono_to_datetime(expires_at),
         ticket: ticket.into(),
-        extra_data: None,
     };
-    let bytes = serde_json::to_vec(&output).map_err(|_| ChatFailure::invariant(ENDPOINT))?;
+    let bytes = catbird_server::atproto_conv::wire_json_bytes(&output)
+        .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
     Ok(context::json_ok(bytes))
 }
 

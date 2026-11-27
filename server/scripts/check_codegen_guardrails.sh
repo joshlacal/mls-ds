@@ -34,13 +34,13 @@ if [ -d "server/src/generated" ] && find "server/src/generated" -maxdepth 1 -typ
 fi
 
 if rg -n --no-heading 'pub mod generated;' "server/src/lib.rs" >"$tmp_matches"; then
-  echo "[codegen-guardrail] server/src/lib.rs must re-export generated code from catbird-atproto, not declare a local module:"
+  echo "[codegen-guardrail] server/src/lib.rs must re-export generated code from the Petrel Catbird overlay, not declare a local module:"
   cat "$tmp_matches"
   fail=1
 fi
 
-if ! rg -n --no-heading 'pub use catbird_atproto::generated;' "server/src/lib.rs" >/dev/null; then
-  echo "[codegen-guardrail] server/src/lib.rs must contain: pub use catbird_atproto::generated;"
+if ! rg -n --no-heading 'pub use petrel_catbird::generated;' "server/src/lib.rs" >/dev/null; then
+  echo "[codegen-guardrail] server/src/lib.rs must contain: pub use petrel_catbird::generated;"
   fail=1
 fi
 

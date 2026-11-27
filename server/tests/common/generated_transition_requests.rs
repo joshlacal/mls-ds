@@ -1,9 +1,8 @@
 //! Actual generated-Rust producers for submitTransition compatibility tests.
 //!
 //! Every request, signed wrapper, body, reference object, and union below is
-//! constructed explicitly with `extra_data: None`. Deserializing a tagged body
-//! into the generated type would retain its tag in `extra_data` and conceal the
-//! missing-body-tag presentation this regression must exercise.
+//! constructed from generated Petrel types. Its closed body unions carry a type
+//! discriminator. Catbird sends padded standard base64 in signed chat JSON.
 //!
 //! The five frozen cases are transcript/fingerprint fixtures, not valid MLS
 //! artifacts or encrypted metadata. The supplemental recovery case adds real
@@ -13,8 +12,9 @@
 use std::path::Path;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use catbird_atproto::{blue_catbird::chat as dto, jacquard_common::deps::bytes::Bytes};
+use catbird_server::blue_catbird::chat as dto;
 use ed25519_dalek::{Signer, SigningKey};
+use petrel_core::Bytes;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -28,7 +28,7 @@ pub struct GeneratedTransitionCase {
     pub name: &'static str,
     /// Original canonical presentation: `{body: <tagged body>, signature: <base64>}`.
     pub legacy_wrapper: Vec<u8>,
-    /// Unmodified `serde_json::to_vec(&SubmitTransition<String>)` output.
+    /// Serialized Petrel request including the signed-chat base64 convention.
     pub generated_request: Vec<u8>,
     pub public_key: Vec<u8>,
     /// Frozen vector row for the original five; explicitly labeled derived
@@ -45,14 +45,15 @@ fn integer(value: &Value) -> i64 {
 }
 
 fn bytes(value: &Value) -> Bytes {
-    STANDARD
-        .decode(value.as_str().expect("fixture canonical base64"))
-        .expect("fixture base64 decodes")
-        .into()
+    Bytes(
+        STANDARD
+            .decode(value.as_str().expect("fixture canonical base64"))
+            .expect("fixture base64 decodes"),
+    )
 }
 
-fn did(value: &Value) -> dto::BareDid<String> {
-    dto::BareDid::new(text(value)).expect("fixture DID")
+fn did(value: &Value) -> dto::BareDid {
+    dto::BareDid::parse(text(value)).expect("fixture DID")
 }
 
 fn datetime(value: &Value) -> dto::CanonicalDatetime {
@@ -63,7 +64,7 @@ fn datetime(value: &Value) -> dto::CanonicalDatetime {
         .expect("fixture datetime parses")
 }
 
-fn coordinates(value: &Value) -> dto::ConversationCoordinates<String> {
+fn coordinates(value: &Value) -> dto::ConversationCoordinates {
     dto::ConversationCoordinates {
         confirmation_tag: bytes(&value["confirmationTag"]),
         conversation_id: text(&value["conversationId"]),
@@ -71,13 +72,13 @@ fn coordinates(value: &Value) -> dto::ConversationCoordinates<String> {
         generation: integer(&value["generation"]),
         group_context_hash: bytes(&value["groupContextHash"]),
         group_id: bytes(&value["groupId"]),
-        lifecycle: text(&value["lifecycle"]),
+        lifecycle: text(&value["lifecycle"]).parse().expect("fixture enum"),
         state_version: integer(&value["stateVersion"]),
         extra_data: None,
     }
 }
 
-fn aad(value: &Value) -> dto::CommitAad<String> {
+fn aad(value: &Value) -> dto::CommitAad {
     let prior = &value["prior"];
     dto::CommitAad {
         conversation_id: bytes(&value["conversationId"]),
@@ -93,13 +94,15 @@ fn aad(value: &Value) -> dto::CommitAad<String> {
             state_version: integer(&prior["stateVersion"]),
             extra_data: None,
         },
-        protocol_version: text(&value["protocolVersion"]),
+        protocol_version: text(&value["protocolVersion"])
+            .parse()
+            .expect("fixture enum"),
         transition_id: bytes(&value["transitionId"]),
         extra_data: None,
     }
 }
 
-fn commit(value: &Value) -> dto::PublicCommit<String> {
+fn commit(value: &Value) -> dto::PublicCommit {
     dto::PublicCommit {
         bytes: bytes(&value["bytes"]),
         content_type: text(&value["contentType"]),
@@ -109,7 +112,7 @@ fn commit(value: &Value) -> dto::PublicCommit<String> {
     }
 }
 
-fn metadata(value: &Value) -> dto::MetadataSnapshot<String> {
+fn metadata(value: &Value) -> dto::MetadataSnapshot {
     let coordinate = &value["coordinate"];
     let author = &value["authorProof"];
     dto::MetadataSnapshot {
@@ -153,7 +156,7 @@ fn metadata(value: &Value) -> dto::MetadataSnapshot<String> {
     }
 }
 
-fn participant_change(value: &Value) -> dto::ParticipantChange<String> {
+fn participant_change(value: &Value) -> dto::ParticipantChange {
     match value["$type"].as_str().expect("participant union tag") {
         "blue.catbird.chat.defs#addParticipant" => {
             let provenance = &value["invitationProvenance"];
@@ -178,7 +181,7 @@ fn participant_change(value: &Value) -> dto::ParticipantChange<String> {
         }
         "blue.catbird.chat.defs#changeParticipantRole" => {
             dto::ParticipantChange::ChangeParticipantRole(Box::new(dto::ChangeParticipantRole {
-                role: text(&value["role"]),
+                role: text(&value["role"]).parse().expect("fixture enum"),
                 user_did: did(&value["userDid"]),
                 extra_data: None,
             }))
@@ -187,7 +190,7 @@ fn participant_change(value: &Value) -> dto::ParticipantChange<String> {
     }
 }
 
-fn leaf_change(value: &Value) -> dto::LeafChange<String> {
+fn leaf_change(value: &Value) -> dto::LeafChange {
     match value["$type"].as_str().expect("leaf union tag") {
         "blue.catbird.chat.defs#addLeafByRecovery" => {
             dto::LeafChange::AddLeafByRecovery(Box::new(dto::AddLeafByRecovery {
@@ -209,7 +212,7 @@ fn leaf_change(value: &Value) -> dto::LeafChange<String> {
     }
 }
 
-fn welcome(value: &Value) -> dto::WelcomeBundle<String> {
+fn welcome(value: &Value) -> dto::WelcomeBundle {
     dto::WelcomeBundle {
         content_type: text(&value["contentType"]),
         deliveries: value["deliveries"]
@@ -238,7 +241,7 @@ fn welcome(value: &Value) -> dto::WelcomeBundle<String> {
     }
 }
 
-fn manifest(value: &Value) -> dto::TransitionManifest<String> {
+fn manifest(value: &Value) -> dto::TransitionManifest {
     dto::TransitionManifest {
         leaf_changes: value["leafChanges"]
             .as_array()
@@ -264,61 +267,16 @@ pub fn generated_request(body: &Value, signature: &[u8]) -> Vec<u8> {
     let signed_request = match body["$type"].as_str().expect("source body tag") {
         "blue.catbird.chat.defs#commitTransitionBody" => {
             dto::SignedTransition::SignedCommitTransition(Box::new(dto::SignedCommitTransition {
-                body: dto::CommitTransitionBody {
-                    aad: aad(&body["aad"]),
-                    actor_device_id: text(&body["actorDeviceId"]),
-                    actor_did: did(&body["actorDid"]),
-                    auth_generation: integer(&body["authGeneration"]),
-                    commit: commit(&body["commit"]),
-                    idempotency_key: text(&body["idempotencyKey"]),
-                    key_id: text(&body["keyId"]),
-                    manifest: manifest(&body["manifest"]),
-                    metadata_snapshot: metadata(&body["metadataSnapshot"]),
-                    next: coordinates(&body["next"]),
-                    prior: coordinates(&body["prior"]),
-                    signature_domain: text(&body["signatureDomain"]),
-                    signed_at: datetime(&body["signedAt"]),
-                    transition_id: text(&body["transitionId"]),
-                    extra_data: None,
-                },
-                signature: signature.to_vec().into(),
-                extra_data: None,
-            }))
-        }
-        "blue.catbird.chat.defs#policyTransitionBody" => {
-            dto::SignedTransition::SignedPolicyTransition(Box::new(dto::SignedPolicyTransition {
-                body: dto::PolicyTransitionBody {
-                    actor_device_id: text(&body["actorDeviceId"]),
-                    actor_did: did(&body["actorDid"]),
-                    auth_generation: integer(&body["authGeneration"]),
-                    idempotency_key: text(&body["idempotencyKey"]),
-                    key_id: text(&body["keyId"]),
-                    next: coordinates(&body["next"]),
-                    participant_changes: body["participantChanges"]
-                        .as_array()
-                        .expect("policy changes")
-                        .iter()
-                        .map(participant_change)
-                        .collect(),
-                    prior: coordinates(&body["prior"]),
-                    signature_domain: text(&body["signatureDomain"]),
-                    signed_at: datetime(&body["signedAt"]),
-                    transition_id: text(&body["transitionId"]),
-                    extra_data: None,
-                },
-                signature: signature.to_vec().into(),
-                extra_data: None,
-            }))
-        }
-        "blue.catbird.chat.defs#metadataTransitionBody" => {
-            dto::SignedTransition::SignedMetadataTransition(Box::new(
-                dto::SignedMetadataTransition {
-                    body: dto::MetadataTransitionBody {
+                body: dto::SignedCommitTransitionBody::CommitTransitionBody(Box::new(
+                    dto::CommitTransitionBody {
+                        aad: aad(&body["aad"]),
                         actor_device_id: text(&body["actorDeviceId"]),
                         actor_did: did(&body["actorDid"]),
                         auth_generation: integer(&body["authGeneration"]),
+                        commit: commit(&body["commit"]),
                         idempotency_key: text(&body["idempotencyKey"]),
                         key_id: text(&body["keyId"]),
+                        manifest: manifest(&body["manifest"]),
                         metadata_snapshot: metadata(&body["metadataSnapshot"]),
                         next: coordinates(&body["next"]),
                         prior: coordinates(&body["prior"]),
@@ -327,7 +285,58 @@ pub fn generated_request(body: &Value, signature: &[u8]) -> Vec<u8> {
                         transition_id: text(&body["transitionId"]),
                         extra_data: None,
                     },
-                    signature: signature.to_vec().into(),
+                )),
+                signature: Bytes(signature.to_vec()),
+                extra_data: None,
+            }))
+        }
+        "blue.catbird.chat.defs#policyTransitionBody" => {
+            dto::SignedTransition::SignedPolicyTransition(Box::new(dto::SignedPolicyTransition {
+                body: dto::SignedPolicyTransitionBody::PolicyTransitionBody(Box::new(
+                    dto::PolicyTransitionBody {
+                        actor_device_id: text(&body["actorDeviceId"]),
+                        actor_did: did(&body["actorDid"]),
+                        auth_generation: integer(&body["authGeneration"]),
+                        idempotency_key: text(&body["idempotencyKey"]),
+                        key_id: text(&body["keyId"]),
+                        next: coordinates(&body["next"]),
+                        participant_changes: body["participantChanges"]
+                            .as_array()
+                            .expect("policy changes")
+                            .iter()
+                            .map(participant_change)
+                            .collect(),
+                        prior: coordinates(&body["prior"]),
+                        signature_domain: text(&body["signatureDomain"]),
+                        signed_at: datetime(&body["signedAt"]),
+                        transition_id: text(&body["transitionId"]),
+                        extra_data: None,
+                    },
+                )),
+                signature: Bytes(signature.to_vec()),
+                extra_data: None,
+            }))
+        }
+        "blue.catbird.chat.defs#metadataTransitionBody" => {
+            dto::SignedTransition::SignedMetadataTransition(Box::new(
+                dto::SignedMetadataTransition {
+                    body: dto::SignedMetadataTransitionBody::MetadataTransitionBody(Box::new(
+                        dto::MetadataTransitionBody {
+                            actor_device_id: text(&body["actorDeviceId"]),
+                            actor_did: did(&body["actorDid"]),
+                            auth_generation: integer(&body["authGeneration"]),
+                            idempotency_key: text(&body["idempotencyKey"]),
+                            key_id: text(&body["keyId"]),
+                            metadata_snapshot: metadata(&body["metadataSnapshot"]),
+                            next: coordinates(&body["next"]),
+                            prior: coordinates(&body["prior"]),
+                            signature_domain: text(&body["signatureDomain"]),
+                            signed_at: datetime(&body["signedAt"]),
+                            transition_id: text(&body["transitionId"]),
+                            extra_data: None,
+                        },
+                    )),
+                    signature: Bytes(signature.to_vec()),
                     extra_data: None,
                 },
             ))
@@ -335,25 +344,27 @@ pub fn generated_request(body: &Value, signature: &[u8]) -> Vec<u8> {
         "blue.catbird.chat.defs#leafRecoveryFulfillmentBody" => {
             dto::SignedTransition::SignedLeafRecoveryFulfillment(Box::new(
                 dto::SignedLeafRecoveryFulfillment {
-                    body: dto::LeafRecoveryFulfillmentBody {
-                        aad: aad(&body["aad"]),
-                        actor_device_id: text(&body["actorDeviceId"]),
-                        actor_did: did(&body["actorDid"]),
-                        auth_generation: integer(&body["authGeneration"]),
-                        commit: commit(&body["commit"]),
-                        idempotency_key: text(&body["idempotencyKey"]),
-                        key_id: text(&body["keyId"]),
-                        manifest: manifest(&body["manifest"]),
-                        metadata_snapshot: metadata(&body["metadataSnapshot"]),
-                        next: coordinates(&body["next"]),
-                        prior: coordinates(&body["prior"]),
-                        recovery_request_id: text(&body["recoveryRequestId"]),
-                        signature_domain: text(&body["signatureDomain"]),
-                        signed_at: datetime(&body["signedAt"]),
-                        transition_id: text(&body["transitionId"]),
-                        extra_data: None,
-                    },
-                    signature: signature.to_vec().into(),
+                    body: dto::SignedLeafRecoveryFulfillmentBody::LeafRecoveryFulfillmentBody(
+                        Box::new(dto::LeafRecoveryFulfillmentBody {
+                            aad: aad(&body["aad"]),
+                            actor_device_id: text(&body["actorDeviceId"]),
+                            actor_did: did(&body["actorDid"]),
+                            auth_generation: integer(&body["authGeneration"]),
+                            commit: commit(&body["commit"]),
+                            idempotency_key: text(&body["idempotencyKey"]),
+                            key_id: text(&body["keyId"]),
+                            manifest: manifest(&body["manifest"]),
+                            metadata_snapshot: metadata(&body["metadataSnapshot"]),
+                            next: coordinates(&body["next"]),
+                            prior: coordinates(&body["prior"]),
+                            recovery_request_id: text(&body["recoveryRequestId"]),
+                            signature_domain: text(&body["signatureDomain"]),
+                            signed_at: datetime(&body["signedAt"]),
+                            transition_id: text(&body["transitionId"]),
+                            extra_data: None,
+                        }),
+                    ),
+                    signature: Bytes(signature.to_vec()),
                     extra_data: None,
                 },
             ))
@@ -361,36 +372,35 @@ pub fn generated_request(body: &Value, signature: &[u8]) -> Vec<u8> {
         "blue.catbird.chat.defs#leaveCommitFulfillmentBody" => {
             dto::SignedTransition::SignedLeaveCommitFulfillment(Box::new(
                 dto::SignedLeaveCommitFulfillment {
-                    body: dto::LeaveCommitFulfillmentBody {
-                        aad: aad(&body["aad"]),
-                        actor_device_id: text(&body["actorDeviceId"]),
-                        actor_did: did(&body["actorDid"]),
-                        auth_generation: integer(&body["authGeneration"]),
-                        commit: commit(&body["commit"]),
-                        idempotency_key: text(&body["idempotencyKey"]),
-                        key_id: text(&body["keyId"]),
-                        leave_request_id: text(&body["leaveRequestId"]),
-                        manifest: manifest(&body["manifest"]),
-                        metadata_snapshot: metadata(&body["metadataSnapshot"]),
-                        next: coordinates(&body["next"]),
-                        prior: coordinates(&body["prior"]),
-                        signature_domain: text(&body["signatureDomain"]),
-                        signed_at: datetime(&body["signedAt"]),
-                        transition_id: text(&body["transitionId"]),
-                        extra_data: None,
-                    },
-                    signature: signature.to_vec().into(),
+                    body: dto::SignedLeaveCommitFulfillmentBody::LeaveCommitFulfillmentBody(
+                        Box::new(dto::LeaveCommitFulfillmentBody {
+                            aad: aad(&body["aad"]),
+                            actor_device_id: text(&body["actorDeviceId"]),
+                            actor_did: did(&body["actorDid"]),
+                            auth_generation: integer(&body["authGeneration"]),
+                            commit: commit(&body["commit"]),
+                            idempotency_key: text(&body["idempotencyKey"]),
+                            key_id: text(&body["keyId"]),
+                            leave_request_id: text(&body["leaveRequestId"]),
+                            manifest: manifest(&body["manifest"]),
+                            metadata_snapshot: metadata(&body["metadataSnapshot"]),
+                            next: coordinates(&body["next"]),
+                            prior: coordinates(&body["prior"]),
+                            signature_domain: text(&body["signatureDomain"]),
+                            signed_at: datetime(&body["signedAt"]),
+                            transition_id: text(&body["transitionId"]),
+                            extra_data: None,
+                        }),
+                    ),
+                    signature: Bytes(signature.to_vec()),
                     extra_data: None,
                 },
             ))
         }
         other => panic!("unsupported generated transition fixture {other}"),
     };
-    let input = dto::submit_transition::SubmitTransition::<String> {
-        signed_request,
-        extra_data: None,
-    };
-    serde_json::to_vec(&input).expect("actual generated request serialization")
+    let input = dto::submit_transition::Input { signed_request };
+    catbird_server::atproto_conv::wire_json_bytes(&input).expect("signed chat JSON")
 }
 
 // Source markers describe canonical values. In bytes-schema positions a UUID

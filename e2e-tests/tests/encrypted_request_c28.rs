@@ -377,14 +377,7 @@ async fn c28_live_committed_note_publication_lost_response_retry_no_duplicate_in
         sequencer_receipt_authority_key: server.sequencer_receipt_public_key.clone(),
         text: "Please join our group chat".into(),
         invitation: Some(invitation_ref.clone()),
-        metadata: GroupMetadataV1 {
-            version: 1,
-            title: String::new(),
-            description: String::new(),
-            avatar_blob_locator: None,
-            avatar_content_type: None,
-            space_avatar: None,
-        },
+        metadata: GroupMetadataV1::new("", ""),
     })?;
     let b = &journal.bootstrap;
 

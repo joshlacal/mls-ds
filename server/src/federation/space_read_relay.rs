@@ -23,16 +23,10 @@ use std::{
     time::Duration,
 };
 
-use atproto_spaces::{
-    did_resolver::DidDocument,
-    kem::decode_p256_did_key,
-    lthash::compute_dagcbor_cid,
-    tokens::{verify_space_token, SpaceKeyResolver, SpaceTokenKind, SpaceVerifyingKey},
-    SpacesError,
-};
-use catbird_atproto::generated::blue_catbird::labyrinth::mailbox_keys::{
-    MailboxKeys, MailboxKeysBackend,
-};
+use crate::blue_catbird::labyrinth::mailbox_keys::MailboxKeys;
+use crate::space_host::tokens::{verify_compact, ParsedToken, SpaceTokenKind};
+use petrel_crypto::ATProtoJWTVerificationKey as SpaceVerifyingKey;
+use petrel_spaces::decode_p256_did_key;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use url::Url;
@@ -372,33 +366,15 @@ async fn resolve_space_credential_key(
         | OutboundBodyError::LengthOverflow
         | OutboundBodyError::InvalidJson(_) => SpaceRelayError::UpstreamError(e.to_string()),
     })?;
-    DidDocument::parse_json(authority_did, &bytes)
-        .map_err(|e| SpaceRelayError::UpstreamError(e.to_string()))?
-        .atproto_key
-        .ok_or_else(|| {
-            SpaceRelayError::UpstreamError("authority has no #atproto signing key".into())
-        })
-}
-
-struct CredentialAuthorityKey<'a> {
-    authority_did: &'a str,
-    key: SpaceVerifyingKey,
-}
-
-#[async_trait::async_trait(?Send)]
-impl SpaceKeyResolver for CredentialAuthorityKey<'_> {
-    async fn resolve_atproto_key(
-        &self,
-        did_or_issuer: &str,
-        _force_refresh: bool,
-    ) -> atproto_spaces::Result<SpaceVerifyingKey> {
-        if did_or_issuer != self.authority_did {
-            return Err(SpacesError::InvalidSpaceCredential(
-                "credential issuer does not match requested authority".into(),
-            ));
-        }
-        Ok(self.key.clone())
+    let doc = petrel_spaces::SpaceDidDocument::from_json_bytes(&bytes)
+        .map_err(|e| SpaceRelayError::UpstreamError(e.to_string()))?;
+    if doc.id.as_str() != authority_did {
+        return Err(SpaceRelayError::UpstreamError(
+            "authority DID document id mismatch".into(),
+        ));
     }
+    petrel_spaces::extract_signing_key(&doc, "#atproto")
+        .map_err(|e| SpaceRelayError::UpstreamError(e.to_string()))
 }
 
 /// Optional Nov-12 `authorizeSpaceSync` inputs forwarded through `relaySpaceCredential`.
@@ -480,7 +456,7 @@ pub async fn relay_space_credential_with_options(
             "space must be an at:space/{did}/{spaceType}/{skey} Space ref".into(),
         )
     })?;
-    if space.authority != authority_did {
+    if space.space_did().as_str() != authority_did {
         return Err(SpaceRelayError::InvalidRequest(
             "Space authority does not match authorityDid".into(),
         ));
@@ -568,22 +544,15 @@ pub async fn relay_space_credential_with_options(
         }
     }
 
-    let resolver = CredentialAuthorityKey {
-        authority_did,
-        key: resolve_space_credential_key(authority_did, &target).await?,
-    };
+    let key = resolve_space_credential_key(authority_did, &target).await?;
     let now_sec = crate::sim_hooks::current_utc().timestamp().max(0) as u64;
-    // The token API's resolver future is !Send; this pre-resolved key performs no I/O.
-    let claims = futures::executor::block_on(verify_space_token(
-        SpaceTokenKind::Credential,
-        &upstream.credential,
-        &resolver,
-        now_sec,
-    ))
-    .map_err(|e| SpaceRelayError::UpstreamError(e.to_string()))?;
-    if claims.iss != authority_did
+    let parsed = ParsedToken::parse(SpaceTokenKind::Credential, &upstream.credential, now_sec)
+        .map_err(|e| SpaceRelayError::UpstreamError(e.to_string()))?;
+    let claims = &parsed.claims;
+    if !parsed.verify(&key)
+        || claims.iss != authority_did
         || claims.sub != space_uri
-        || claims.cnf_kid.as_deref() != Some(credential_key)
+        || claims.cnf_kid() != Some(credential_key)
         || claims.exp <= now_sec
     {
         return Err(SpaceRelayError::UpstreamError(
@@ -971,7 +940,7 @@ fn parse_verified_car_v1(
         }
         let block_data = &section[cid_len..];
         verify_canonical_dagcbor(block_data)?;
-        if compute_dagcbor_cid(block_data) != block_cid {
+        if petrel_core::Cid::for_dag_cbor(block_data).as_bytes() != block_cid.to_bytes() {
             return Err(SpaceRelayError::UpstreamError(
                 "CAR block CID digest mismatch".into(),
             ));
@@ -1050,7 +1019,15 @@ fn atproto_commit_signature(
     })?;
     Ok((
         commit.data,
-        atproto_key.verify_raw(atproto_key.expected_alg(), &unsigned_bytes, &commit.sig),
+        verify_compact(
+            atproto_key,
+            match atproto_key {
+                SpaceVerifyingKey::P256(_) => "ES256",
+                SpaceVerifyingKey::Secp256k1(_) => "ES256K",
+            },
+            &unsigned_bytes,
+            &commit.sig,
+        ),
     ))
 }
 
@@ -1200,11 +1177,11 @@ fn validate_mailbox_keys_cbor_value(
     target_did: &str,
     rkey: &str,
 ) -> Result<bytes::Bytes, SpaceRelayError> {
-    let typed: MailboxKeys<String> =
-        serde_ipld_dagcbor::from_slice(record_bytes).map_err(|_| {
-            SpaceRelayError::UpstreamError("malformed mailboxKeys DAG-CBOR record".into())
-        })?;
-    if matches!(typed.backend, Some(MailboxKeysBackend::Other(_))) {
+    let typed: MailboxKeys = petrel_core::from_dag_cbor_strict(record_bytes).map_err(|_| {
+        SpaceRelayError::UpstreamError("malformed mailboxKeys DAG-CBOR record".into())
+    })?;
+    // Petrel emits the knownValues `backend` field as a plain String.
+    if matches!(typed.backend.as_deref(), Some(other) if other != "space" && other != "mlsDs") {
         return Err(SpaceRelayError::UpstreamError(
             "unknown mailboxKeys backend variant".into(),
         ));
@@ -1229,14 +1206,14 @@ fn validate_mailbox_keys_cbor_value(
 
     let current = &typed.current;
     let exact_lengths = [
-        (current.auth_pubkey.len(), 32usize),
-        (current.encryption_pubkey.len(), 1216),
-        (current.signing_pubkey.len(), 32),
-        (current.members_hash.len(), 32),
-        (current.epoch_head.len(), 32),
-        (current.self_sig.len(), 64),
-        (current.attestation.transport_pubkey.len(), 32),
-        (current.attestation.sig.len(), 64),
+        (current.auth_pubkey.0.len(), 32usize),
+        (current.encryption_pubkey.0.len(), 1216),
+        (current.signing_pubkey.0.len(), 32),
+        (current.members_hash.0.len(), 32),
+        (current.epoch_head.0.len(), 32),
+        (current.self_sig.0.len(), 64),
+        (current.attestation.transport_pubkey.0.len(), 32),
+        (current.attestation.sig.0.len(), 64),
     ];
     if !(0..=MAX_MAILBOX_EPOCH_NUMBER).contains(&current.epoch_number)
         || exact_lengths
@@ -1245,11 +1222,11 @@ fn validate_mailbox_keys_cbor_value(
         || current
             .previous_epoch_head
             .as_ref()
-            .is_some_and(|value| value.len() != 32)
+            .is_some_and(|value| value.0.len() != 32)
         || current
             .prev_sig
             .as_ref()
-            .is_some_and(|value| value.len() != 64)
+            .is_some_and(|value| value.0.len() != 64)
     {
         return Err(SpaceRelayError::UpstreamError(
             "mailboxKeys value violates the epoch schema".into(),
@@ -1856,7 +1833,7 @@ async fn device_proof_authority(
     device_id: &str,
 ) -> Result<(String, SpaceVerifyingKey), SpaceRelayError> {
     if crate::identity::canonical_did(did) != did
-        || !atproto_spaces::is_valid_did(did)
+        || petrel_core::Did::parse(did).is_err()
         || !(did.starts_with("did:plc:") || did.starts_with("did:web:"))
     {
         return Err(SpaceRelayError::InvalidRequest(
@@ -2114,7 +2091,7 @@ pub async fn relay_mailbox_keys_record(
     rkey: &str,
 ) -> Result<Option<bytes::Bytes>, SpaceRelayError> {
     if crate::identity::canonical_did(target_did) != target_did
-        || !atproto_spaces::is_valid_did(target_did)
+        || petrel_core::Did::parse(target_did).is_err()
         || !(target_did.starts_with("did:plc:") || target_did.starts_with("did:web:"))
     {
         return Err(SpaceRelayError::InvalidRequest(
@@ -2330,6 +2307,10 @@ pub async fn relay_space_read_with_headers(
 /// Test-support builder for canonical DAG-CBOR + CARv1 + signed ATProto v3 commit + MST proofs.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_car_builder {
+    fn compute_dagcbor_cid(data: &[u8]) -> cid::Cid {
+        cid::Cid::try_from(petrel_core::Cid::for_dag_cbor(data).as_bytes()).unwrap()
+    }
+
     use super::*;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use p256::ecdsa::{signature::Signer, Signature, SigningKey};
@@ -2651,10 +2632,29 @@ mod tests {
     };
     use super::*;
     use crate::federation::resolver::ValidatedRemoteDestination;
-    use atproto_spaces::{
-        kem::encode_p256_did_key,
-        tokens::{mint_space_token, SpaceSigningKey, SpaceTokenClaims},
-    };
+    use crate::space_host::{p256_verification_key, tokens::SpaceTokenClaims};
+    use petrel_spaces::{CnfClaim, SigningKeyPair};
+
+    fn encode_p256_did_key(key: &p256::PublicKey) -> String {
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        petrel_spaces::encode_p256_did_key(key.to_encoded_point(true).as_bytes()).unwrap()
+    }
+
+    fn mint_test_credential(
+        key: &SigningKeyPair,
+        claims: &SpaceTokenClaims,
+    ) -> petrel_spaces::Result<String> {
+        petrel_spaces::mint_credential_token(
+            key,
+            &petrel_core::Did::parse(&claims.iss).unwrap(),
+            &petrel_spaces::parse_space_ref(&claims.sub)?,
+            claims.cnf_kid().unwrap(),
+            claims.iat as i64,
+            claims.exp as i64,
+            Some(&claims.jti),
+            Some("#atproto"),
+        )
+    }
     use axum::{
         extract::{OriginalUri, Query},
         http::HeaderMap,
@@ -2745,7 +2745,7 @@ mod tests {
     fn car_proof_follows_entryless_nodes_as_the_reference_pds_writes_them() {
         let did = "did:web:mailbox.example";
         let secret = p256::SecretKey::from_slice(&[0x51; 32]).unwrap();
-        let vk = SpaceVerifyingKey::P256(p256::ecdsa::VerifyingKey::from(secret.public_key()));
+        let vk = p256_verification_key(&p256::ecdsa::VerifyingKey::from(secret.public_key()));
         let value = sample_mailbox_value(7);
         let (car, _) = super::test_car_builder::build_signed_repo_car_under_entryless_nodes(
             did,
@@ -2774,7 +2774,7 @@ mod tests {
     fn car_proof_refuses_a_non_root_node_with_no_entries_and_no_subtree() {
         let did = "did:web:mailbox.example";
         let secret = p256::SecretKey::from_slice(&[0x51; 32]).unwrap();
-        let vk = SpaceVerifyingKey::P256(p256::ecdsa::VerifyingKey::from(secret.public_key()));
+        let vk = p256_verification_key(&p256::ecdsa::VerifyingKey::from(secret.public_key()));
         let (car, _) = super::test_car_builder::build_signed_repo_car_under_entryless_nodes(
             did,
             "3l2aaaaaaaaaa",
@@ -2790,10 +2790,10 @@ mod tests {
     fn signed_car_proof_verifies_inclusion_non_inclusion_and_rejects_tampering() {
         let did = "did:web:mailbox.example";
         let secret = p256::SecretKey::from_slice(&[0x51; 32]).unwrap();
-        let vk = SpaceVerifyingKey::P256(p256::ecdsa::VerifyingKey::from(secret.public_key()));
+        let vk = p256_verification_key(&p256::ecdsa::VerifyingKey::from(secret.public_key()));
         let wrong_secret = p256::SecretKey::from_slice(&[0x52; 32]).unwrap();
         let wrong_vk =
-            SpaceVerifyingKey::P256(p256::ecdsa::VerifyingKey::from(wrong_secret.public_key()));
+            p256_verification_key(&p256::ecdsa::VerifyingKey::from(wrong_secret.public_key()));
 
         let val_7 = sample_mailbox_value(7);
         let (car, cids) = build_signed_repo_car(
@@ -2875,10 +2875,10 @@ mod tests {
         let did = "did:web:deleting.example";
         let device_id = "f65aa2fd-6fae-4fc9-955b-088ce430f8d6";
         let secret = p256::SecretKey::from_slice(&[0x59; 32]).unwrap();
-        let vk = SpaceVerifyingKey::P256(p256::ecdsa::VerifyingKey::from(secret.public_key()));
+        let vk = p256_verification_key(&p256::ecdsa::VerifyingKey::from(secret.public_key()));
         let wrong_secret = p256::SecretKey::from_slice(&[0x5a; 32]).unwrap();
         let wrong_vk =
-            SpaceVerifyingKey::P256(p256::ecdsa::VerifyingKey::from(wrong_secret.public_key()));
+            p256_verification_key(&p256::ecdsa::VerifyingKey::from(wrong_secret.public_key()));
         let signing_key = [0x42; 32];
         let record = json!({
             "$type": "blue.catbird.chat.device",
@@ -2928,7 +2928,7 @@ mod tests {
         let device_id = "f65aa2fd-6fae-4fc9-955b-088ce430f8d6";
         let sibling_id = "a3814970-35ec-4d0e-b37a-c39f87849469";
         let secret = p256::SecretKey::from_slice(&[0x5b; 32]).unwrap();
-        let vk = SpaceVerifyingKey::P256(p256::ecdsa::VerifyingKey::from(secret.public_key()));
+        let vk = p256_verification_key(&p256::ecdsa::VerifyingKey::from(secret.public_key()));
         let ed_sk = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32]);
         let ed_pk = ed_sk.verifying_key().to_bytes();
         let op_id = [0x9A; 16];
@@ -3235,7 +3235,7 @@ mod tests {
         server.abort();
     }
 
-    fn credential_fixture(authority: &str) -> (SpaceSigningKey, SpaceTokenClaims, Value) {
+    fn credential_fixture(authority: &str) -> (SigningKeyPair, SpaceTokenClaims, Value) {
         let secret = p256::SecretKey::from_slice(&[0x21; 32]).unwrap();
         let pop = p256::SecretKey::from_slice(&[0x31; 32]).unwrap();
         let kem = p256::SecretKey::from_slice(&[0x22; 32]).unwrap();
@@ -3256,7 +3256,7 @@ mod tests {
             ],
         });
         (
-            SpaceSigningKey::from_p256_secret(&secret, "#atproto"),
+            SigningKeyPair::from_p256_bytes(&secret.to_bytes()).unwrap(),
             SpaceTokenClaims {
                 iss: authority.into(),
                 sub: format!("at:space/{authority}/blue.catbird.labyrinth.mailbox/self"),
@@ -3264,7 +3264,9 @@ mod tests {
                 iat: NOW,
                 exp: NOW + 600,
                 jti: "credential-relay-test".into(),
-                cnf_kid: Some(encode_p256_did_key(&pop.public_key())),
+                cnf: Some(CnfClaim {
+                    kid: encode_p256_did_key(&pop.public_key()),
+                }),
             },
             document,
         )
@@ -3274,7 +3276,7 @@ mod tests {
     async fn standard_post_verifies_jwt_only_response_and_all_credential_bindings() {
         let authority = "did:web:credential-relay-post.example";
         let (signing_key, claims, document) = credential_fixture(authority);
-        let jwt = mint_space_token(SpaceTokenKind::Credential, &signing_key, &claims).unwrap();
+        let jwt = mint_test_credential(&signing_key, &claims).unwrap();
         let response = Arc::new(Mutex::new(
             json!({"credential": jwt, "spaceRev": "3l2aaaaaaaaaa"}),
         ));
@@ -3282,7 +3284,7 @@ mod tests {
         let requests = Arc::new(AtomicUsize::new(0));
         let expected_body = json!({
             "space": claims.sub,
-            "credentialKey": claims.cnf_kid,
+            "credentialKey": claims.cnf_kid(),
             "delegationToken": "secret-delegation.jwt",
         });
         let router = Router::new()
@@ -3327,7 +3329,7 @@ mod tests {
             chrono::DateTime::from_timestamp(NOW as i64, 0).unwrap(),
         ));
         crate::sim_hooks::scope_ds_clock(clock.clone(), async {
-            let kid = claims.cnf_kid.as_deref().unwrap();
+            let kid = claims.cnf_kid().unwrap();
             let exchange = || {
                 relay_space_credential_stateless(
                     authority,
@@ -3351,9 +3353,8 @@ mod tests {
             assert_eq!(exchange().await.unwrap().expires_at, expected_expiry);
 
             let attacker = p256::SecretKey::from_slice(&[0x22; 32]).unwrap();
-            let attacker_key = SpaceSigningKey::from_p256_secret(&attacker, "#atproto");
-            let forged =
-                mint_space_token(SpaceTokenKind::Credential, &attacker_key, &claims).unwrap();
+            let attacker_key = SigningKeyPair::from_p256_bytes(&attacker.to_bytes()).unwrap();
+            let forged = mint_test_credential(&attacker_key, &claims).unwrap();
             let parts: Vec<_> = jwt.split('.').collect();
             let mut unsigned: Value =
                 serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
@@ -3367,7 +3368,9 @@ mod tests {
             let mut wrong_space = claims.clone();
             wrong_space.sub = format!("at:space/{authority}/blue.catbird.labyrinth.mailbox/other");
             let mut wrong_pop = claims.clone();
-            wrong_pop.cnf_kid = Some(encode_p256_did_key(&attacker.public_key()));
+            wrong_pop.cnf = Some(CnfClaim {
+                kid: encode_p256_did_key(&attacker.public_key()),
+            });
             let mut wrong_authority = claims.clone();
             wrong_authority.iss = "did:web:another-authority.example".into();
             wrong_authority.sub =
@@ -3379,11 +3382,10 @@ mod tests {
             for invalid in [
                 forged,
                 tampered_expiry,
-                mint_space_token(SpaceTokenKind::Credential, &signing_key, &wrong_space).unwrap(),
-                mint_space_token(SpaceTokenKind::Credential, &signing_key, &wrong_pop).unwrap(),
-                mint_space_token(SpaceTokenKind::Credential, &signing_key, &wrong_authority)
-                    .unwrap(),
-                mint_space_token(SpaceTokenKind::Credential, &signing_key, &expired).unwrap(),
+                mint_test_credential(&signing_key, &wrong_space).unwrap(),
+                mint_test_credential(&signing_key, &wrong_pop).unwrap(),
+                mint_test_credential(&signing_key, &wrong_authority).unwrap(),
+                mint_test_credential(&signing_key, &expired).unwrap(),
             ] {
                 *response.lock().unwrap() =
                     json!({"credential": invalid, "expiresAt": expected_expiry});
@@ -3485,7 +3487,7 @@ mod tests {
                 authority,
                 &claims.sub,
                 "private-delegation",
-                claims.cnf_kid.as_deref().unwrap()
+                claims.cnf_kid().unwrap()
             )
             .await,
             Err(SpaceRelayError::UpstreamError(_))
@@ -3499,7 +3501,7 @@ mod tests {
     async fn credential_post_and_did_lookup_use_scoped_simulator_transport() {
         let authority = "did:web:credential-relay-sim.example";
         let (key, claims, document) = credential_fixture(authority);
-        let jwt = mint_space_token(SpaceTokenKind::Credential, &key, &claims).unwrap();
+        let jwt = mint_test_credential(&key, &claims).unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let hooks = Arc::new(crate::sim_hooks::SimDsHooks {
             service_did: "did:web:home-relay-sim.example".into(),
@@ -3510,7 +3512,7 @@ mod tests {
                 let requests = requests.clone();
                 let jwt = jwt.clone();
                 let expected_space = claims.sub.clone();
-                let expected_kid = claims.cnf_kid.clone().unwrap();
+                let expected_kid = claims.cnf_kid().unwrap().to_owned();
                 move |request| {
                     let requests = requests.clone();
                     let jwt = jwt.clone();
@@ -3563,7 +3565,7 @@ mod tests {
                     authority,
                     &claims.sub,
                     "simulated-private-delegation",
-                    claims.cnf_kid.as_deref().unwrap(),
+                    claims.cnf_kid().unwrap(),
                 ),
             ),
         )

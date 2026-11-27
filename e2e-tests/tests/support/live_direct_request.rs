@@ -85,7 +85,7 @@ pub fn signed_push_gateway_registration(
         "signature": {"$bytes": STANDARD.encode(engine.sign_identity(&identity, transcript)?)},
     });
     serde_json::from_value::<
-        catbird_mls::atproto::blue_catbird::chat::register_push_gateway::RegisterPushGateway,
+        petrel_catbird::generated::blue::catbird::chat::register_push_gateway::Input,
     >(request.clone())
     .context("registerPushGateway request does not match the lexicon")?;
     Ok(request)
@@ -115,7 +115,7 @@ pub async fn register_push_gateway(
     );
     let ack: Value = serde_json::from_slice(&bytes)?;
     serde_json::from_value::<
-        catbird_mls::atproto::blue_catbird::chat::register_push_gateway::RegisterPushGatewayOutput,
+        petrel_catbird::generated::blue::catbird::chat::register_push_gateway::Output,
     >(ack.clone())
     .context("registerPushGateway ack does not match the lexicon")?;
     let stored = super::encrypted_requests::push_auth_snapshot(device)?.gateway_binding;
@@ -541,14 +541,7 @@ async fn publish_request_variant_configured(
         sequencer_receipt_authority_key: server.sequencer_receipt_public_key.clone(),
         text: "Real encrypted first contact".into(),
         invitation: None,
-        metadata: GroupMetadataV1 {
-            version: 1,
-            title: String::new(),
-            description: String::new(),
-            avatar_blob_locator: None,
-            avatar_content_type: None,
-            space_avatar: None,
-        },
+        metadata: GroupMetadataV1::new("", ""),
     })?;
     if tamper_introduction {
         tamper_introduction_ciphertext(&mut journal.bootstrap)?;
@@ -1330,7 +1323,7 @@ pub async fn accept_reply_offline(
         introduction_entry["signedRequest"]["body"]["firstMessageId"],
         f.first_message_id.to_string()
     );
-    use catbird_mls::atproto::generated::blue_catbird::chat::send_message::SendMessageOutput;
+    use petrel_catbird::generated::blue::catbird::chat::send_message::Output as SendMessageOutput;
     let typed_sent: SendMessageOutput = serde_json::from_slice(&sent_bytes)
         .context("sendMessage output does not decode into generated types")?;
     assert_eq!(typed_sent.entry.seq, 3);
@@ -1516,18 +1509,21 @@ pub async fn accept_reply_offline_with_followup() -> anyhow::Result<Uuid> {
 }
 
 /// Every read of an accepted request decodes into the generated
-/// catbird-atproto response types, with byte fields (including the
+/// Petrel response types, with byte fields (including the
 /// `ArtifactHash` alias) carrying their exact decoded bytes.
 async fn assert_generated_accepted_reads(
     f: &PublishedRequestFixture,
     state_bytes: &[u8],
     entries_bytes: &[u8],
 ) -> anyhow::Result<()> {
-    use catbird_mls::atproto::generated::blue_catbird::chat::{
-        get_conversation_state::GetConversationStateOutput,
-        get_conversations::GetConversationsOutput,
-        get_direct_request_outcome::GetDirectRequestOutcomeOutput, ConversationEntry,
-        ConversationInventoryItem, DirectRequestOutcome, DirectRequestStateConsent,
+    use petrel_catbird::generated::blue::catbird::chat::{
+        defs::{
+            ConversationEntry, ConversationInventoryItem, DirectRequestOutcome,
+            DirectRequestStateConsent,
+        },
+        get_conversation_state::Output as GetConversationStateOutput,
+        get_conversations::Output as GetConversationsOutput,
+        get_direct_request_outcome::Output as GetDirectRequestOutcomeOutput,
     };
     let context_hash = STANDARD.decode(
         f.publication["body"]["contextHash"]
@@ -1539,9 +1535,9 @@ async fn assert_generated_accepted_reads(
     let request = state.state.direct_request.context("typed request state")?;
     assert_eq!(request.consent, DirectRequestStateConsent::Accepted);
     assert!(request.acceptance_proof.is_some(), "typed acceptance proof");
-    assert_eq!(request.context_hash.as_ref(), context_hash.as_slice());
+    assert_eq!(request.context_hash.0.as_slice(), context_hash.as_slice());
 
-    use catbird_mls::atproto::generated::blue_catbird::chat::get_entries::GetEntriesOutput;
+    use petrel_catbird::generated::blue::catbird::chat::get_entries::Output as GetEntriesOutput;
     let page: GetEntriesOutput = serde_json::from_slice(entries_bytes)
         .context("getEntries whole page does not decode into generated types")?;
     assert_eq!(page.entries.len(), 3);
@@ -1561,7 +1557,8 @@ async fn assert_generated_accepted_reads(
             .as_ref()
             .context("unpruned introduction entry must carry signedRequest")?
             .signature
-            .as_ref(),
+            .0
+            .as_slice(),
         STANDARD
             .decode(
                 f.publication["signature"]
@@ -1584,7 +1581,7 @@ async fn assert_generated_accepted_reads(
         .context("typed application entry")?;
     assert_eq!(typed_app.seq, 3);
 
-    use catbird_mls::atproto::generated::blue_catbird::chat::SubscriptionMessage;
+    use petrel_catbird::generated::blue::catbird::chat::defs::SubscriptionMessage;
     // A subscribeEvents frame for this conversation decodes into the generated SubscriptionMessage type.
     let frame_val = serde_json::json!({
         "$type": "blue.catbird.chat.defs#eventEnvelope",
@@ -1638,7 +1635,7 @@ async fn assert_generated_accepted_reads(
         DirectRequestStateConsent::Accepted
     );
     assert_eq!(
-        inventory_request.context_hash.as_ref(),
+        inventory_request.context_hash.0.as_slice(),
         context_hash.as_slice()
     );
 
@@ -1666,7 +1663,7 @@ async fn assert_generated_accepted_reads(
         .or_else(|| f.receipt["signature"]["$bytes"].as_str())
         .context("receipt signature")?;
     assert_eq!(
-        receipt.signature.as_ref(),
+        receipt.signature.0.as_slice(),
         STANDARD.decode(receipt_sig)?.as_slice()
     );
     Ok(())

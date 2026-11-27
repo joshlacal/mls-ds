@@ -8,8 +8,7 @@
 // returns `DeviceRevoked`.
 
 use chrono::{DateTime, Utc};
-use jacquard_common::deps::{bytes::Bytes, smol_str::SmolStr};
-use jacquard_common::DefaultStr;
+use petrel_core::Bytes;
 use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Transaction};
 use thiserror::Error;
@@ -32,7 +31,7 @@ use super::{
         PreparedSignedOperation, PreparedSignedOperationState, SignedOperationReplayPostStateProof,
     },
 };
-use catbird_atproto::generated::blue_catbird::chat as chat_dto;
+use catbird_server::blue_catbird::chat as chat_dto;
 
 const APPROVE_DEVICE_NSID: &str = "blue.catbird.chat.approveDevice";
 const DEVICE_APPROVAL_REPLAY_POST_STATE_DOMAIN: &[u8] =
@@ -388,30 +387,29 @@ async fn execute_first_device_approval(
         request_reserved_package_count: target.request_reserved_package_count,
         capabilities_json: target.capabilities_json,
     };
-    let output = chat_dto::approve_device::ApproveDeviceOutput::<DefaultStr> {
+    let output = chat_dto::approve_device::Output {
         device: chat_dto::DeviceView {
             auth_generation: approved_view.auth_generation,
             available_package_count: approved_view.available_package_count,
-            created_at: crate::sqlx_jacquard::chrono_to_datetime(approved_view.created_at),
-            device_id: SmolStr::from(approved_view.device_id.to_string()),
-            device_name: Some(SmolStr::from(approved_view.device_name.as_str())),
+            created_at: crate::atproto_conv::chrono_to_datetime(approved_view.created_at),
+            device_id: String::from(approved_view.device_id.to_string()),
+            device_name: Some(String::from(approved_view.device_name.as_str())),
             dormant_at: approved_view
                 .dormant_at
-                .map(crate::sqlx_jacquard::chrono_to_datetime),
-            key_id: SmolStr::from(approved_view.key_id.as_str()),
-            last_active_at: Some(crate::sqlx_jacquard::chrono_to_datetime(
+                .map(crate::atproto_conv::chrono_to_datetime),
+            key_id: String::from(approved_view.key_id.as_str()),
+            last_active_at: Some(crate::atproto_conv::chrono_to_datetime(
                 approved_view.last_active_at,
             )),
             reserved_package_count: approved_view.reserved_package_count,
-            signature_public_key: Bytes::from(approved_view.signing_public_key.clone()),
-            status: SmolStr::from(approved_view.status.as_str()),
-            updated_at: crate::sqlx_jacquard::chrono_to_datetime(approved_view.updated_at),
+            signature_public_key: Bytes(Vec::from(approved_view.signing_public_key.clone())),
+            status: catbird_server::atproto_conv::open_enum(approved_view.status.as_str()),
+            updated_at: crate::atproto_conv::chrono_to_datetime(approved_view.updated_at),
             extra_data: None,
         },
-        extra_data: None,
     };
-    let response_bytes =
-        serde_json::to_vec(&output).map_err(|_| DeviceApprovalFacadeError::Integrity)?;
+    let response_bytes = catbird_server::atproto_conv::wire_json_bytes(&output)
+        .map_err(|_| DeviceApprovalFacadeError::Integrity)?;
     let (scope, completion) = prepared.into_execution_parts();
     complete_operation(
         transaction,
@@ -643,17 +641,16 @@ async fn prepare_device_approval_replay(
     .flatten()
     .ok_or(DeviceApprovalFacadeError::Integrity)?;
 
-    let decoded: chat_dto::approve_device::ApproveDeviceOutput<DefaultStr> =
-        serde_json::from_slice(&stored_response_bytes)
-            .map_err(|_| DeviceApprovalFacadeError::Integrity)?;
+    let decoded: chat_dto::approve_device::Output = serde_json::from_slice(&stored_response_bytes)
+        .map_err(|_| DeviceApprovalFacadeError::Integrity)?;
     if decoded.device.device_id.as_str() != input.target_device_id.to_string()
         || decoded.device.key_id.as_str() != input.target_key_id
-        || decoded.device.signature_public_key.as_ref()
+        || decoded.device.signature_public_key.0.as_slice()
             != input.target_signing_public_key.as_slice()
         || decoded.device.auth_generation != target_auth_generation
         || decoded.device.status.as_str() != "active"
         || decoded.device.updated_at
-            != crate::sqlx_jacquard::chrono_to_datetime(approval.accepted_at)
+            != crate::atproto_conv::chrono_to_datetime(approval.accepted_at)
     {
         return Err(DeviceApprovalFacadeError::Integrity);
     }

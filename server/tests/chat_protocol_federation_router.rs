@@ -33,7 +33,7 @@ use axum::routing::post;
 use axum::Router;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
-use catbird_atproto::generated::blue_catbird::chat::ConversationCoordinates;
+use catbird_server::blue_catbird::chat::ConversationCoordinates;
 use catbird_server::auth::{
     cache_test_did_document, DidDocument, PublicKeyJwk, VerificationMethod,
 };
@@ -49,9 +49,7 @@ use catbird_server::federation::resolver::{DsResolver, ValidatedRemoteDestinatio
 use catbird_server::federation::FederationMode;
 use catbird_server::federation::ServiceAuthClient;
 use catbird_server::handlers::chat::ChatRuntime;
-use catbird_server::handlers::ds::get_convo_digest::{
-    compute_clean_convo_digest, CleanDigestRow, GetConvoDigestOutput,
-};
+use catbird_server::handlers::ds::get_convo_digest::{compute_clean_convo_digest, CleanDigestRow, GetConvoDigestOutput};
 use catbird_server::storage::DbPool;
 use chrono::{DateTime, SecondsFormat, Utc};
 use common::fresh_db::{fresh_legacy_pool, DisposableDatabase};
@@ -3940,14 +3938,14 @@ async fn test_deliver_welcome_router_authenticated_positive_and_replay() {
         outer_entry_fingerprint: outer_fp,
     };
     let coordinates_dto = ConversationCoordinates {
-        conversation_id: jacquard_common::deps::smol_str::SmolStr::from(convo_id.to_string()),
+        conversation_id: String::from(convo_id.to_string()),
         generation: 0,
         state_version: 1,
-        group_id: jacquard_common::deps::bytes::Bytes::copy_from_slice(&group_id),
+        group_id: petrel_core::Bytes(<[u8]>::to_vec(&group_id)),
         epoch: 1,
-        group_context_hash: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x32u8; 32]),
-        confirmation_tag: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x32u8; 32]),
-        lifecycle: jacquard_common::deps::smol_str::SmolStr::from("active"),
+        group_context_hash: petrel_core::Bytes(<[u8]>::to_vec(&[0x32u8; 32])),
+        confirmation_tag: petrel_core::Bytes(<[u8]>::to_vec(&[0x32u8; 32])),
+        lifecycle: catbird_server::blue_catbird::chat::Lifecycle::Active,
         extra_data: None,
     };
 
@@ -5640,14 +5638,14 @@ async fn test_deliver_welcome_router_concurrency_revocation_fails_closed() {
         outer_entry_fingerprint: outer_fp,
     };
     let coordinates_dto = ConversationCoordinates {
-        conversation_id: jacquard_common::deps::smol_str::SmolStr::from(convo_id.to_string()),
+        conversation_id: String::from(convo_id.to_string()),
         generation: 0,
         state_version: 1,
-        group_id: jacquard_common::deps::bytes::Bytes::copy_from_slice(&group_id),
+        group_id: petrel_core::Bytes(<[u8]>::to_vec(&group_id)),
         epoch: 1,
-        group_context_hash: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x32u8; 32]),
-        confirmation_tag: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x32u8; 32]),
-        lifecycle: jacquard_common::deps::smol_str::SmolStr::from("active"),
+        group_context_hash: petrel_core::Bytes(<[u8]>::to_vec(&[0x32u8; 32])),
+        confirmation_tag: petrel_core::Bytes(<[u8]>::to_vec(&[0x32u8; 32])),
+        lifecycle: catbird_server::blue_catbird::chat::Lifecycle::Active,
         extra_data: None,
     };
 
@@ -6218,16 +6216,16 @@ async fn test_deliver_welcome_router_cancelled_or_stale_welcome_rejects() {
             outer_entry_fingerprint: outer_fp,
         },
         &ConversationCoordinates {
-            conversation_id: jacquard_common::deps::smol_str::SmolStr::from(
+            conversation_id: String::from(
                 convo_id.hyphenated().to_string(),
             ),
             generation: 0,
             state_version: 1,
             epoch: 1,
-            group_id: jacquard_common::deps::bytes::Bytes::copy_from_slice(&group_id),
-            group_context_hash: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x32u8; 32]),
-            confirmation_tag: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x32u8; 32]),
-            lifecycle: jacquard_common::deps::smol_str::SmolStr::from("active"),
+            group_id: petrel_core::Bytes(<[u8]>::to_vec(&group_id)),
+            group_context_hash: petrel_core::Bytes(<[u8]>::to_vec(&[0x32u8; 32])),
+            confirmation_tag: petrel_core::Bytes(<[u8]>::to_vec(&[0x32u8; 32])),
+            lifecycle: catbird_server::blue_catbird::chat::Lifecycle::Active,
             extra_data: None,
         },
         &public_snapshot_sha256,
@@ -7146,14 +7144,11 @@ async fn test_remote_commit_canonical_mismatch_fails_and_rolls_back() {
             let signer = signer_clone.clone();
             let router = seq_router.clone();
             async move {
-                use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::{
-                    SubmitCommit, SubmitCommitOutput,
-                };
+                use catbird_server::blue_catbird::mls_ds::submit_commit::{Input as SubmitCommit, Output as SubmitCommitOutput};
                 use catbird_server::federation::envelope::sign_receipt;
                 use catbird_server::federation::envelope::validate_envelope_header;
-                use jacquard_common::DefaultStr;
-
-                let msg: SubmitCommit<DefaultStr> = serde_json::from_slice(&body).unwrap();
+                
+                let msg: SubmitCommit = serde_json::from_slice(&body).unwrap();
                 let header = validate_envelope_header(&msg.header).unwrap();
 
                 let mut req = Request::builder()
@@ -7175,12 +7170,11 @@ async fn test_remote_commit_canonical_mismatch_fails_and_rolls_back() {
                 // Coordinates, entryId, seq, and locator hashes match perfectly.
                 // Mutate received_at so that only full byte-for-byte canonical response equality detects the mismatch.
                 output.commit_entry.received_at =
-                    catbird_server::sqlx_jacquard::chrono_to_datetime(now - chrono::Duration::seconds(100));
-                let st_output = catbird_atproto::generated::blue_catbird::chat::submit_transition::SubmitTransitionOutput {
+                    catbird_server::atproto_conv::chrono_to_datetime(now - chrono::Duration::seconds(100));
+                let st_output = catbird_server::blue_catbird::chat::submit_transition::Output {
                     coordinates: output.coordinates.clone(),
-                    entry: catbird_atproto::generated::blue_catbird::chat::ConversationEntry::CommitEntry(Box::new(output.commit_entry.clone())),
+                    entry: catbird_server::blue_catbird::chat::ConversationEntry::CommitEntry(Box::new(output.commit_entry.clone())),
                     welcomes: vec![],
-                    extra_data: None,
                 };
                 let st_bytes = serde_json::to_vec(&st_output).unwrap();
                 let result_sha256 = Sha256::digest(&st_bytes);
@@ -7192,14 +7186,16 @@ async fn test_remote_commit_canonical_mismatch_fails_and_rolls_back() {
                         .receipt
                         .source_locator
                         .accepted_payload_sha256
-                        .as_ref()
+                        .0
+                        .as_slice()
                         .try_into()
                         .unwrap(),
                     outer_entry_fingerprint: output
                         .receipt
                         .source_locator
                         .outer_entry_fingerprint
-                        .as_ref()
+                        .0
+                        .as_slice()
                         .try_into()
                         .unwrap(),
                 };
@@ -7453,14 +7449,11 @@ async fn test_remote_commit_receipt_locator_payload_hash_mismatch_fails_and_roll
             let signer = signer_clone.clone();
             let router = seq_router.clone();
             async move {
-                use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::{
-                    SubmitCommit, SubmitCommitOutput,
-                };
+                use catbird_server::blue_catbird::mls_ds::submit_commit::{Input as SubmitCommit, Output as SubmitCommitOutput};
                 use catbird_server::federation::envelope::sign_receipt;
                 use catbird_server::federation::envelope::validate_envelope_header;
-                use jacquard_common::DefaultStr;
-
-                let msg: SubmitCommit<DefaultStr> = serde_json::from_slice(&body).unwrap();
+                
+                let msg: SubmitCommit = serde_json::from_slice(&body).unwrap();
                 let header = validate_envelope_header(&msg.header).unwrap();
 
                 let mut req = Request::builder()
@@ -7480,11 +7473,10 @@ async fn test_remote_commit_receipt_locator_payload_hash_mismatch_fails_and_roll
 
                 let mut output: SubmitCommitOutput = serde_json::from_slice(&resp_bytes).unwrap();
 
-                let st_output = catbird_atproto::generated::blue_catbird::chat::submit_transition::SubmitTransitionOutput {
+                let st_output = catbird_server::blue_catbird::chat::submit_transition::Output {
                     coordinates: output.coordinates.clone(),
-                    entry: catbird_atproto::generated::blue_catbird::chat::ConversationEntry::CommitEntry(Box::new(output.commit_entry.clone())),
+                    entry: catbird_server::blue_catbird::chat::ConversationEntry::CommitEntry(Box::new(output.commit_entry.clone())),
                     welcomes: vec![],
-                    extra_data: None,
                 };
                 let st_bytes = serde_json::to_vec(&st_output).unwrap();
                 let result_sha256 = Sha256::digest(&st_bytes);
@@ -7498,7 +7490,8 @@ async fn test_remote_commit_receipt_locator_payload_hash_mismatch_fails_and_roll
                         .receipt
                         .source_locator
                         .outer_entry_fingerprint
-                        .as_ref()
+                        .0
+                        .as_slice()
                         .try_into()
                         .unwrap(),
                 };
@@ -7752,14 +7745,11 @@ async fn test_remote_commit_receipt_locator_fingerprint_mismatch_fails_and_rolls
             let signer = signer_clone.clone();
             let router = seq_router.clone();
             async move {
-                use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::{
-                    SubmitCommit, SubmitCommitOutput,
-                };
+                use catbird_server::blue_catbird::mls_ds::submit_commit::{Input as SubmitCommit, Output as SubmitCommitOutput};
                 use catbird_server::federation::envelope::sign_receipt;
                 use catbird_server::federation::envelope::validate_envelope_header;
-                use jacquard_common::DefaultStr;
-
-                let msg: SubmitCommit<DefaultStr> = serde_json::from_slice(&body).unwrap();
+                
+                let msg: SubmitCommit = serde_json::from_slice(&body).unwrap();
                 let header = validate_envelope_header(&msg.header).unwrap();
 
                 let mut req = Request::builder()
@@ -7779,11 +7769,10 @@ async fn test_remote_commit_receipt_locator_fingerprint_mismatch_fails_and_rolls
 
                 let mut output: SubmitCommitOutput = serde_json::from_slice(&resp_bytes).unwrap();
 
-                let st_output = catbird_atproto::generated::blue_catbird::chat::submit_transition::SubmitTransitionOutput {
+                let st_output = catbird_server::blue_catbird::chat::submit_transition::Output {
                     coordinates: output.coordinates.clone(),
-                    entry: catbird_atproto::generated::blue_catbird::chat::ConversationEntry::CommitEntry(Box::new(output.commit_entry.clone())),
+                    entry: catbird_server::blue_catbird::chat::ConversationEntry::CommitEntry(Box::new(output.commit_entry.clone())),
                     welcomes: vec![],
-                    extra_data: None,
                 };
                 let st_bytes = serde_json::to_vec(&st_output).unwrap();
                 let result_sha256 = Sha256::digest(&st_bytes);
@@ -7796,7 +7785,8 @@ async fn test_remote_commit_receipt_locator_fingerprint_mismatch_fails_and_rolls
                         .receipt
                         .source_locator
                         .accepted_payload_sha256
-                        .as_ref()
+                        .0
+                        .as_slice()
                         .try_into()
                         .unwrap(),
                     outer_entry_fingerprint: [0xff; 32],
@@ -8103,11 +8093,10 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
 
                 let count = counts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
 
-                use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit;
+                use catbird_server::blue_catbird::mls_ds::submit_commit::Input as SubmitCommit;
                 use catbird_server::federation::envelope::validate_envelope_header;
-                use jacquard_common::DefaultStr;
-
-                if let Ok(msg) = serde_json::from_slice::<SubmitCommit<DefaultStr>>(body_bytes) {
+                
+                if let Ok(msg) = serde_json::from_slice::<SubmitCommit>(body_bytes) {
                     if let Ok(header) = validate_envelope_header(&msg.header) {
                         let mut guard = ids.lock();
                         guard.push(header.delivery_id.to_string());
@@ -11889,14 +11878,14 @@ async fn test_quarantined_conversation_rejects_all_shared_writers_with_generic_c
         outer_entry_fingerprint: outer_fp_w,
     };
     let coordinates_dto = ConversationCoordinates {
-        conversation_id: jacquard_common::deps::smol_str::SmolStr::from(convo_id.to_string()),
+        conversation_id: String::from(convo_id.to_string()),
         generation: 0,
         state_version: 1,
-        group_id: jacquard_common::deps::bytes::Bytes::copy_from_slice(&group_id),
+        group_id: petrel_core::Bytes(<[u8]>::to_vec(&group_id)),
         epoch: 1,
-        group_context_hash: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x32u8; 32]),
-        confirmation_tag: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x32u8; 32]),
-        lifecycle: jacquard_common::deps::smol_str::SmolStr::from("active"),
+        group_context_hash: petrel_core::Bytes(<[u8]>::to_vec(&[0x32u8; 32])),
+        confirmation_tag: petrel_core::Bytes(<[u8]>::to_vec(&[0x32u8; 32])),
+        lifecycle: catbird_server::blue_catbird::chat::Lifecycle::Active,
         extra_data: None,
     };
     let welcome_digest = compute_welcome_envelope_digest(
@@ -12708,14 +12697,14 @@ async fn test_ds_delivery_replay_cannot_bypass_quarantine() {
         outer_entry_fingerprint: outer_fp_w,
     };
     let coordinates_dto_w = ConversationCoordinates {
-        conversation_id: jacquard_common::deps::smol_str::SmolStr::from(convo_id.to_string()),
+        conversation_id: String::from(convo_id.to_string()),
         generation: 0,
         state_version: 1,
-        group_id: jacquard_common::deps::bytes::Bytes::copy_from_slice(&group_id),
+        group_id: petrel_core::Bytes(<[u8]>::to_vec(&group_id)),
         epoch: 1,
-        group_context_hash: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x32u8; 32]),
-        confirmation_tag: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x32u8; 32]),
-        lifecycle: jacquard_common::deps::smol_str::SmolStr::from("active"),
+        group_context_hash: petrel_core::Bytes(<[u8]>::to_vec(&[0x32u8; 32])),
+        confirmation_tag: petrel_core::Bytes(<[u8]>::to_vec(&[0x32u8; 32])),
+        lifecycle: catbird_server::blue_catbird::chat::Lifecycle::Active,
         extra_data: None,
     };
     let welcome_digest = compute_welcome_envelope_digest(

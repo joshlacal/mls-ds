@@ -15,13 +15,11 @@
 
 use std::time::Duration;
 
+use crate::blue_catbird::push::deliver::{Input as Deliver, WakePayload, WakePayloadWakeKind};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use catbird_atproto::generated::blue_catbird::push::deliver::{
-    Deliver, WakePayload, WakePayloadWakeKind,
-};
 use chrono::Utc;
-use jacquard_common::deps::bytes::Bytes;
 use p256::ecdsa::{signature::Signer, Signature, SigningKey as P256SigningKey};
+use petrel_core::Bytes;
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use sqlx::FromRow;
@@ -169,7 +167,7 @@ impl PushGatewayClient {
         let inline_ct = wake
             .ciphertext
             .filter(|bytes| bytes.len() <= INLINE_CIPHERTEXT_MAX_BYTES)
-            .map(Bytes::from);
+            .map(Bytes);
 
         let payload = WakePayload {
             wake_kind: wake.wake_kind.to_generated(),
@@ -252,9 +250,8 @@ impl PushGatewayClient {
                 app_id: binding.app_id.clone().into(),
                 push_key: binding.push_key.clone().into(),
                 payload: payload.clone(),
-                extra_data: None,
             };
-            let body_bytes = serde_json::to_vec(&req_body)
+            let body_bytes = catbird_server::atproto_conv::wire_json_bytes(&req_body)
                 .map_err(|e| PushDispatchError::Rejected(e.to_string()))?;
             let body_sha256 = hex_lower(&Sha256::digest(&body_bytes));
 
@@ -503,12 +500,12 @@ mod tests {
                 generation: 1,
                 seq: 42,
                 epoch: 3,
-                ciphertext: Some(Bytes::from_static(b"mls-private-message")),
+                ciphertext: Some(Bytes(<[u8]>::to_vec(b"mls-private-message"))),
                 extra_data: None,
             },
-            extra_data: None,
         };
-        let body_bytes = serde_json::to_vec(&req_body).expect("serialize Deliver");
+        let body_bytes =
+            catbird_server::atproto_conv::wire_json_bytes(&req_body).expect("serialize Deliver");
         let expected_sha = hex_lower(&Sha256::digest(&body_bytes));
 
         let jwt = client

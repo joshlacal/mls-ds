@@ -18,14 +18,11 @@
 
 mod common;
 
-use atproto_spaces::{
-    http_signature::sign_credential_request,
-    kem::{encapsulate_p256, encode_p256_did_key},
-    lthash::LtHash,
-    mac::{format_accept_signature, verify_commit_mac, MacProfile, ACCEPT_SIGNATURE_HEADER},
-    tokens::{mint_space_token, SpaceSigningKey, SpaceTokenClaims, SpaceTokenKind},
-    SpaceUri,
-};
+#[path = "common/space_fixtures.rs"]
+mod space_fixtures;
+use petrel_spaces::{encapsulate_p256, format_accept_signature, MacProfile};
+use space_fixtures::{did_key, signed_headers};
+
 use axum::{
     body::Body,
     extract::State,
@@ -82,10 +79,12 @@ fn build_signed_space_headers(
     nonce: &str,
 ) -> HeaderMap {
     let secret = P256Secret::from_slice(&pop_key.to_bytes()).expect("p256 secret");
-    sign_credential_request(&secret, cred_jwt, authority_did, now_sec, nonce)
-        .expect("sign_credential_request")
-        .to_header_map()
-        .expect("to_header_map")
+    let mut headers = HeaderMap::new();
+    signed_headers(&secret, cred_jwt, authority_did, now_sec, nonce)
+        .unwrap()
+        .apply_to_header_map(&mut headers)
+        .unwrap();
+    headers
 }
 
 async fn inventory_page(
@@ -99,10 +98,9 @@ async fn inventory_page(
     cursor: Option<&str>,
     limit: usize,
 ) -> (Response, [u8; 32], String) {
-    let authority_kem = encode_p256_did_key(&P256PublicKey::from(authority_key.verifying_key()));
+    let authority_kem = did_key(&P256PublicKey::from(authority_key.verifying_key()));
     let encapsulation = encapsulate_p256(&authority_kem).expect("encapsulate inventory MAC key");
-    let accept_sig =
-        format_accept_signature(MacProfile::Commit, &encapsulation.key_share_did_key).unwrap();
+    let accept_sig = format_accept_signature(MacProfile::Commit, &encapsulation.key_share).unwrap();
     let mut headers = build_signed_space_headers(
         pop_key,
         credential,
@@ -111,7 +109,7 @@ async fn inventory_page(
         &Uuid::new_v4().to_string(),
     );
     headers.insert(
-        ACCEPT_SIGNATURE_HEADER,
+        "accept-signature",
         HeaderValue::from_str(&accept_sig).unwrap(),
     );
     let mut query = url::form_urlencoded::Serializer::new(String::new());
@@ -130,8 +128,8 @@ async fn inventory_page(
     *request.headers_mut() = headers;
     (
         app.clone().oneshot(request).await.unwrap(),
-        encapsulation.shared_secret,
-        encapsulation.key_share_did_key,
+        *encapsulation.shared_secret,
+        encapsulation.key_share,
     )
 }
 
@@ -220,27 +218,7 @@ fn mint_delegation(
     now_sec: u64,
 ) -> String {
     let _ = cnf_kid;
-    let authority = SpaceUri::parse(space_uri)
-        .expect("canonical Space URI")
-        .authority;
-    let signing_key = SpaceSigningKey::P256 {
-        signing_key: user_pds_key.clone(),
-        kid: "#atproto".to_string(),
-    };
-    mint_space_token(
-        SpaceTokenKind::Delegation,
-        &signing_key,
-        &SpaceTokenClaims {
-            iss: user_did.to_string(),
-            sub: space_uri.to_string(),
-            aud: Some(format!("{authority}#atproto_pds")),
-            iat: now_sec,
-            exp: now_sec + 60,
-            jti: jti.to_string(),
-            cnf_kid: None,
-        },
-    )
-    .expect("mint delegation JWT")
+    space_fixtures::delegation(user_pds_key, user_did, space_uri, jti, now_sec)
 }
 
 fn mint_service_jwt_es256(issuer_did: &str, key: &P256SigningKey, aud: &str, lxm: &str) -> String {
@@ -349,7 +327,7 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
     // 1. Active sender & active recipient both mint Space credentials via authorizeSpaceSync
     //    (including synchronous confirmRegistration when `notify` is supplied)!
     let sender_pop = P256SigningKey::from_bytes((&[0x41u8; 32]).into()).unwrap();
-    let sender_kid = encode_p256_did_key(&P256PublicKey::from(sender_pop.verifying_key()));
+    let sender_kid = did_key(&P256PublicKey::from(sender_pop.verifying_key()));
     let sender_del = mint_delegation(
         &fixture.sender_did,
         &sender_pds_key,
@@ -435,7 +413,7 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
 
     // Mint credential for recipient too
     let recip_pop = P256SigningKey::from_bytes((&[0x42u8; 32]).into()).unwrap();
-    let recip_kid = encode_p256_did_key(&P256PublicKey::from(recip_pop.verifying_key()));
+    let recip_kid = did_key(&P256PublicKey::from(recip_pop.verifying_key()));
     let recip_del = mint_delegation(
         &fixture.recipient_did,
         &recipient_pds_key,
@@ -614,7 +592,7 @@ async fn space_host_enforces_active_vs_historical_rosters_replay_revocation_and_
     .expect("seed active charlie");
 
     let charlie_pop = P256SigningKey::from_bytes((&[0x43u8; 32]).into()).unwrap();
-    let charlie_kid = encode_p256_did_key(&P256PublicKey::from(charlie_pop.verifying_key()));
+    let charlie_kid = did_key(&P256PublicKey::from(charlie_pop.verifying_key()));
     let charlie_del = mint_delegation(
         charlie_did,
         &charlie_pds_key,
@@ -1118,7 +1096,7 @@ async fn archive_inventory_pages_over_one_hundred_writers_with_one_snapshot_comm
     tx.commit().await.unwrap();
 
     let sender_pop = P256SigningKey::from_bytes((&[0x61u8; 32]).into()).unwrap();
-    let sender_kid = encode_p256_did_key(&P256PublicKey::from(sender_pop.verifying_key()));
+    let sender_kid = did_key(&P256PublicKey::from(sender_pop.verifying_key()));
     let delegation = mint_delegation(
         &fixture.sender_did,
         &sender_pds_key,
@@ -1185,16 +1163,16 @@ async fn archive_inventory_pages_over_one_hundred_writers_with_one_snapshot_comm
         .unwrap()
         .try_into()
         .unwrap();
-    verify_commit_mac(
+    let signed = space_fixtures::verified_commit(
         &first_secret,
         &first_key_share,
         &first_headers,
         &space_uri,
         authority_did,
-        first_commit["rev"].as_str().unwrap(),
-        &commitment,
     )
     .unwrap();
+    assert_eq!(signed.rev.as_str(), first_commit["rev"].as_str().unwrap());
+    assert_eq!(&signed.data, &commitment);
 
     let (second_response, second_secret, second_key_share) = inventory_page(
         &app,
@@ -1220,16 +1198,19 @@ async fn archive_inventory_pages_over_one_hundred_writers_with_one_snapshot_comm
     assert_eq!(second["complete"], true);
     assert!(second.get("cursor").is_none());
     assert_eq!(second["commit"], first_commit);
-    verify_commit_mac(
+    let signed = space_fixtures::verified_commit(
         &second_secret,
         &second_key_share,
         &second_headers,
         &space_uri,
         authority_did,
-        second["commit"]["rev"].as_str().unwrap(),
-        &commitment,
     )
     .unwrap();
+    assert_eq!(
+        signed.rev.as_str(),
+        second["commit"]["rev"].as_str().unwrap()
+    );
+    assert_eq!(&signed.data, &commitment);
 
     let rows: Vec<&Value> = first["repos"]
         .as_array()
@@ -1238,7 +1219,7 @@ async fn archive_inventory_pages_over_one_hundred_writers_with_one_snapshot_comm
         .chain(second["repos"].as_array().unwrap())
         .collect();
     assert_eq!(rows.len(), expected.len());
-    let mut inventory_hash = LtHash::empty();
+    let mut inventory_hash = [0u8; 2048];
     for (row, (expected_did, expected_rev, expected_data)) in rows.iter().zip(&expected) {
         assert_eq!(row["$type"], "com.atproto.space.defs#repoWrite");
         assert_eq!(row["repo"], expected_did.as_str());
@@ -1250,11 +1231,19 @@ async fn archive_inventory_pages_over_one_hundred_writers_with_one_snapshot_comm
             .try_into()
             .unwrap();
         assert_eq!(data.as_slice(), expected_data.as_slice());
-        inventory_hash
-            .add_inventory_entry(expected_did, expected_rev, expected_rev, &data)
-            .unwrap();
+        catbird_server::space_host::add_inventory_entry(
+            &mut inventory_hash,
+            expected_did,
+            expected_rev,
+            expected_rev,
+            &data,
+        )
+        .unwrap();
     }
-    assert_eq!(inventory_hash.commitment(), commitment);
+    assert_eq!(
+        <sha2::Sha256 as sha2::Digest>::digest(inventory_hash).as_slice(),
+        commitment
+    );
 
     let mut tampered_cursor = cursor.as_bytes().to_vec();
     let midpoint = tampered_cursor.len() / 2;

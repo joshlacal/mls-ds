@@ -393,14 +393,7 @@ async fn prepare_and_build(
         sequencer_receipt_authority_key: ds.sequencer_receipt_public_key.clone(),
         text: text.into(),
         invitation: None,
-        metadata: GroupMetadataV1 {
-            version: 1,
-            title: String::new(),
-            description: String::new(),
-            avatar_blob_locator: None,
-            avatar_content_type: None,
-            space_avatar: None,
-        },
+        metadata: GroupMetadataV1::new("", ""),
     })?;
     let bootstrap = &journal.bootstrap;
 

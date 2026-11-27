@@ -14,12 +14,6 @@ mod epoch_secret_test_support;
 mod live_orchestrator;
 
 use anyhow::Context as _;
-use catbird_mls::atproto::generated::blue_catbird::chat::{
-    accept_conversation::AcceptConversationOutput, activate_reset::ActivateResetOutput,
-    create_conversation::CreateConversationOutput, get_entries::GetEntriesOutput,
-    get_subscription_ticket::GetSubscriptionTicketOutput, request_reset::RequestResetOutput,
-    send_message::SendMessageOutput, submit_transition::SubmitTransitionOutput, ConversationEntry,
-};
 use catbird_mls::orchestrator::reset_flow::ResetOutcome;
 use catbird_mls::orchestrator::MLSAPIClient;
 use encrypted_requests::{
@@ -28,6 +22,15 @@ use encrypted_requests::{
 };
 use live_orchestrator::mock_credentials::MockCredentials;
 use mls_e2e_tests::mls_engine::MlsEngine;
+use petrel_catbird::generated::blue::catbird::chat::{
+    accept_conversation::Output as AcceptConversationOutput,
+    activate_reset::Output as ActivateResetOutput,
+    create_conversation::Output as CreateConversationOutput, defs::ConversationEntry,
+    get_entries::Output as GetEntriesOutput,
+    get_subscription_ticket::Output as GetSubscriptionTicketOutput,
+    request_reset::Output as RequestResetOutput, send_message::Output as SendMessageOutput,
+    submit_transition::Output as SubmitTransitionOutput,
+};
 use serde_json::Value;
 use uuid::Uuid;
 

@@ -16,8 +16,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use catbird_atproto::generated::blue_catbird::chat as chat_dto;
-use jacquard_common::DefaultStr;
+use crate::blue_catbird::chat as chat_dto;
 
 use crate::chat_protocol::error::{ChatEndpoint, ChatProtocolErrorCode};
 use crate::chat_protocol::repository::device_directory::read_device_view;
@@ -116,12 +115,11 @@ async fn replenish(
         .await
         .map_err(|error| directory_failure(ENDPOINT, error))?
         .ok_or_else(|| ChatFailure::invariant(ENDPOINT))?;
-    let output = chat_dto::replenish_key_packages::ReplenishKeyPackagesOutput::<DefaultStr> {
+    let output = chat_dto::replenish_key_packages::Output {
         device: device_view_from_directory(&view),
-        extra_data: None,
     };
-    let response_bytes =
-        serde_json::to_vec(&output).map_err(|_| ChatFailure::invariant(ENDPOINT))?;
+    let response_bytes = catbird_server::atproto_conv::wire_json_bytes(&output)
+        .map_err(|_| ChatFailure::invariant(ENDPOINT))?;
 
     prelude::complete_replenishment_operation(
         &mut transaction,

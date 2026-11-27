@@ -14,17 +14,17 @@ pub enum StreamEvent {
     #[serde(rename = "blue.catbird.chat.defs#typingEvent")]
     CleanTypingEvent {
         #[serde(rename = "actorDeviceId")]
-        actor_device_id: catbird_atproto::generated::blue_catbird::chat::DeviceId,
+        actor_device_id: crate::blue_catbird::chat::DeviceId,
         #[serde(rename = "actorDid")]
-        actor_did: catbird_atproto::generated::blue_catbird::chat::BareDid,
+        actor_did: crate::blue_catbird::chat::BareDid,
         #[serde(rename = "conversationId")]
-        conversation_id: catbird_atproto::generated::blue_catbird::chat::OperationId,
+        conversation_id: crate::blue_catbird::chat::OperationId,
         #[serde(rename = "expiresAt")]
-        expires_at: catbird_atproto::generated::blue_catbird::chat::CanonicalDatetime,
+        expires_at: crate::blue_catbird::chat::CanonicalDatetime,
         #[serde(rename = "isTyping")]
         is_typing: bool,
         #[serde(rename = "typingId")]
-        typing_id: catbird_atproto::generated::blue_catbird::chat::OperationId,
+        typing_id: crate::blue_catbird::chat::OperationId,
     },
 }
 
@@ -35,9 +35,7 @@ pub fn is_false(v: &bool) -> bool {
 pub fn set_stream_event_cursor(_event: &mut StreamEvent, _new_cursor: String) {}
 
 impl StreamEvent {
-    pub(crate) fn clean_typing_payload(
-        &self,
-    ) -> Option<catbird_atproto::generated::blue_catbird::chat::TypingEvent> {
+    pub(crate) fn clean_typing_payload(&self) -> Option<crate::blue_catbird::chat::TypingEvent> {
         match self {
             Self::CleanTypingEvent {
                 actor_device_id,
@@ -46,17 +44,15 @@ impl StreamEvent {
                 expires_at,
                 is_typing,
                 typing_id,
-            } => Some(
-                catbird_atproto::generated::blue_catbird::chat::TypingEvent {
-                    actor_device_id: actor_device_id.clone(),
-                    actor_did: actor_did.clone(),
-                    conversation_id: conversation_id.clone(),
-                    expires_at: expires_at.clone(),
-                    is_typing: *is_typing,
-                    typing_id: typing_id.clone(),
-                    extra_data: None,
-                },
-            ),
+            } => Some(crate::blue_catbird::chat::TypingEvent {
+                actor_device_id: actor_device_id.clone(),
+                actor_did: actor_did.clone(),
+                conversation_id: conversation_id.clone(),
+                expires_at: expires_at.clone(),
+                is_typing: *is_typing,
+                typing_id: typing_id.clone(),
+                extra_data: None,
+            }),
         }
     }
 }

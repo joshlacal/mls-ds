@@ -387,12 +387,12 @@ impl catbird_mls::orchestrator::api_client::MLSAPIClient for CapableHostApi {
         let mut conversations = Vec::new();
         for item in page.items {
             // Tombstones carry no state; only live states become views.
-            let catbird_mls::atproto::blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(item) = item else {
+            let petrel_catbird::generated::blue::catbird::chat::defs::ConversationInventoryItem::ConversationInventoryState(item) = item else {
                 continue;
             };
             let coordinates = &item.state.coordinates;
             conversations.push(catbird_mls::orchestrator::ConversationView {
-                group_id: hex::encode(&coordinates.group_id),
+                group_id: hex::encode(&coordinates.group_id.0),
                 conversation_id: serde_json::to_value(&coordinates.conversation_id)
                     .map_err(api_error)?
                     .as_str()
@@ -800,14 +800,7 @@ async fn prepare_upgrade(
             sequencer_receipt_authority_key: f.server.sequencer_receipt_public_key.clone(),
             text: "Upgraded legacy introduction".into(),
             invitation: None,
-            metadata: GroupMetadataV1 {
-                version: 1,
-                title: String::new(),
-                description: String::new(),
-                avatar_blob_locator: None,
-                avatar_content_type: None,
-                space_avatar: None,
-            },
+            metadata: GroupMetadataV1::new("", ""),
         })?;
     let b = &journal.bootstrap;
     let mut body = prepare["body"].clone();

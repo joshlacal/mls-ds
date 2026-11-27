@@ -11,9 +11,9 @@ use super::peer_policy;
 use super::receipt::result_bytes_for_receipt;
 use super::resolver::{DsResolver, ValidatedRemoteDestination};
 use crate::auth::AuthMiddleware;
+use crate::blue_catbird::mls_ds::FederationReceiptV1;
 use crate::chat_protocol::repository::delivery::QUEUED_COPY_OF_PRUNED_ENTRY_SQL;
 use crate::identity::{canonical_did, dids_equivalent, service_did_base};
-use catbird_atproto::generated::blue_catbird::mlsDS::FederationReceiptV1;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres};
@@ -987,11 +987,11 @@ impl OutboundQueue {
                         }
                     };
 
-                    if receipt.envelope_sha256.as_ref() != &expected_envelope_digest[..] {
+                    if receipt.envelope_sha256.0.as_slice() != &expected_envelope_digest[..] {
                         let error_msg = format!(
                             "Receipt envelope_sha256 mismatch: expected {}, got {}",
                             hex::encode(expected_envelope_digest),
-                            hex::encode(receipt.envelope_sha256.as_ref()),
+                            hex::encode(receipt.envelope_sha256.0.as_slice()),
                         );
                         warn!(queue_id = %item.id, error = %error_msg, "Receipt envelope digest mismatch — possible forgery");
                         self.handle_failure(item, &error_msg, false).await;
@@ -1011,11 +1011,11 @@ impl OutboundQueue {
                         }
                     };
                     let result_sha256: [u8; 32] = sha2::Sha256::digest(&result_bytes).into();
-                    if receipt.result_sha256.as_ref() != &result_sha256[..] {
+                    if receipt.result_sha256.0.as_slice() != &result_sha256[..] {
                         let error_msg = format!(
                             "Receipt result_sha256 mismatch: expected {}, got {}",
                             hex::encode(result_sha256),
-                            hex::encode(receipt.result_sha256.as_ref()),
+                            hex::encode(receipt.result_sha256.0.as_slice()),
                         );
                         warn!(queue_id = %item.id, error = %error_msg, "Receipt result digest mismatch — possible forgery / permanent hostile response");
                         self.handle_failure(item, &error_msg, false).await;
@@ -1975,14 +1975,14 @@ pub fn recompute_envelope_digest_from_payload(
         compute_commit_envelope_digest, compute_message_envelope_digest,
         compute_welcome_envelope_digest, validate_entry_locator, validate_envelope_header,
     };
-    use catbird_atproto::generated::blue_catbird::mlsDS::{
-        deliver_message::DeliverMessage, deliver_welcome::DeliverWelcome,
-        submit_commit::SubmitCommit,
+    use crate::blue_catbird::mls_ds::{
+        deliver_message::Input as DeliverMessage, deliver_welcome::Input as DeliverWelcome,
+        submit_commit::Input as SubmitCommit,
     };
 
     match method {
         DELIVER_MESSAGE_NSID => {
-            let msg: DeliverMessage<jacquard_common::DefaultStr> =
+            let msg: DeliverMessage =
                 serde_json::from_slice(payload_bytes).map_err(FederationError::Json)?;
             let header = validate_envelope_header(&msg.header)?;
             let locator = validate_entry_locator(&msg.entry_locator)?;
@@ -1990,12 +1990,12 @@ pub fn recompute_envelope_digest_from_payload(
                 &header,
                 msg.recipient_did.as_str(),
                 &locator,
-                msg.entry_bytes.as_ref(),
-                msg.signed_request_bytes.as_ref(),
+                msg.entry_bytes.0.as_slice(),
+                msg.signed_request_bytes.0.as_slice(),
             )
         }
         DELIVER_WELCOME_NSID => {
-            let msg: DeliverWelcome<jacquard_common::DefaultStr> =
+            let msg: DeliverWelcome =
                 serde_json::from_slice(payload_bytes).map_err(FederationError::Json)?;
             let header = validate_envelope_header(&msg.header)?;
             let locator = validate_entry_locator(&msg.entry_locator)?;
@@ -2016,10 +2016,10 @@ pub fn recompute_envelope_digest_from_payload(
                         reason: "invalid recoveryRequestId".to_string(),
                     }
                 })?;
-            if msg.key_package_ref.len() != 32
-                || msg.welcome_sha256.len() != 32
-                || msg.public_snapshot_sha256.len() != 32
-                || msg.tree_summary_sha256.len() != 32
+            if msg.key_package_ref.0.len() != 32
+                || msg.welcome_sha256.0.len() != 32
+                || msg.public_snapshot_sha256.0.len() != 32
+                || msg.tree_summary_sha256.0.len() != 32
             {
                 return Err(FederationError::InvalidEnvelope {
                     reason: "invalid crypto byte array length in deliverWelcome payload"
@@ -2027,13 +2027,13 @@ pub fn recompute_envelope_digest_from_payload(
                 });
             }
             let mut key_package_ref = [0u8; 32];
-            key_package_ref.copy_from_slice(&msg.key_package_ref);
+            key_package_ref.copy_from_slice(&msg.key_package_ref.0);
             let mut welcome_sha256 = [0u8; 32];
-            welcome_sha256.copy_from_slice(&msg.welcome_sha256);
+            welcome_sha256.copy_from_slice(&msg.welcome_sha256.0);
             let mut public_snapshot_sha256 = [0u8; 32];
-            public_snapshot_sha256.copy_from_slice(&msg.public_snapshot_sha256);
+            public_snapshot_sha256.copy_from_slice(&msg.public_snapshot_sha256.0);
             let mut tree_summary_sha256 = [0u8; 32];
-            tree_summary_sha256.copy_from_slice(&msg.tree_summary_sha256);
+            tree_summary_sha256.copy_from_slice(&msg.tree_summary_sha256.0);
 
             compute_welcome_envelope_digest(
                 &header,
@@ -2042,10 +2042,10 @@ pub fn recompute_envelope_digest_from_payload(
                 welcome_id,
                 recovery_request_id,
                 &key_package_ref,
-                msg.welcome_bytes.as_ref(),
+                msg.welcome_bytes.0.as_slice(),
                 &welcome_sha256,
-                msg.entry_bytes.as_ref(),
-                msg.signed_request_bytes.as_ref(),
+                msg.entry_bytes.0.as_slice(),
+                msg.signed_request_bytes.0.as_slice(),
                 &locator,
                 &msg.coordinates,
                 &public_snapshot_sha256,
@@ -2053,10 +2053,10 @@ pub fn recompute_envelope_digest_from_payload(
             )
         }
         SUBMIT_COMMIT_NSID => {
-            let msg: SubmitCommit<jacquard_common::DefaultStr> =
+            let msg: SubmitCommit =
                 serde_json::from_slice(payload_bytes).map_err(FederationError::Json)?;
             let header = validate_envelope_header(&msg.header)?;
-            compute_commit_envelope_digest(&header, msg.signed_request_bytes.as_ref())
+            compute_commit_envelope_digest(&header, msg.signed_request_bytes.0.as_slice())
         }
         _ => Err(FederationError::InvalidEnvelope {
             reason: format!("unsupported clean federation method: {method}"),
@@ -2153,15 +2153,15 @@ pub async fn store_federation_receipt_conn(
             || stored_receiver != receipt.receiver_ds_did.as_str()
             || stored_sequencer != receipt.sequencer_did.as_str()
             || stored_term != receipt.sequencer_term as i64
-            || stored_envelope_sha256 != receipt.envelope_sha256.as_ref()
-            || stored_result_sha256 != receipt.result_sha256.as_ref()
+            || stored_envelope_sha256 != receipt.envelope_sha256.0.as_slice()
+            || stored_result_sha256 != receipt.result_sha256.0.as_slice()
             || stored_source_entry_id != source_entry_id
             || stored_source_entry_seq != receipt.source_locator.seq as i64
             || stored_source_entry_fingerprint
-                != receipt.source_locator.outer_entry_fingerprint.as_ref()
+                != receipt.source_locator.outer_entry_fingerprint.0.as_slice()
             || stored_response_bytes != response_bytes
             || stored_response_sha256 != &response_sha256[..]
-            || stored_signature != receipt.signature.as_ref()
+            || stored_signature != receipt.signature.0.as_slice()
         {
             return Err(sqlx::Error::Protocol(format!(
                 "Receipt conflict for delivery_id {delivery_id}: existing receipt bytes or metadata differ"
@@ -2185,14 +2185,14 @@ pub async fn store_federation_receipt_conn(
     .bind(receipt.receiver_ds_did.as_str())
     .bind(receipt.sequencer_did.as_str())
     .bind(receipt.sequencer_term as i64)
-    .bind(receipt.envelope_sha256.as_ref())
-    .bind(receipt.result_sha256.as_ref())
+    .bind(receipt.envelope_sha256.0.as_slice())
+    .bind(receipt.result_sha256.0.as_slice())
     .bind(source_entry_id)
     .bind(receipt.source_locator.seq as i64)
-    .bind(receipt.source_locator.outer_entry_fingerprint.as_ref())
+    .bind(receipt.source_locator.outer_entry_fingerprint.0.as_slice())
     .bind(response_bytes)
     .bind(&response_sha256[..])
-    .bind(receipt.signature.as_ref())
+    .bind(receipt.signature.0.as_slice())
     .bind(completed_at)
     .execute(&mut *conn)
     .await;
@@ -2250,15 +2250,15 @@ pub async fn store_federation_receipt_conn(
                     || stored_receiver != receipt.receiver_ds_did.as_str()
                     || stored_sequencer != receipt.sequencer_did.as_str()
                     || stored_term != receipt.sequencer_term as i64
-                    || stored_envelope_sha256 != receipt.envelope_sha256.as_ref()
-                    || stored_result_sha256 != receipt.result_sha256.as_ref()
+                    || stored_envelope_sha256 != receipt.envelope_sha256.0.as_slice()
+                    || stored_result_sha256 != receipt.result_sha256.0.as_slice()
                     || stored_source_entry_id != source_entry_id
                     || stored_source_entry_seq != receipt.source_locator.seq as i64
                     || stored_source_entry_fingerprint
-                        != receipt.source_locator.outer_entry_fingerprint.as_ref()
+                        != receipt.source_locator.outer_entry_fingerprint.0.as_slice()
                     || stored_response_bytes != response_bytes
                     || stored_response_sha256 != &response_sha256[..]
-                    || stored_signature != receipt.signature.as_ref()
+                    || stored_signature != receipt.signature.0.as_slice()
                 {
                     return Err(sqlx::Error::Protocol(format!(
                         "Receipt conflict on concurrent insert for delivery_id {delivery_id}"

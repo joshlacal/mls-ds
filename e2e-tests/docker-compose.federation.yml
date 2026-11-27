@@ -98,7 +98,8 @@ services:
       dockerfile: server/Dockerfile
       target: federation-test
       additional_contexts:
-        catbird-atproto: ../../catbird-atproto
+        petrel: ../../Petrel/rust
+        petrel-catbird: ../../PetrelCatbird/rust/petrel-catbird
         labyrinth-protocol: ../../labyrinth/labyrinth-protocol
     command: *ds-command
     depends_on:
@@ -196,7 +197,8 @@ services:
       dockerfile: server/Dockerfile
       target: federation-test
       additional_contexts:
-        catbird-atproto: ../../catbird-atproto
+        petrel: ../../Petrel/rust
+        petrel-catbird: ../../PetrelCatbird/rust/petrel-catbird
         labyrinth-protocol: ../../labyrinth/labyrinth-protocol
     command: *ds-command
     depends_on:
