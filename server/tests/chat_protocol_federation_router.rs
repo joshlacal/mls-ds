@@ -7147,7 +7147,7 @@ async fn test_remote_commit_canonical_mismatch_fails_and_rolls_back() {
                 use catbird_server::blue_catbird::mls_ds::submit_commit::{Input as SubmitCommit, Output as SubmitCommitOutput};
                 use catbird_server::federation::envelope::sign_receipt;
                 use catbird_server::federation::envelope::validate_envelope_header;
-                
+
                 let msg: SubmitCommit = serde_json::from_slice(&body).unwrap();
                 let header = validate_envelope_header(&msg.header).unwrap();
 
@@ -7452,7 +7452,7 @@ async fn test_remote_commit_receipt_locator_payload_hash_mismatch_fails_and_roll
                 use catbird_server::blue_catbird::mls_ds::submit_commit::{Input as SubmitCommit, Output as SubmitCommitOutput};
                 use catbird_server::federation::envelope::sign_receipt;
                 use catbird_server::federation::envelope::validate_envelope_header;
-                
+
                 let msg: SubmitCommit = serde_json::from_slice(&body).unwrap();
                 let header = validate_envelope_header(&msg.header).unwrap();
 
@@ -7748,7 +7748,7 @@ async fn test_remote_commit_receipt_locator_fingerprint_mismatch_fails_and_rolls
                 use catbird_server::blue_catbird::mls_ds::submit_commit::{Input as SubmitCommit, Output as SubmitCommitOutput};
                 use catbird_server::federation::envelope::sign_receipt;
                 use catbird_server::federation::envelope::validate_envelope_header;
-                
+
                 let msg: SubmitCommit = serde_json::from_slice(&body).unwrap();
                 let header = validate_envelope_header(&msg.header).unwrap();
 
@@ -8095,7 +8095,7 @@ async fn test_remote_commit_dropped_first_response_replay_applies_exactly_once()
 
                 use catbird_server::blue_catbird::mls_ds::submit_commit::Input as SubmitCommit;
                 use catbird_server::federation::envelope::validate_envelope_header;
-                
+
                 if let Ok(msg) = serde_json::from_slice::<SubmitCommit>(body_bytes) {
                     if let Ok(header) = validate_envelope_header(&msg.header) {
                         let mut guard = ids.lock();

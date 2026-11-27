@@ -492,7 +492,12 @@ impl Pds {
             ("GET", "com.atproto.space.getDelegationToken") => {
                 self.delegation_token(headers, params, now)
             }
-            ("POST", "com.atproto.space.getSpaceCredential") => self.space_credential(body, now),
+            ("POST", "com.atproto.space.getSpaceCredential") => {
+                self.space_credential(body, now, "credentialKid")
+            }
+            ("POST", "com.atproto.space.authorizeSpaceSync") => {
+                self.space_credential(body, now, "credentialKey")
+            }
             ("GET", "com.atproto.space.listSpaces") => self.list_spaces(headers),
             (
                 "GET",
@@ -801,10 +806,10 @@ impl Pds {
     }
 
     /// The personal-mailbox Space authority: only the owner's delegation earns a credential.
-    fn space_credential(&self, body: &[u8], now: u64) -> Reply {
+    fn space_credential(&self, body: &[u8], now: u64, key_field: &str) -> Reply {
         let body = parse(body)?;
         let space = space_uri(body["space"].as_str())?;
-        let kid = text(&body, "credentialKid")?;
+        let kid = text(&body, key_field)?;
         decode_p256_did_key(kid).map_err(|e| err(400, "InvalidRequest", e))?;
         if space.space_type().as_str() != MAILBOX
             || space.skey().as_str() != "self"
