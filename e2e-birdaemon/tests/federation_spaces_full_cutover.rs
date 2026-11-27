@@ -64,7 +64,7 @@ use labyrinth_protocol::receipt::{
     compute_archive_commitment, verify_sequencer_receipt_sec1, SignedSequencerReceipt,
 };
 use native_spaces::{
-    assert_authority_notified, did_key, mint_es256_service_jwt, p256_public_jwk,
+    assert_authority_notified, delegation, did_key, mint_es256_service_jwt, p256_public_jwk,
     CleanSlateDsProcess, DidDirectory, MemoryKeyStore, SpacesPds,
 };
 use p256::{
@@ -72,8 +72,8 @@ use p256::{
     SecretKey as P256Secret,
 };
 use petrel_spaces::{
-    encapsulate_p256, format_accept_signature, mint_delegation_token, parse_space_ref,
-    sign_credential_request, verify_commit_mac, MacProfile, SigningKeyPair,
+    encapsulate_p256, format_accept_signature, sign_credential_request, verify_commit_mac,
+    MacProfile, SigningKeyPair,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -1948,27 +1948,22 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .error_for_status()?;
     let outsider_eph = P256Secret::random(&mut rand::rngs::OsRng);
     let outsider_cnf = did_key(&outsider_eph.public_key());
-    let delegation_space = parse_space_ref(&space_uri)?;
-    let delegation_audience = DS_B_DID.parse()?;
     let now = Utc::now().timestamp();
-    let outsider_del = mint_delegation_token(
-        &SigningKeyPair::from_p256_bytes(&outsider_p256.to_bytes())?,
-        &outsider_did.parse()?,
-        &delegation_audience,
-        &delegation_space,
-        now,
-        now + 60,
-        None,
-        Some("#atproto"),
-    )?;
+    let outsider_del = delegation(
+        &outsider_p256,
+        &outsider_did,
+        &space_uri,
+        &Uuid::new_v4().to_string(),
+        now as u64,
+    );
     let outsider_cred_resp = admin_http
         .post(format!(
-            "{}/xrpc/com.atproto.space.getSpaceCredential",
+            "{}/xrpc/com.atproto.space.authorizeSpaceSync",
             ds_b.base_url
         ))
         .json(&json!({
             "space": space_uri,
-            "credentialKid": outsider_cnf,
+            "credentialKey": outsider_cnf,
             "delegationToken": outsider_del,
         }))
         .send()
@@ -1984,24 +1979,21 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     let eve_proof_key = SigningKeyPair::from_p256_bytes(&eve_eph.to_bytes())?;
     let eve_cnf = did_key(&eve_eph.public_key());
     let now = Utc::now().timestamp();
-    let eve_del = mint_delegation_token(
-        &SigningKeyPair::from_p256_bytes(&eve_p256.to_bytes())?,
-        &eve_did.parse()?,
-        &delegation_audience,
-        &delegation_space,
-        now,
-        now + 60,
-        None,
-        Some("#atproto"),
-    )?;
+    let eve_del = delegation(
+        &eve_p256,
+        &eve_did,
+        &space_uri,
+        &Uuid::new_v4().to_string(),
+        now as u64,
+    );
     let eve_cred_json: Value = admin_http
         .post(format!(
-            "{}/xrpc/com.atproto.space.getSpaceCredential",
+            "{}/xrpc/com.atproto.space.authorizeSpaceSync",
             ds_b.base_url
         ))
         .json(&json!({
             "space": space_uri,
-            "credentialKid": eve_cnf,
+            "credentialKey": eve_cnf,
             "delegationToken": eve_del,
         }))
         .send()
@@ -2055,16 +2047,13 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     let alice_proof_key = SigningKeyPair::from_p256_bytes(&alice_eph.to_bytes())?;
     let alice_cnf = did_key(&alice_eph.public_key());
     let now = Utc::now().timestamp();
-    let alice_del = mint_delegation_token(
-        &SigningKeyPair::from_p256_bytes(&alice_p256.to_bytes())?,
-        &alice_remote_did.parse()?,
-        &delegation_audience,
-        &delegation_space,
-        now,
-        now + 60,
-        None,
-        Some("#atproto"),
-    )?;
+    let alice_del = delegation(
+        &alice_p256,
+        &alice_remote_did,
+        &space_uri,
+        &Uuid::new_v4().to_string(),
+        now as u64,
+    );
     let alice_relay_cred_jwt = mint_es256_service_jwt(
         &alice_p256,
         &alice_remote_did,
@@ -2172,7 +2161,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
 
     // Gate 10: Eve's unexpired 10-minute credential MUST NOW IMMEDIATELY FAIL with `401 CredentialRevoked`
     // on `ds-b` (`listRepos`), `swan_pds` (`getBlob` & `listRepoOps`), AND `ref_pds` (`getBlob` & `listRepoOps`),
-    // AND re-minting via `getSpaceCredential` MUST return `403 Forbidden`!
+    // AND re-minting via `authorizeSpaceSync` MUST return `403 Forbidden`!
     let eve_ds_b_pop = sign_credential_request(
         &eve_cred,
         &eve_proof_key,
@@ -2202,24 +2191,21 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     );
 
     let now = Utc::now().timestamp();
-    let eve_remint_del = mint_delegation_token(
-        &SigningKeyPair::from_p256_bytes(&eve_p256.to_bytes())?,
-        &eve_did.parse()?,
-        &delegation_audience,
-        &delegation_space,
-        now,
-        now + 60,
-        None,
-        Some("#atproto"),
-    )?;
+    let eve_remint_del = delegation(
+        &eve_p256,
+        &eve_did,
+        &space_uri,
+        &Uuid::new_v4().to_string(),
+        now as u64,
+    );
     let eve_remint_resp = admin_http
         .post(format!(
-            "{}/xrpc/com.atproto.space.getSpaceCredential",
+            "{}/xrpc/com.atproto.space.authorizeSpaceSync",
             ds_b.base_url
         ))
         .json(&json!({
             "space": space_uri,
-            "credentialKid": eve_cnf,
+            "credentialKey": eve_cnf,
             "delegationToken": eve_remint_del,
         }))
         .send()
@@ -2227,7 +2213,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     assert_eq!(
         eve_remint_resp.status(),
         reqwest::StatusCode::FORBIDDEN,
-        "Gate 10: removed member Eve re-minting getSpaceCredential MUST fail with 403 Forbidden"
+        "Gate 10: removed member Eve re-minting authorizeSpaceSync MUST fail with 403 Forbidden"
     );
 
     for (pds_url, writer, cid) in [

@@ -972,14 +972,16 @@ async fn create_conversation_happy_path_with_did_typed_participants_accepts_and_
 
 #[derive(Clone, Copy)]
 enum GeneratedTransitionOrigin {
-    Rust,
+    Petrel,
+    Jacquard,
     Swift,
 }
 
 impl GeneratedTransitionOrigin {
     fn name(self) -> &'static str {
         match self {
-            Self::Rust => "rust",
+            Self::Petrel => "rust",
+            Self::Jacquard => "rust-historical",
             Self::Swift => "swift",
         }
     }
@@ -1173,12 +1175,29 @@ async fn exercise_generated_transition_handler(origin: GeneratedTransitionOrigin
     )
     .unwrap();
     let request_bytes = match origin {
-        GeneratedTransitionOrigin::Rust => generated_transition_requests::generated_request(
-            &canonical_wrapper["body"],
-            &STANDARD
-                .decode(canonical_wrapper["signature"].as_str().unwrap())
-                .unwrap(),
-        ),
+        GeneratedTransitionOrigin::Petrel | GeneratedTransitionOrigin::Jacquard => {
+            let petrel = generated_transition_requests::generated_request(
+                &canonical_wrapper["body"],
+                &STANDARD
+                    .decode(canonical_wrapper["signature"].as_str().unwrap())
+                    .unwrap(),
+            );
+            if matches!(origin, GeneratedTransitionOrigin::Jacquard) {
+                // The historical Rust producer encoded body as a plain ref. The
+                // wrapper and participant unions still carried discriminators.
+                let mut historical: Value = serde_json::from_slice(&petrel).unwrap();
+                assert_eq!(
+                    historical["signedRequest"]["body"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("$type"),
+                    Some(json!("blue.catbird.chat.defs#policyTransitionBody"))
+                );
+                serde_json::to_vec(&historical).unwrap()
+            } else {
+                petrel
+            }
+        }
         GeneratedTransitionOrigin::Swift => {
             run_swift_transition_producer(
                 &[
@@ -1206,11 +1225,15 @@ async fn exercise_generated_transition_handler(origin: GeneratedTransitionOrigin
         wire_value["signedRequest"]["$type"],
         "blue.catbird.chat.defs#signedPolicyTransition"
     );
-    if matches!(origin, GeneratedTransitionOrigin::Rust) {
-        assert!(
-            wire_value["signedRequest"]["body"].get("$type").is_none(),
-            "fresh Rust structs must not inherit a body tag through extra_data"
-        );
+    match origin {
+        GeneratedTransitionOrigin::Petrel => assert_eq!(
+            wire_value["signedRequest"]["body"]["$type"],
+            "blue.catbird.chat.defs#policyTransitionBody"
+        ),
+        GeneratedTransitionOrigin::Jacquard => {
+            assert!(wire_value["signedRequest"]["body"].get("$type").is_none())
+        }
+        GeneratedTransitionOrigin::Swift => {}
     }
     let request = |bytes: &[u8]| {
         let mut request = build_authenticated_post_for_endpoint(
@@ -1446,7 +1469,8 @@ async fn exercise_generated_transition_handler(origin: GeneratedTransitionOrigin
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL and activation; required by the Linux compatibility gate"]
 async fn generated_transition_handlers_preserve_raw_persistence_replay_and_canonical_reads() {
-    exercise_generated_transition_handler(GeneratedTransitionOrigin::Rust).await;
+    exercise_generated_transition_handler(GeneratedTransitionOrigin::Petrel).await;
+    exercise_generated_transition_handler(GeneratedTransitionOrigin::Jacquard).await;
 }
 
 #[tokio::test]

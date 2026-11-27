@@ -36,8 +36,9 @@
 //!    second import is a no-op.
 //! 3. The phone revokes the tablet's Labyrinth device (a new epoch opens).
 //!    Post-rotation sends by the phone and by Bob are archived and address only
-//!    Alice's new epoch; a fresh Alice device restores all four messages with
-//!    the recovery code; the revoked tablet can no longer open the mailbox.
+//!    Alice's new epoch. A fresh Alice device rejects the superseded recovery
+//!    code and restores all four messages with the replacement. The revoked
+//!    tablet can no longer open the mailbox.
 //!
 //! Requires `clean_slate_federation_fixture` in mls-ds/target/debug (built with
 //! `--features test-support`) and a loopback PostgreSQL instance whose role can
@@ -507,7 +508,7 @@ async fn labyrinth_backup_restore_import_and_revocation_against_live_mlsds() -> 
     };
     anyhow::ensure!(
         rotated.status.epoch_seq > epoch0,
-        "revocation opens a new epoch ({rotated:?})"
+        "revocation must advance the epoch past {epoch0}"
     );
     let head1 = epoch_head(&ds, ALICE, rotated.status.epoch_seq as i64).await?;
     anyhow::ensure!(head1 != head0);
@@ -563,8 +564,8 @@ async fn labyrinth_backup_restore_import_and_revocation_against_live_mlsds() -> 
         );
         assert_authority_notified(&ds, &pds, &space, writer).await?;
     }
-    // A fresh Alice device restores every message with the recovery code, Bob's
-    // post-rotation message included.
+    // Revoking a device also rotates the recovery code. Only the replacement
+    // code can restore Alice's history, including Bob's post-rotation message.
     let laptop = DeviceUnderTest::open(
         root.path(),
         "alice-laptop",
@@ -573,7 +574,16 @@ async fn labyrinth_backup_restore_import_and_revocation_against_live_mlsds() -> 
         &pds,
     )
     .await?;
-    let restored = laptop.restore(&alice_code, &cid).await?;
+    let replaced_code = rotated
+        .rekeyed_recovery_code
+        .as_deref()
+        .context("device revocation must issue a replacement recovery code")?;
+    let old_code_error = laptop.restore(&alice_code, &cid).await.unwrap_err();
+    anyhow::ensure!(
+        format!("{old_code_error:#}").contains("recovery code is invalid"),
+        "superseded recovery code failed for an unexpected reason: {old_code_error:#}"
+    );
+    let restored = laptop.restore(replaced_code, &cid).await?;
     let laptop_history = laptop.history(&cid).await?;
     let expected = vec![
         (
@@ -626,14 +636,47 @@ async fn labyrinth_backup_restore_import_and_revocation_against_live_mlsds() -> 
         rotated.status.epoch_seq
     );
 
-    // The only refusals are absence probes: records not written yet (the next
-    // epoch, an unpublished mailboxKeys) and the Spaces eligibility probe, a
-    // parameterless getSpace; nothing was refused or failed for another reason.
-    let probe = |e: &native_spaces::Exchange| {
-        (e.status == 404 && e.error.as_deref() == Some("RecordNotFound"))
-            || (e.status == 400
-                && e.error.as_deref() == Some("InvalidRequest")
-                && e.url.ends_with("/xrpc/com.atproto.space.getSpace"))
+    // Check each non-success against the protocol operation that expects it.
+    // A fresh installation rediscovers the existing public device records
+    // and verifies the server's matching enrollment before opening the archive.
+    let expected = |device: &str, e: &native_spaces::Exchange| {
+        let endpoint = e
+            .url
+            .split('?')
+            .next()
+            .and_then(|u| u.split("/xrpc/").nth(1));
+        let replacement = matches!(device, "alice-tablet" | "bob-tablet" | "alice-laptop");
+        match (e.method.as_str(), endpoint, e.status, e.error.as_deref()) {
+            (
+                "GET",
+                Some(
+                    "com.atproto.repo.getRecord"
+                    | "com.atproto.sync.getRecord"
+                    | "com.atproto.space.getRecord",
+                ),
+                404,
+                Some("RecordNotFound"),
+            ) => true,
+            ("GET", Some("com.atproto.space.getSpace"), 400, Some("InvalidRequest")) => {
+                !e.url.contains('?')
+            }
+            ("GET", Some("blue.catbird.labyrinth.getEpochHead"), 404, Some("EpochNotFound")) => {
+                matches!(device, "alice-phone" | "bob-phone")
+            }
+            (
+                "POST",
+                Some("blue.catbird.labyrinth.deleteRecoveryShare"),
+                404,
+                Some("RecoveryShareNotFound"),
+            ) => device == "alice-phone",
+            ("POST", Some("blue.catbird.chat.enrollDevice"), 400, Some("DeviceAlreadyExists")) => {
+                replacement
+            }
+            ("POST", Some("com.atproto.repo.createRecord"), 400, Some("InvalidRequest")) => {
+                replacement && e.message.as_deref() == Some("record already exists")
+            }
+            _ => false,
+        }
     };
     let (probes, unexpected): (Vec<_>, Vec<_>) = [&phone, &bob, &bob_tablet, &tablet, &laptop]
         .iter()
@@ -646,9 +689,9 @@ async fn labyrinth_backup_restore_import_and_revocation_against_live_mlsds() -> 
                 .map(|e| (device.label.clone(), e))
                 .collect::<Vec<_>>()
         })
-        .partition(|(_, e)| probe(e));
+        .partition(|(device, e)| expected(device, e));
     anyhow::ensure!(unexpected.is_empty(), "unexpected refusals: {unexpected:?}");
-    println!("{} absence probes, no other refusal", probes.len());
+    println!("{} expected absence or retry responses", probes.len());
     for device in [&phone, &bob, &bob_tablet, &tablet, &laptop] {
         anyhow::ensure!(
             device

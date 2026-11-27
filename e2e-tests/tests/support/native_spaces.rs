@@ -19,10 +19,14 @@
 // The PDS handlers' `Err` is the XRPC error response itself.
 #![allow(clippy::result_large_err)]
 
+#[path = "../../../server/tests/common/space_fixtures.rs"]
+mod space_fixtures;
+pub use space_fixtures::delegation;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
-    io::{BufRead as _, BufReader},
+    io::{BufRead as _, BufReader, Write as _},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
@@ -62,11 +66,10 @@ use p256::{
 use petrel_core::{AtUri, Did, SpaceRef};
 use petrel_spaces::{
     compute_dagcbor_cid, decapsulate_p256, decode_p256_did_key, encode_p256_did_key,
-    extract_signing_key, mint_credential_token, mint_delegation_token, parse_accept_signature,
-    parse_space_ref, sign_commit_mac, sign_record_mac, verify_credential_request,
-    verify_credential_token, verify_delegation_token, verify_json_value_for_dag_cbor,
-    write_star_repo, LtHash, MacProfile, SigningKeyPair, SpaceDidDocument, SpaceMacHeaders,
-    StaticDidResolver, MAX_DELEGATION_LIFETIME_SECS,
+    extract_signing_key, mint_credential_token, parse_accept_signature, parse_space_ref,
+    sign_commit_mac, sign_record_mac, verify_credential_request, verify_credential_token,
+    verify_delegation_token, verify_json_value_for_dag_cbor, write_star_repo, LtHash, MacProfile,
+    SigningKeyPair, SpaceDidDocument, SpaceMacHeaders, StaticDidResolver,
 };
 use rand::RngCore as _;
 use serde_json::{json, Value};
@@ -401,7 +404,13 @@ async fn handle(
         );
     }
     let reply = match (method.as_str(), nsid) {
-        ("GET", "com.atproto.sync.getRecord") => pds.record_proof(&params).await,
+        (
+            "GET",
+            "com.atproto.sync.getRecord"
+            | "com.atproto.sync.getLatestCommit"
+            | "com.atproto.sync.getBlocks"
+            | "com.atproto.sync.getRepo",
+        ) => pds.read_public_repository(nsid, &params).await,
         ("POST", "com.atproto.space.applyWrites") => pds.apply_writes(&headers, &body).await,
         ("POST", "com.atproto.space.deleteRecord") => {
             pds.delete_space_record(&headers, &body).await
@@ -518,10 +527,10 @@ impl Pds {
         }
     }
 
-    async fn record_proof(&self, params: &BTreeMap<String, String>) -> Reply {
-        let did = required(params, "did")?;
-        let collection = required(params, "collection")?;
-        let rkey = required(params, "rkey")?;
+    async fn signed_public_repository(
+        &self,
+        did: &str,
+    ) -> Result<petrel_repo::Repository, Response> {
         let mut heads = self.public_heads.lock().await;
         let (records, key) = {
             let world = self.world.lock().unwrap();
@@ -537,10 +546,7 @@ impl Pds {
                 .collect::<BTreeMap<_, _>>();
             (records, account.key.to_bytes())
         };
-        if !records.contains_key(&(collection.to_owned(), rkey.to_owned())) {
-            return Err(err(404, "RecordNotFound", rkey));
-        }
-        let proof: Result<Vec<u8>> = async {
+        let result: anyhow::Result<petrel_repo::Repository> = async {
             let signer = petrel_repo::P256Keypair::from_bytes(&key.into())?;
             let head = match heads.entry(did.to_owned()) {
                 std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
@@ -552,10 +558,57 @@ impl Pds {
                 }
             };
             head.refresh(&records, &signer).await?;
-            Ok(head.repo.record_proof(collection, rkey).await?.car()?)
+            Ok(head.repo.clone())
         }
         .await;
-        let car = proof.map_err(|e| err(500, "RepoProofFailed", e))?;
+        result.map_err(|e| err(500, "RepoProofFailed", e))
+    }
+
+    async fn read_public_repository(&self, nsid: &str, params: &BTreeMap<String, String>) -> Reply {
+        use petrel_repo::{car::varint::push_varint, BlockSource as _};
+        let did = required(params, "did")?;
+        let repo = self.signed_public_repository(did).await?;
+        let problem = |e: &dyn std::fmt::Display| err(500, "RepoProofFailed", e);
+        let car = match nsid {
+            "com.atproto.sync.getLatestCommit" => {
+                return Ok(ok(json!({
+                    "cid": repo.commit().cid.to_string(), "rev": repo.revision().to_string()
+                })))
+            }
+            "com.atproto.sync.getRecord" => {
+                let c = required(params, "collection")?;
+                let r = required(params, "rkey")?;
+                let proof = repo.record_proof(c, r).await.map_err(|e| problem(&e))?;
+                if proof.record_cid.is_none() {
+                    return Err(err(404, "RecordNotFound", r));
+                }
+                proof.car().map_err(|e| problem(&e))?
+            }
+            "com.atproto.sync.getBlocks" => {
+                let id = petrel_core::Cid::parse(required(params, "cids")?)
+                    .map_err(|e| err(400, "InvalidRequest", e))?;
+                let bytes = repo
+                    .store()
+                    .get_block(&id)
+                    .await
+                    .map_err(|e| problem(&e))?
+                    .ok_or_else(|| err(404, "BlockNotFound", &id))?;
+                // getBlocks carries individual blocks in a rootless CAR. Repository
+                // exports and inclusion proofs instead carry their signed commit root.
+                let header = serde_ipld_dagcbor::to_vec(&json!({"roots": [], "version": 1}))
+                    .map_err(|e| problem(&e))?;
+                let mut output = Vec::new();
+                push_varint(header.len() as u64, &mut output).map_err(|e| problem(&e))?;
+                output.extend_from_slice(&header);
+                push_varint((id.as_bytes().len() + bytes.len()) as u64, &mut output)
+                    .map_err(|e| problem(&e))?;
+                output.extend_from_slice(id.as_bytes());
+                output.extend_from_slice(&bytes);
+                output
+            }
+            "com.atproto.sync.getRepo" => repo.export_car().await.map_err(|e| problem(&e))?,
+            _ => unreachable!("public repository read route"),
+        };
         Ok(Response::builder()
             .header(header::CONTENT_TYPE, "application/vnd.ipld.car")
             .body(Body::from(car))
@@ -789,19 +842,15 @@ impl Pds {
         let account = self.session(headers)?;
         let space = space_uri(params.get("space").map(String::as_str))?;
         let mut world = self.world.lock().unwrap();
-        let issuer = Did::parse(&account).map_err(|e| err(400, "InvalidRequest", e))?;
         let jti = format!("delegation-{}", world.next());
-        let token = mint_delegation_token(
-            &space_signer(&world.accounts[&account].key),
-            &issuer,
-            space.space_did(),
-            &space,
-            now as i64,
-            now as i64 + MAX_DELEGATION_LIFETIME_SECS,
-            Some(&jti),
-            Some("#atproto"),
-        )
-        .map_err(|e| err(500, "InternalServerError", e))?;
+        // The Catbird authority checks the service-scoped audience before accepting a delegation.
+        let token = delegation(
+            &world.accounts[&account].key,
+            &account,
+            space.as_str(),
+            &jti,
+            now,
+        );
         Ok(ok(json!({ "token": token })))
     }
 
@@ -1675,6 +1724,7 @@ pub struct CleanSlateDsProcess {
     pub receipt_key: SigningKey,
     pub did_document: Value,
     pub pool: PgClient,
+    _recovery_directory: tempfile::TempDir,
     child: Option<Child>,
 }
 
@@ -1693,7 +1743,18 @@ impl CleanSlateDsProcess {
         let db_url = database_url.to_string();
         let signing_key = SigningKey::random(&mut rand::rngs::OsRng);
         let receipt_key = SigningKey::random(&mut rand::rngs::OsRng);
+        let recovery_directory = tempfile::tempdir()?;
+        let kek_path = recovery_directory.path().join("kek");
+        let mut key_file = tempfile::NamedTempFile::new_in(recovery_directory.path())?;
+        key_file.write_all(&rand::random::<[u8; 32]>())?;
+        key_file.persist(&kek_path)?;
         let mut child = Command::new(fixture_binary_path())
+            .env("LABYRINTH_RECOVERY_SHARE_KEK_FILE", kek_path)
+            .env("LABYRINTH_RECOVERY_SHARE_KEK_ID", &db_name)
+            .env(
+                "LABYRINTH_RECOVERY_SHARE_TOMBSTONE_FILE",
+                recovery_directory.path().join("deletions"),
+            )
             .env("APP_ENV", "test")
             .env("TEST_DATABASE_URL", &db_url)
             .env("SERVICE_DID", service_did)
@@ -1735,6 +1796,7 @@ impl CleanSlateDsProcess {
             receipt_key,
             did_document,
             pool,
+            _recovery_directory: recovery_directory,
             child: Some(child),
         })
     }
@@ -1848,13 +1910,14 @@ pub async fn assert_authority_notified(
 // Native client platform transport and key store
 // ---------------------------------------------------------------------------
 
-/// One exchange the transport carried: method, URL, status, XRPC error name.
+/// One HTTP exchange, including the XRPC error response when present.
 #[derive(Clone, Debug)]
 pub struct Exchange {
     pub method: String,
     pub url: String,
     pub status: u16,
     pub error: Option<String>,
+    pub message: Option<String>,
 }
 
 struct AccountSession {
@@ -2099,20 +2162,24 @@ impl PlatformTransport for ClientTransport {
         })
         .join()
         .map_err(|_| MLSError::Internal("transport panic".into()))?;
-        let (status, error) = match &response {
-            Ok(response) => (
-                response.status,
-                serde_json::from_slice::<Value>(&response.body)
-                    .ok()
-                    .and_then(|body| body["error"].as_str().map(str::to_owned)),
-            ),
-            Err(error) => (0, Some(error.to_string())),
+        let (status, error, message) = match &response {
+            Ok(response) if !(200..300).contains(&response.status) => {
+                let body = serde_json::from_slice::<Value>(&response.body).unwrap_or_default();
+                (
+                    response.status,
+                    body["error"].as_str().map(str::to_owned),
+                    body["message"].as_str().map(str::to_owned),
+                )
+            }
+            Ok(response) => (response.status, None, None),
+            Err(error) => (0, Some(error.to_string()), None),
         };
         self.exchanges.lock().unwrap().push(Exchange {
             method,
             url,
             status,
             error,
+            message,
         });
         response
     }
