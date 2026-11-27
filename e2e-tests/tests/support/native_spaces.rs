@@ -12,7 +12,7 @@
 //! the writer, with `Accept-Signature` answered from the writer's
 //! `#atproto_kem` secret; real DAG-CBOR CIDs, LtHash commits, `listRepoOps`
 //! replay and STAR `getRepo`. A conversation-Space write commits only after the
-//! Space authority accepts the PDS's service-authenticated `notifyWrite`.
+//! Space authority accepts the PDS's service-authenticated `notifyRepoUpdate`.
 //! `notifyCredentialRevoked` / `notifySpaceDeleted` must carry the authority's
 //! service auth. DID documents live in one [`DidDirectory`] (the stand-in for
 //! PLC / did:web) that every PDS's `resolveDid` serves.
@@ -887,7 +887,13 @@ impl Pds {
             .filter(|((space, repo), state)| {
                 repo == &account && !state.ops.is_empty() && !world.deleted_spaces.contains(space)
             })
-            .map(|((space, _), _)| json!({ "uri": space }))
+            .map(|((space, _), state)| {
+                json!({
+                    "space": space,
+                    "repoRev": tid(state.rev_micros, 0),
+                    "data": { "$bytes": STANDARD.encode(state.hash.digest()) },
+                })
+            })
             .collect();
         Ok(ok(json!({ "spaces": spaces })))
     }
@@ -936,7 +942,7 @@ impl Pds {
             .cloned()
             .unwrap_or_default();
         let base_micros = current.rev_micros;
-        // Strictly monotonic per repo, as the authority's notifyWrite requires.
+        // Strictly monotonic per repo, as the authority's notifyRepoUpdate requires.
         let rev_micros = now_micros().max(base_micros + 1);
         let rev = tid(rev_micros, 0);
         let mut next = current;
@@ -1001,7 +1007,7 @@ impl Pds {
         })
     }
 
-    /// `com.atproto.space.notifyWrite` to the Space authority, service-authenticated
+    /// `com.atproto.space.notifyRepoUpdate` to the Space authority, service-authenticated
     /// by the writer; a refusal is the write's answer.
     async fn notify_write(&self, staged: &StagedWrite) -> Result<(), Response> {
         let endpoint = self
@@ -1020,12 +1026,14 @@ impl Pds {
                 &world.accounts[&staged.repo].key,
                 &staged.repo,
                 staged.space.space_did().as_str(),
-                "com.atproto.space.notifyWrite",
+                "com.atproto.space.notifyRepoUpdate",
             )
         };
         let response = self
             .http
-            .post(format!("{endpoint}/xrpc/com.atproto.space.notifyWrite"))
+            .post(format!(
+                "{endpoint}/xrpc/com.atproto.space.notifyRepoUpdate"
+            ))
             .bearer_auth(token)
             .json(&json!({
                 "space": staged.space.as_str(),
@@ -1808,7 +1816,7 @@ impl Drop for CleanSlateDsProcess {
     }
 }
 
-/// The Space authority `ds` recorded, from the PDS's `notifyWrite`, exactly the
+/// The Space authority `ds` recorded, from the PDS's `notifyRepoUpdate`, exactly the
 /// commit `pds` serves for `writer`'s repo in `space`.
 pub async fn assert_authority_notified(
     ds: &CleanSlateDsProcess,

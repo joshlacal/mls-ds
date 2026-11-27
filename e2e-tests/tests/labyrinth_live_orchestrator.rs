@@ -9,7 +9,7 @@
 //! Real: every MLS operation and HTTP exchange (scoped service-auth JWTs the DS
 //! verifies against each account's registered `#atproto` key, PDS OAuth
 //! sessions, delegation → Space credential exchanges, credential reads relayed
-//! through the home DS, the PDS's service-authenticated `notifyWrite` to the
+//! through the home DS, the PDS's service-authenticated `notifyRepoUpdate` to the
 //! Space authority), the DS's PostgreSQL state, the PDS's committed Space repos,
 //! and each device's encrypted MLS database (which also holds its Labyrinth
 //! state and archive queue).
@@ -363,7 +363,7 @@ async fn labyrinth_backup_restore_import_and_revocation_against_live_mlsds() -> 
     );
     // Space record writes: Alice's sealed sender copies and their MEK, in her
     // own repo of the conversation Space, committed after the DS accepted the
-    // PDS's notifyWrite for exactly that commit.
+    // PDS's notifyRepoUpdate for exactly that commit.
     let archived: BTreeSet<String> =
         decode::<Batch>(pds.space_records(&space, ALICE, nsid::BATCH))?
             .into_iter()

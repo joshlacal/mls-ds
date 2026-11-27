@@ -1838,7 +1838,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     assert_eq!(staged_public_resp.status(), reqwest::StatusCode::NOT_FOUND);
 
     // Promote Bob's avatar into Conversation Space on `swan_pds`: the PDS commits it only after
-    // `ds-b`, the Space authority, accepts its service-authenticated `notifyWrite`.
+    // `ds-b`, the Space authority, accepts its service-authenticated `notifyRepoUpdate`.
     admin_http
         .post(format!(
             "{}/xrpc/com.atproto.space.applyWrites",
