@@ -25,7 +25,7 @@ use aes_gcm::{
     aead::{Aead as _, KeyInit as _},
     Aes256Gcm, Nonce as AesNonce,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     body::Bytes as AxumBytes,
     http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
@@ -1995,6 +1995,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             "space": space_uri,
             "credentialKey": eve_cnf,
             "delegationToken": eve_del,
+            "notify": ref_pds.notify_registration(&space_uri),
         }))
         .send()
         .await?
@@ -2073,6 +2074,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
                 "space": space_uri,
                 "delegationToken": alice_del,
                 "cnfKey": alice_cnf,
+                "notify": swan_pds.notify_registration(&space_uri),
             }),
         )
         .await?;
@@ -2140,7 +2142,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     }
 
     // Gate 10: Admin Bob removes Eve (`200 OK`) -> `ds-b` revokes Eve's credential & fans out
-    // `notifyCredentialRevoked` to BOTH `swan_pds` and `ref_pds`!
+    // `notifyCredentialsRevoked` to BOTH `swan_pds` and `ref_pds`!
     let kick_eve_resp: Value = admin_http
         .post(format!("{}/_test/clean-slate/remove-member", ds_b.base_url))
         .json(&json!({
@@ -2156,11 +2158,11 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     assert_eq!(kick_eve_resp["removed"], true);
     assert!(
         kick_eve_resp["notifiedWriterHosts"].as_u64().unwrap() >= 2,
-        "Gate 10: notifyCredentialRevoked must fan out to both Swan and atproto#5187 PDS hosts"
+        "Gate 10: notifyCredentialsRevoked must fan out to both Swan and atproto#5187 PDS hosts"
     );
 
     // Gate 10: Eve's unexpired 10-minute credential MUST NOW IMMEDIATELY FAIL with `401 CredentialRevoked`
-    // on `ds-b` (`listRepos`), `swan_pds` (`getBlob` & `listRepoOps`), AND `ref_pds` (`getBlob` & `listRepoOps`),
+    // on `ds-b` (`listWriters`), `swan_pds` (`getBlob` & `listRepoOps`), AND `ref_pds` (`getBlob` & `listRepoOps`),
     // AND re-minting via `authorizeSpaceSync` MUST return `403 Forbidden`!
     let eve_ds_b_pop = sign_credential_request(
         &eve_cred,
@@ -2169,9 +2171,9 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         Utc::now().timestamp(),
         Some(&Uuid::new_v4().to_string()),
     )?;
-    let evicted_list_repos = admin_http
+    let evicted_list_writers = admin_http
         .get(format!(
-            "{}/xrpc/com.atproto.space.listRepos?space={}",
+            "{}/xrpc/com.atproto.space.listWriters?space={}",
             ds_b.base_url,
             urlencoding::encode(&space_uri),
         ))
@@ -2185,9 +2187,9 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .send()
         .await?;
     assert_eq!(
-        evicted_list_repos.status(),
+        evicted_list_writers.status(),
         reqwest::StatusCode::UNAUTHORIZED,
-        "Gate 10: removed member Eve's cached credential must fail with 401 on ds-b listRepos"
+        "Gate 10: removed member Eve's cached credential must fail with 401 on ds-b listWriters"
     );
 
     let now = Utc::now().timestamp();
@@ -2272,9 +2274,9 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         assert_eq!(evicted_ops.status(), reqwest::StatusCode::UNAUTHORIZED);
     }
 
-    // Remaining member Alice reads `listRepos` on `ds-b` AND Eve's historical repo ops + blob on `ref_pds`
+    // Remaining member Alice reads `listWriters` on `ds-b` AND Eve's historical repo ops + blob on `ref_pds`
     // EXCLUSIVELY through her home `ds-a`'s stateless `relaySpaceRead` (`3A` + `D1` firewall)!
-    let list_repos_pop = sign_credential_request(
+    let list_writers_pop = sign_credential_request(
         &alice_cred,
         &alice_proof_key,
         DS_B_DID,
@@ -2294,12 +2296,12 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             &json!({
                 "actorDeviceId": alice_device_id.to_string(),
                 "targetDid": DS_B_DID,
-                "nsid": "com.atproto.space.listRepos",
+                "nsid": "com.atproto.space.listWriters",
                 "query": format!("space={}", urlencoding::encode(&space_uri)),
                 "credential": alice_cred,
                 "spaceAudience": DS_B_DID,
-                "signatureInput": list_repos_pop.signature_input,
-                "signature": list_repos_pop.signature,
+                "signatureInput": list_writers_pop.signature_input,
+                "signature": list_writers_pop.signature,
             }),
         )
         .await?;
@@ -2309,11 +2311,15 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .as_array()
         .unwrap()
         .iter()
-        .filter_map(|r| r["did"].as_str())
+        .map(|r| {
+            r["repo"]
+                .as_str()
+                .expect("listWriters entry has a repo DID")
+        })
         .collect();
     assert!(
         repo_dids.contains(&eve_did),
-        "Historical writer Eve MUST remain listed in listRepos after removal"
+        "Historical writer Eve MUST remain listed in listWriters after removal"
     );
 
     // Alice reads Eve's `listRepoOps` on `ref_pds` via `ds-a` `relaySpaceRead` with HPKE `Accept-Signature`
@@ -2678,6 +2684,13 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .windows(2)
         .any(|w| w == [0x00, 0x4d]));
     assert!(bird_bot.enrollment_receipt().labyrinth_backup_enabled);
+    // Start the bot before sending the live mention. Its first successful sync
+    // records a watermark so it never replies to a backlog of old messages.
+    assert!(bird_bot.sync_and_reply().await?.is_empty());
+    assert_eq!(
+        bird_bot.conversation_watermark("__cold_start_complete__")?,
+        Some(1)
+    );
 
     // 7a. Live federated group creation on `ds-b` with cross-DS participants (`alice_sdk_did` on `ds-a`, `bob_sdk_did` on `ds-b`)
     let bird_group_id = Uuid::new_v4().to_string();
@@ -2832,65 +2845,93 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .await?;
     let app_seq = prune_send_out["entry"]["seq"].as_i64().unwrap();
 
-    // Sender ACKs via HTTP, then Recipient ACKs via real `CatbirdMlsClient::acknowledge_entries_up_to`
-    // AND registers push gateway via `CatbirdMlsClient::build_signed_push_gateway_registration`!
+    // The seeded signing devices acknowledge through the shipping endpoint.
+    // Earlier live clients verified and decrypted their MLS conversations.
     {
-        let ack_signed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-        #[derive(serde::Serialize)]
-        struct AckPayload<'a> {
-            #[serde(rename = "keyId")]
-            key_id: &'a str,
-            #[serde(rename = "upToSeq")]
-            up_to_seq: i64,
-            #[serde(rename = "signedAt")]
-            signed_at: &'a str,
-            generation: i64,
-            #[serde(rename = "actorDeviceId")]
-            actor_device_id: String,
-            #[serde(rename = "authGeneration")]
-            auth_generation: i64,
-            #[serde(rename = "conversationId")]
-            conversation_id: String,
-        }
-        let cbor = serde_ipld_dagcbor::to_vec(&AckPayload {
-            key_id: &p_sender_kid,
-            up_to_seq: app_seq,
-            signed_at: &ack_signed_at,
-            generation: 0,
-            actor_device_id: p_sender_dev.to_string(),
-            auth_generation: 1,
-            conversation_id: prune_cid.to_string(),
-        })?;
-        let ack_sig: Ed25519Signature =
-            p_sender_ed.sign(&[b"CATBIRD-CHAT-ACK-ENTRIES\0".as_slice(), &cbor].concat());
-        let ack_jwt = mint_es256_service_jwt(
-            &p_sender_p256,
-            &p_sender_did,
-            &format!("{DS_A_DID}#atproto_mls"),
-            "blue.catbird.chat.acknowledgeEntries",
+        let ack_endpoint = format!(
+            "{}/xrpc/blue.catbird.chat.acknowledgeEntries",
+            ds_a.base_url
         );
-        admin_http
-            .post(format!(
-                "{}/xrpc/blue.catbird.chat.acknowledgeEntries",
-                ds_a.base_url
-            ))
-            .header("authorization", format!("Bearer {ack_jwt}"))
-            .header(CONTENT_TYPE, "application/json")
-            .json(&json!({
-                "conversationId": prune_cid,
-                "generation": 0,
-                "actorDeviceId": p_sender_dev,
-                "keyId": p_sender_kid,
-                "authGeneration": 1,
-                "upToSeq": app_seq,
-                "signedAt": ack_signed_at,
-                "signature": STANDARD.encode(ack_sig.to_bytes()),
-            }))
-            .send()
-            .await?
-            .error_for_status()?;
+        let signed_ack = async |did: &str,
+                                device: Uuid,
+                                key_id: &str,
+                                signer: &Ed25519SigningKey,
+                                pds_key: &P256SigningKey|
+               -> Result<i64> {
+            let ack_signed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+            #[derive(serde::Serialize)]
+            struct AckPayload<'a> {
+                #[serde(rename = "keyId")]
+                key_id: &'a str,
+                #[serde(rename = "upToSeq")]
+                up_to_seq: i64,
+                #[serde(rename = "signedAt")]
+                signed_at: &'a str,
+                generation: i64,
+                #[serde(rename = "actorDeviceId")]
+                actor_device_id: String,
+                #[serde(rename = "authGeneration")]
+                auth_generation: i64,
+                #[serde(rename = "conversationId")]
+                conversation_id: String,
+            }
+            let cbor = serde_ipld_dagcbor::to_vec(&AckPayload {
+                key_id: key_id,
+                up_to_seq: app_seq,
+                signed_at: &ack_signed_at,
+                generation: 0,
+                actor_device_id: device.to_string(),
+                auth_generation: 1,
+                conversation_id: prune_cid.to_string(),
+            })?;
+            let ack_sig: Ed25519Signature =
+                signer.sign(&[b"CATBIRD-CHAT-ACK-ENTRIES\0".as_slice(), &cbor].concat());
+            let ack_jwt = mint_es256_service_jwt(
+                pds_key,
+                did,
+                &format!("{DS_A_DID}#atproto_mls"),
+                "blue.catbird.chat.acknowledgeEntries",
+            );
+            let response: Value = admin_http
+                .post(&ack_endpoint)
+                .header("authorization", format!("Bearer {ack_jwt}"))
+                .header(CONTENT_TYPE, "application/json")
+                .json(&json!({
+                    "conversationId": prune_cid,
+                    "generation": 0,
+                    "actorDeviceId": device,
+                    "keyId": key_id,
+                    "authGeneration": 1,
+                    "upToSeq": app_seq,
+                    "signedAt": ack_signed_at,
+                    "signature": STANDARD.encode(ack_sig.to_bytes()),
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
 
-        // Now drive Recipient (`p_rcpt_did`) through the real `CatbirdMlsClient` SDK!
+            anyhow::ensure!(
+                response["acknowledgedSeq"].as_i64() == Some(app_seq),
+                "server did not acknowledge the entry: {response}"
+            );
+            response["prunedCount"]
+                .as_i64()
+                .context("acknowledgeEntries prunedCount")
+        };
+        assert_eq!(
+            signed_ack(
+                &p_sender_did,
+                p_sender_dev,
+                &p_sender_kid,
+                &p_sender_ed,
+                &p_sender_p256
+            )
+            .await?,
+            0
+        );
+        // The recipient registers its signed push gateway through the native SDK.
         let rcpt_ks = Arc::new(MemoryKeyStore::new());
         let rcpt_hash = account_did_hash_hex(&p_rcpt_did)?;
         rcpt_ks.store_signature_keypair(
@@ -2941,18 +2982,73 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             .await?
             .error_for_status()?;
 
-        let rcpt_ack_jwt = mint_es256_service_jwt(
-            &p_rcpt_p256,
-            &p_rcpt_did,
-            &format!("{DS_A_DID}#atproto_mls"),
-            "blue.catbird.chat.acknowledgeEntries",
+        assert_eq!(
+            signed_ack(
+                &p_rcpt_did,
+                p_rcpt_dev,
+                &p_rcpt_kid,
+                &p_rcpt_ed,
+                &p_rcpt_p256
+            )
+            .await?,
+            0
         );
-        rcpt_transport.set_chat_bearer_token(rcpt_ack_jwt);
-        let prune_cid_str = prune_cid.to_string();
-        tokio::task::spawn_blocking(move || {
-            rcpt_sdk.acknowledge_entries_up_to(&prune_cid_str, app_seq)
-        })
-        .await??;
+
+        let fresh = ds_a
+            .pool
+            .query_one(
+                "SELECT accepted_payload_bytes IS NOT NULL AND payload_pruned_at IS NULL
+                    AND received_at > clock_timestamp() - INTERVAL '72 hours',
+                    (SELECT COUNT(*) FROM chat.device_entry_acks
+                     WHERE conversation_id = $1 AND acked_through_seq >= $2)
+                 FROM chat.entries WHERE conversation_id = $1 AND seq = $2",
+                &[&prune_cid, &app_seq],
+            )
+            .await?;
+        assert!(
+            fresh.get::<_, bool>(0),
+            "acknowledged ciphertext must remain during the 72-hour floor"
+        );
+
+        assert_eq!(
+            fresh.get::<_, i64>(1),
+            2,
+            "both fixture devices acknowledged the entry"
+        );
+
+        // As in the real-database pruning suite, adjust only the receipt time
+        // of this disposable immutable entry, then send another ordinary ACK.
+        let age = ds_a.pool.transaction().await?;
+        age.batch_execute("SET LOCAL session_replication_role = replica")
+            .await?;
+        let aged = age
+            .query_one(
+                "UPDATE chat.entries SET received_at = clock_timestamp() - INTERVAL '73 hours'
+                 WHERE conversation_id = $1 AND seq = $2
+                 RETURNING (EXTRACT(EPOCH FROM (clock_timestamp() - received_at)) / 3600)::int",
+                &[&prune_cid, &app_seq],
+            )
+            .await?;
+        assert_eq!(aged.get::<_, i32>(0), 73);
+        let mapped = age.execute(
+            "UPDATE chat.message_sends send SET received_at = entry.received_at
+             FROM chat.entries entry WHERE entry.conversation_id = $1 AND entry.seq = $2
+             AND send.conversation_id = entry.conversation_id AND send.message_id = entry.message_id",
+            &[&prune_cid, &app_seq]
+        ).await?;
+        assert_eq!(mapped, 1, "keep receipt and entry timestamps identical");
+        age.commit().await?;
+        assert_eq!(
+            signed_ack(
+                &p_sender_did,
+                p_sender_dev,
+                &p_sender_kid,
+                &p_sender_ed,
+                &p_sender_p256
+            )
+            .await?,
+            1
+        );
     }
 
     let prune_row = ds_a
@@ -2967,7 +3063,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     let pruned_at_set: bool = prune_row.get(1);
     assert!(
         pruned_payload_null && pruned_at_set,
-        "I14/G6: applicationEntry ciphertext MUST be pruned immediately once all active leaf devices ACK"
+        "I14/G6: acknowledged applicationEntry ciphertext MUST be pruned after the 72-hour floor"
     );
 
     let seq_rows = ds_a
@@ -2985,7 +3081,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     );
 
     // Close & wipe `convo_id` on `ds-b`: prove active conversation refuses premature wipe,
-    // `notifySpaceDeleted` fans out (`410 SpaceDeleted`), and operational rows are wiped!
+    // `notifySpaceUpdate#spaceDeleted` fans out (`410 SpaceDeleted`), and operational rows are wiped!
     let wipe_res: Value = admin_http
         .post(format!(
             "{}/_test/clean-slate/close-and-wipe-conversation",
@@ -3014,7 +3110,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         "G6/I14: chat.wipe_closed_conversation_operational_rows must wipe all operational entries"
     );
 
-    // Verify `swan_pds` and `ref_pds` received the authority's `notifySpaceDeleted` and now return
+    // Verify `swan_pds` and `ref_pds` received the authority's `notifySpaceUpdate#spaceDeleted` and now return
     // `410 SpaceDeleted` to their writers (Bob on `swan_pds`, Eve on `ref_pds`)
     for (pds, token) in [(&swan_pds, "bob-pds-oauth"), (&ref_pds, "eve-pds-oauth")] {
         assert!(
@@ -3113,12 +3209,18 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
                 &[],
             )
             .await?;
-        let mut lab_tables: Vec<String> = lab_rows.into_iter().map(|r| r.get(0)).collect();
-        lab_tables.sort();
+        let lab_tables: Vec<String> = lab_rows.into_iter().map(|r| r.get(0)).collect();
         assert_eq!(
             lab_tables,
-            vec!["epoch_head_floors", "epoch_heads", "operations"],
-            "G6: labyrinth schema on {} must contain strictly epoch_heads, epoch_head_floors, operations",
+            [
+                "account_erasure_operations",
+                "epoch_head_floors",
+                "epoch_heads",
+                "operations",
+                "recovery_share_events",
+                "recovery_shares",
+            ],
+            "G6: labyrinth schema on {} must contain only epoch, erasure and encrypted recovery-share tables",
             ds.service_did
         );
 

@@ -7,15 +7,16 @@
 //! PDS semantics follow catbird-sim's `SimPds` and catbird-mls's
 //! `NativeArchiveAuthFixture`, over HTTP: an opaque OAuth bearer per account;
 //! `getDelegationToken` minted with the account's `#atproto` key; personal
-//! mailbox credentials from `getSpaceCredential` (conversation credentials come
+//! mailbox credentials from `authorizeSpaceSync` (conversation credentials come
 //! from the real mls-ds SpaceHost); RFC 9421 credential reads whose audience is
 //! the writer, with `Accept-Signature` answered from the writer's
 //! `#atproto_kem` secret; real DAG-CBOR CIDs, LtHash commits, `listRepoOps`
 //! replay and STAR `getRepo`. A conversation-Space write commits only after the
 //! Space authority accepts the PDS's service-authenticated `notifyRepoUpdate`.
-//! `notifyCredentialRevoked` / `notifySpaceDeleted` must carry the authority's
-//! service auth. DID documents live in one [`DidDirectory`] (the stand-in for
-//! PLC / did:web) that every PDS's `resolveDid` serves.
+//! Credential revocations require the authority's service auth. The active
+//! deletion webhook requires a token confirmed by the registration handshake.
+//! DID documents live in one [`DidDirectory`] (the stand-in for PLC / did:web)
+//! that every PDS's `resolveDid` serves.
 // The PDS handlers' `Err` is the XRPC error response itself.
 #![allow(clippy::result_large_err)]
 
@@ -208,8 +209,10 @@ struct World {
     /// Blobs committed into a Space: `(space, repo, cid)`.
     space_blobs: BTreeMap<(String, String, String), Vec<u8>>,
     spent_delegations: BTreeSet<String>,
-    /// Revoked credential `jti` -> expiry (seconds).
-    revoked: BTreeMap<String, u64>,
+    /// Revoked (space, credential identifier) -> expiry (seconds).
+    revoked: BTreeMap<(String, String), u64>,
+    /// (Space, opaque subscriber token) -> confirmed by the authority's challenge.
+    registrations: BTreeMap<(String, String), bool>,
     created_spaces: BTreeSet<String>,
     deleted_spaces: BTreeSet<String>,
     sequence: u64,
@@ -372,6 +375,17 @@ impl SpacesPds {
             .map(|repo| (tid(repo.rev_micros, 0), repo.hash.digest()))
     }
 
+    pub fn notify_registration(&self, space: &str) -> Value {
+        let token = Uuid::new_v4().to_string();
+        self.inner
+            .world
+            .lock()
+            .unwrap()
+            .registrations
+            .insert((space.to_owned(), token.clone()), false);
+        json!({"endpoint": self.base_url, "token": token})
+    }
+
     pub fn space_deleted(&self, space: &str) -> bool {
         self.inner
             .world
@@ -389,6 +403,20 @@ async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // BIRDaemon's loopback transport maps canonical PLC requests to this prefix.
+    if method == Method::GET {
+        if let Some(did) = uri
+            .path()
+            .strip_prefix("/plc.directory/")
+            .filter(|did| did.starts_with("did:plc:"))
+        {
+            return pds
+                .directory
+                .document(did)
+                .map(ok)
+                .unwrap_or_else(|| err(404, "NotFound", did));
+        }
+    }
     let Some(nsid) = uri.path().strip_prefix("/xrpc/") else {
         return err(404, "NotFound", uri.path());
     };
@@ -517,9 +545,15 @@ impl Pds {
                 | "com.atproto.space.getLatestCommit"
                 | "com.atproto.space.getBlob",
             ) => self.read(nsid, params, headers, now),
-            ("POST", "com.atproto.space.notifyCredentialRevoked") => {
-                self.credentials_revoked(headers, body, now)
-            }
+            (
+                "POST",
+                "com.atproto.space.notifyCredentialRevoked"
+                | "com.atproto.space.notifyCredentialsRevoked",
+            ) => self.credentials_revoked(nsid, headers, body, now),
+            (
+                "POST",
+                "com.atproto.space.confirmRegistration" | "com.atproto.space.notifySpaceUpdate",
+            ) => self.subscriber_notice(nsid, body),
             ("POST", "com.atproto.space.notifySpaceDeleted") => {
                 self.space_deleted(headers, body, now)
             }
@@ -579,9 +613,7 @@ impl Pds {
                 let c = required(params, "collection")?;
                 let r = required(params, "rkey")?;
                 let proof = repo.record_proof(c, r).await.map_err(|e| problem(&e))?;
-                if proof.record_cid.is_none() {
-                    return Err(err(404, "RecordNotFound", r));
-                }
+                // An absent record still has a signed MST non-membership proof.
                 proof.car().map_err(|e| problem(&e))?
             }
             "com.atproto.sync.getBlocks" => {
@@ -1167,7 +1199,10 @@ impl Pds {
         ))
         .map_err(|e| err(401, "BadSpaceSignature", e))?;
         let world = self.world.lock().unwrap();
-        if world.revoked.contains_key(&claims.jti) {
+        if world
+            .revoked
+            .contains_key(&(space.as_str().to_owned(), claims.jti.clone()))
+        {
             return Err(err(
                 401,
                 "CredentialRevoked",
@@ -1418,26 +1453,39 @@ impl Pds {
         Ok(())
     }
 
-    fn credentials_revoked(&self, headers: &HeaderMap, body: &[u8], now: u64) -> Reply {
+    fn credentials_revoked(&self, nsid: &str, headers: &HeaderMap, body: &[u8], now: u64) -> Reply {
         let body = parse(body)?;
         let space = space_uri(body["space"].as_str())?;
-        self.verify_authority(
-            headers,
-            space.space_did().as_str(),
-            "com.atproto.space.notifyCredentialRevoked",
-            now,
-        )?;
+        self.verify_authority(headers, space.space_did().as_str(), nsid, now)?;
         let credentials = body["credentials"]
             .as_array()
             .ok_or_else(|| err(400, "InvalidRequest", "credentials missing"))?;
+        if !(1..=100).contains(&credentials.len()) {
+            return Err(err(
+                400,
+                "InvalidRequest",
+                "expected 1 to 100 credential identifiers",
+            ));
+        }
         let mut revoked = Vec::with_capacity(credentials.len());
         for credential in credentials {
-            let exp = chrono::DateTime::parse_from_rfc3339(text(credential, "expiresAt")?)
-                .map_err(|e| err(400, "InvalidRequest", e))?;
-            revoked.push((
-                text(credential, "jti")?.to_owned(),
-                exp.timestamp().max(0) as u64,
-            ));
+            let (jti, expires) = if nsid == "com.atproto.space.notifyCredentialsRevoked" {
+                let jti = credential
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        err(400, "InvalidRequest", "expected a credential identifier")
+                    })?;
+                (
+                    jti,
+                    now + petrel_spaces::tokens::MAX_CREDENTIAL_LIFETIME_SECS as u64,
+                )
+            } else {
+                let expires = chrono::DateTime::parse_from_rfc3339(text(credential, "expiresAt")?)
+                    .map_err(|e| err(400, "InvalidRequest", e))?;
+                (text(credential, "jti")?, expires.timestamp().max(0) as u64)
+            };
+            revoked.push(((space.as_str().to_owned(), jti.to_owned()), expires));
         }
         let mut world = self.world.lock().unwrap();
         world.revoked.retain(|_, exp| *exp > now);
@@ -1445,7 +1493,33 @@ impl Pds {
         Ok(ok(json!({})))
     }
 
-    /// The authority deleted the Space: drop this host's copy; it is gone for reads and writes.
+    fn subscriber_notice(&self, nsid: &str, bytes: &[u8]) -> Reply {
+        let body = parse(bytes)?;
+        let space = space_uri(body["space"].as_str())?;
+        let token = text(&body, "token")?;
+        let mut world = self.world.lock().unwrap();
+        let confirmed = world
+            .registrations
+            .get_mut(&(space.as_str().to_owned(), token.to_owned()))
+            .ok_or_else(|| err(403, "Forbidden", "unknown subscriber token"))?;
+        if nsid == "com.atproto.space.confirmRegistration" {
+            let challenge = text(&body, "challenge")?;
+            if challenge.is_empty() || challenge.len() > 512 {
+                return Err(err(400, "InvalidRequest", "invalid registration challenge"));
+            }
+            *confirmed = true;
+            return Ok(ok(json!({"challenge": challenge})));
+        }
+        if !*confirmed {
+            return Err(err(403, "Forbidden", "registration is not confirmed"));
+        }
+        if body["update"]["$type"] != "com.atproto.space.notifySpaceUpdate#spaceDeleted" {
+            return Err(err(400, "InvalidRequest", "expected a spaceDeleted update"));
+        }
+        Ok(Self::delete_hosted_space(&mut world, space))
+    }
+
+    /// Compatibility callback for the older authority-authenticated deletion procedure.
     fn space_deleted(&self, headers: &HeaderMap, body: &[u8], now: u64) -> Reply {
         let body = parse(body)?;
         let space = space_uri(body["space"].as_str())?;
@@ -1455,11 +1529,17 @@ impl Pds {
             "com.atproto.space.notifySpaceDeleted",
             now,
         )?;
-        let mut world = self.world.lock().unwrap();
+        Ok(Self::delete_hosted_space(
+            &mut self.world.lock().unwrap(),
+            space,
+        ))
+    }
+
+    fn delete_hosted_space(world: &mut World, space: SpaceRef) -> Response {
         world.repos.retain(|(s, _), _| s != space.as_str());
         world.space_blobs.retain(|(s, _, _), _| s != space.as_str());
         world.deleted_spaces.insert(space.into_string());
-        Ok(ok(json!({})))
+        ok(json!({}))
     }
 }
 
