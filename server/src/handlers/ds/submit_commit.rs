@@ -28,15 +28,13 @@ pub async fn submit_commit(
     let Some(signer) = ack_signer.as_deref() else {
         return Err(FederationError::SignerUnavailable);
     };
-    let msg: SubmitCommit = serde_json::from_str(&body).map_err(|e| {
-        FederationError::Json(serde_json::Error::io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Invalid SubmitCommit body: {e}"),
-        )))
-    })?;
-
-    // Unknown top-level fields are rejected while decoding: Petrel XRPC inputs
-    // decode strictly (`ObjectReader::new_strict`).
+    // Petrel inputs accept and drop unknown fields, so the top-level keys are
+    // checked against the lexicon here (400 InvalidEnvelope on an unknown one).
+    let msg: SubmitCommit = super::strict_input::decode_ds_input(
+        &body,
+        "SubmitCommit",
+        super::strict_input::SUBMIT_COMMIT_INPUT_FIELDS,
+    )?;
 
     let header = validate_envelope_header(&msg.header)?;
 

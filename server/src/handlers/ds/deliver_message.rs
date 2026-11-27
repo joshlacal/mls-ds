@@ -28,15 +28,13 @@ pub async fn deliver_message(
         return Err(FederationError::SignerUnavailable);
     };
 
-    let msg: DeliverMessage = serde_json::from_str(&body).map_err(|e| {
-        FederationError::Json(serde_json::Error::io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Invalid DeliverMessage body: {e}"),
-        )))
-    })?;
-
-    // Unknown top-level fields are rejected while decoding: Petrel XRPC inputs
-    // decode strictly (`ObjectReader::new_strict`).
+    // Petrel inputs accept and drop unknown fields, so the top-level keys are
+    // checked against the lexicon here (400 InvalidEnvelope on an unknown one).
+    let msg: DeliverMessage = super::strict_input::decode_ds_input(
+        &body,
+        "DeliverMessage",
+        super::strict_input::DELIVER_MESSAGE_INPUT_FIELDS,
+    )?;
 
     let header = validate_envelope_header(&msg.header)?;
     let locator = validate_entry_locator(&msg.entry_locator)?;

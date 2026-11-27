@@ -72,15 +72,13 @@ pub async fn deliver_welcome(
         return Err(FederationError::SignerUnavailable);
     };
 
-    let msg: DeliverWelcome = serde_json::from_str(&body).map_err(|e| {
-        FederationError::Json(serde_json::Error::io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Invalid DeliverWelcome body: {e}"),
-        )))
-    })?;
-
-    // Unknown top-level fields are rejected while decoding: Petrel XRPC inputs
-    // decode strictly (`ObjectReader::new_strict`).
+    // Petrel inputs accept and drop unknown fields, so the top-level keys are
+    // checked against the lexicon here (400 InvalidEnvelope on an unknown one).
+    let msg: DeliverWelcome = super::strict_input::decode_ds_input(
+        &body,
+        "DeliverWelcome",
+        super::strict_input::DELIVER_WELCOME_INPUT_FIELDS,
+    )?;
 
     let header = validate_envelope_header(&msg.header)?;
     let locator = validate_entry_locator(&msg.entry_locator)?;
