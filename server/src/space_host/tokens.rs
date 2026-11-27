@@ -148,3 +148,64 @@ pub(crate) fn verify_compact(
     key.verify_with_options(sig, input, alg, ATProtoSignatureVerificationOptions::JWT)
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ISSUER: &str = "did:plc:ragtjsm2j2vknwk6zpkrhgah";
+    const SPACE_DID: &str = "did:web:space.example.com";
+
+    fn delegation_with_kid(kid: &str, now: u64) -> String {
+        let header = serde_json::json!({
+            "alg": "ES256",
+            "typ": petrel_spaces::DELEGATION_JWT_TYP,
+            "kid": kid,
+        });
+        let claims = serde_json::json!({
+            "iss": ISSUER,
+            "sub": format!("at:space/{SPACE_DID}/blue.catbird.circle/self"),
+            "aud": format!("{SPACE_DID}#atproto_pds"),
+            "iat": now,
+            "exp": now + 30,
+            "jti": "delegation-kid-pin",
+        });
+        let enc = |v: &serde_json::Value| URL_SAFE_NO_PAD.encode(v.to_string());
+        format!(
+            "{}.{}.{}",
+            enc(&header),
+            enc(&claims),
+            URL_SAFE_NO_PAD.encode([7u8; 64])
+        )
+    }
+
+    /// Pins the accepted delegation and credential `kid` forms. Every deployed
+    /// producer (Swan's `PermissionedDataJWT.delegationKeyID` and
+    /// `spaceCredentialKeyID`, catbird-mls, nest, this server) signs with the
+    /// bare `#atproto`; the issuer-qualified form names the same key. A
+    /// fragment naming another DID's key, which the pre-migration
+    /// `ends_with("#atproto")` check let through, is refused.
+    #[test]
+    fn space_token_kid_must_be_issuer_atproto_key() {
+        let now = 1_800_000_000;
+        for kid in ["#atproto".to_string(), format!("{ISSUER}#atproto")] {
+            let jwt = delegation_with_kid(&kid, now);
+            assert!(
+                ParsedToken::parse(SpaceTokenKind::Delegation, &jwt, now).is_ok(),
+                "kid {kid} must be accepted"
+            );
+        }
+        for kid in [
+            "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa#atproto",
+            "other#atproto",
+            "#atproto_pds",
+            "",
+        ] {
+            let jwt = delegation_with_kid(kid, now);
+            assert!(
+                ParsedToken::parse(SpaceTokenKind::Delegation, &jwt, now).is_err(),
+                "kid {kid:?} must be refused"
+            );
+        }
+    }
+}
