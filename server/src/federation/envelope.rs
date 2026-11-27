@@ -5,10 +5,8 @@
 
 use std::str::FromStr;
 
-use catbird_atproto::generated::blue_catbird::chat::ConversationCoordinates;
-use catbird_atproto::generated::blue_catbird::mlsDS::{
-    EntryLocatorV1, EnvelopeHeaderV1, FederationReceiptV1,
-};
+use crate::blue_catbird::chat::ConversationCoordinates;
+use crate::blue_catbird::mls_ds::{EntryLocatorV1, EnvelopeHeaderV1, FederationReceiptV1};
 use chrono::{DateTime, SecondsFormat, Utc};
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
@@ -126,13 +124,13 @@ pub fn validate_envelope_header(
         }
     })?;
 
-    if header.payload_sha256.len() != 32 {
+    if header.payload_sha256.0.len() != 32 {
         return Err(FederationError::InvalidEnvelope {
             reason: "payloadSha256 must be exactly 32 bytes".to_string(),
         });
     }
     let mut payload_sha256 = [0u8; 32];
-    payload_sha256.copy_from_slice(&header.payload_sha256);
+    payload_sha256.copy_from_slice(&header.payload_sha256.0);
 
     Ok(ValidatedEnvelopeHeader {
         protocol_version: "1".to_string(),
@@ -174,21 +172,21 @@ pub fn validate_entry_locator(
     }
     let seq = locator.seq as u64;
 
-    if locator.accepted_payload_sha256.len() != 32 {
+    if locator.accepted_payload_sha256.0.len() != 32 {
         return Err(FederationError::InvalidEnvelope {
             reason: "acceptedPayloadSha256 must be exactly 32 bytes".to_string(),
         });
     }
     let mut accepted_payload_sha256 = [0u8; 32];
-    accepted_payload_sha256.copy_from_slice(&locator.accepted_payload_sha256);
+    accepted_payload_sha256.copy_from_slice(&locator.accepted_payload_sha256.0);
 
-    if locator.outer_entry_fingerprint.len() != 32 {
+    if locator.outer_entry_fingerprint.0.len() != 32 {
         return Err(FederationError::InvalidEnvelope {
             reason: "outerEntryFingerprint must be exactly 32 bytes".to_string(),
         });
     }
     let mut outer_entry_fingerprint = [0u8; 32];
-    outer_entry_fingerprint.copy_from_slice(&locator.outer_entry_fingerprint);
+    outer_entry_fingerprint.copy_from_slice(&locator.outer_entry_fingerprint.0);
 
     Ok(ValidatedEntryLocator {
         entry_id,
@@ -260,9 +258,9 @@ pub fn compute_welcome_envelope_digest(
             reason: format!("invalid recipientDid: {e}"),
         })?;
 
-    if coordinates.group_id.len() != 32
-        || coordinates.group_context_hash.len() != 32
-        || coordinates.confirmation_tag.len() != 32
+    if coordinates.group_id.0.len() != 32
+        || coordinates.group_context_hash.0.len() != 32
+        || coordinates.confirmation_tag.0.len() != 32
     {
         return Err(FederationError::InvalidEnvelope {
             reason: "invalid coordinates crypto lengths".to_string(),
@@ -304,10 +302,10 @@ pub fn compute_welcome_envelope_digest(
 
     buf.extend_from_slice(&(coordinates.generation as u64).to_be_bytes());
     buf.extend_from_slice(&(coordinates.state_version as u64).to_be_bytes());
-    buf.extend_from_slice(&coordinates.group_id);
+    buf.extend_from_slice(&coordinates.group_id.0);
     buf.extend_from_slice(&(coordinates.epoch as u64).to_be_bytes());
-    buf.extend_from_slice(&coordinates.group_context_hash);
-    buf.extend_from_slice(&coordinates.confirmation_tag);
+    buf.extend_from_slice(&coordinates.group_context_hash.0);
+    buf.extend_from_slice(&coordinates.confirmation_tag.0);
     buf.extend_from_slice(public_snapshot_sha256);
     buf.extend_from_slice(tree_summary_sha256);
 
@@ -396,7 +394,7 @@ pub fn sign_receipt(
     source_locator: ValidatedEntryLocator,
     completed_at: DateTime<Utc>,
 ) -> Result<FederationReceiptV1, FederationError> {
-    let completed_at_dt = crate::sqlx_jacquard::chrono_to_datetime(completed_at);
+    let completed_at_dt = crate::atproto_conv::chrono_to_datetime(completed_at);
     let canonical = canonical_receipt_bytes(
         endpoint,
         delivery_id,
@@ -414,47 +412,42 @@ pub fn sign_receipt(
     let sig_bytes = signer.sign_canonical_bytes(&canonical);
 
     let generated_locator = EntryLocatorV1 {
-        accepted_payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+        accepted_payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(
             &source_locator.accepted_payload_sha256,
-        ),
-        entry_id: jacquard_common::deps::smol_str::SmolStr::from(
-            source_locator.entry_id.hyphenated().to_string(),
-        ),
-        outer_entry_fingerprint: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+        )),
+        entry_id: String::from(source_locator.entry_id.hyphenated().to_string()),
+        outer_entry_fingerprint: petrel_core::Bytes(<[u8]>::to_vec(
             &source_locator.outer_entry_fingerprint,
-        ),
+        )),
         seq: source_locator.seq as i64,
         extra_data: None,
     };
 
     Ok(FederationReceiptV1 {
         completed_at: completed_at_dt,
-        conversation_id: jacquard_common::deps::smol_str::SmolStr::from(
-            conversation_id.hyphenated().to_string(),
-        ),
-        delivery_id: jacquard_common::deps::smol_str::SmolStr::from(
-            delivery_id.hyphenated().to_string(),
-        ),
-        endpoint: jacquard_common::deps::smol_str::SmolStr::from(endpoint),
-        envelope_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&envelope_sha256),
-        protocol_version: jacquard_common::deps::smol_str::SmolStr::from("1"),
-        receiver_ds_did: jacquard_common::types::string::Did::new_owned(
-            receiver_ds_did.to_string(),
-        )
-        .map_err(|e| FederationError::InvalidEnvelope {
-            reason: format!("invalid receiverDsDid: {e}"),
+        conversation_id: String::from(conversation_id.hyphenated().to_string()),
+        delivery_id: String::from(delivery_id.hyphenated().to_string()),
+        endpoint: crate::atproto_conv::open_enum(endpoint),
+        envelope_sha256: petrel_core::Bytes(<[u8]>::to_vec(&envelope_sha256)),
+        protocol_version: crate::atproto_conv::open_enum("1"),
+        receiver_ds_did: petrel_core::Did::parse(receiver_ds_did.to_string()).map_err(|e| {
+            FederationError::InvalidEnvelope {
+                reason: format!("invalid receiverDsDid: {e}"),
+            }
         })?,
-        result_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&result_sha256),
-        sender_ds_did: jacquard_common::types::string::Did::new_owned(sender_ds_did.to_string())
-            .map_err(|e| FederationError::InvalidEnvelope {
+        result_sha256: petrel_core::Bytes(<[u8]>::to_vec(&result_sha256)),
+        sender_ds_did: petrel_core::Did::parse(sender_ds_did.to_string()).map_err(|e| {
+            FederationError::InvalidEnvelope {
                 reason: format!("invalid senderDsDid: {e}"),
-            })?,
-        sequencer_did: jacquard_common::types::string::Did::new_owned(sequencer_did.to_string())
-            .map_err(|e| FederationError::InvalidEnvelope {
+            }
+        })?,
+        sequencer_did: petrel_core::Did::parse(sequencer_did.to_string()).map_err(|e| {
+            FederationError::InvalidEnvelope {
                 reason: format!("invalid sequencerDid: {e}"),
-            })?,
+            }
+        })?,
         sequencer_term: sequencer_term as i64,
-        signature: jacquard_common::deps::bytes::Bytes::copy_from_slice(&sig_bytes),
+        signature: petrel_core::Bytes(<[u8]>::to_vec(&sig_bytes)),
         source_locator: generated_locator,
         extra_data: None,
     })
@@ -468,10 +461,10 @@ pub fn verify_receipt(
     if receipt.protocol_version.as_str() != "1" {
         return Ok(false);
     }
-    if receipt.signature.len() != 64 {
+    if receipt.signature.0.len() != 64 {
         return Ok(false);
     }
-    if receipt.envelope_sha256.len() != 32 || receipt.result_sha256.len() != 32 {
+    if receipt.envelope_sha256.0.len() != 32 || receipt.result_sha256.0.len() != 32 {
         return Ok(false);
     }
 
@@ -489,9 +482,9 @@ pub fn verify_receipt(
     let validated_locator = validate_entry_locator(&receipt.source_locator)?;
 
     let mut envelope_sha256 = [0u8; 32];
-    envelope_sha256.copy_from_slice(&receipt.envelope_sha256);
+    envelope_sha256.copy_from_slice(&receipt.envelope_sha256.0);
     let mut result_sha256 = [0u8; 32];
-    result_sha256.copy_from_slice(&receipt.result_sha256);
+    result_sha256.copy_from_slice(&receipt.result_sha256.0);
 
     let completed_at_str = receipt.completed_at.as_str();
 
@@ -509,7 +502,7 @@ pub fn verify_receipt(
         completed_at_str,
     );
 
-    let signature = match Signature::from_slice(&receipt.signature) {
+    let signature = match Signature::from_slice(&receipt.signature.0) {
         Ok(s) => s,
         Err(_) => return Ok(false),
     };

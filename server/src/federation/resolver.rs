@@ -56,7 +56,7 @@ fn declaration_record_url(pds_endpoint: &str, user_did: &str) -> String {
 /// Rules:
 /// 1. Must be non-empty, trimmed, with no whitespace or fragment (`#`).
 /// 2. Must not have trailing colon (`:`).
-/// 3. Must parse via ATProto parser (`jacquard_common::types::string::Did`).
+/// 3. Must parse via ATProto parser (`petrel_core::Did`).
 /// 4. Supported DID methods: exact `did:plc:` and hostname-level `did:web:`.
 /// 5. `did:plc:` must have exactly 24 lowercase base32 characters (`did:plc:[a-z2-7]{24}`).
 /// 6. `did:web:` must be hostname-level only (no path segments).
@@ -303,11 +303,9 @@ pub fn validate_canonical_did(raw: &str) -> Result<String, FederationError> {
     }
 
     // 1. ATProto DID parser check
-    let _parsed = jacquard_common::types::string::Did::new(raw).map_err(|e| {
-        FederationError::ResolutionFailed {
-            did: raw.to_string(),
-            kind: ResolutionFailureKind::InvalidDid(format!("Invalid ATProto DID syntax: {e}")),
-        }
+    let _parsed = petrel_core::Did::parse(raw).map_err(|e| FederationError::ResolutionFailed {
+        did: raw.to_string(),
+        kind: ResolutionFailureKind::InvalidDid(format!("Invalid ATProto DID syntax: {e}")),
     })?;
 
     // 2. Exact did:plc validation
@@ -1391,7 +1389,7 @@ impl DsResolver {
     pub(crate) async fn resolve_did_to_pds_and_atproto_key(
         &self,
         did: &str,
-    ) -> Result<(String, Option<atproto_spaces::tokens::SpaceVerifyingKey>), FederationError> {
+    ) -> Result<(String, Option<petrel_crypto::ATProtoJWTVerificationKey>), FederationError> {
         let doc = self.fetch_did_document(did).await?;
 
         let endpoint = extract_service(&doc, "atproto_pds", None).ok_or_else(|| {
@@ -1404,12 +1402,7 @@ impl DsResolver {
         })?;
 
         self.validate_remote_url(endpoint).await?;
-        let atproto_key = serde_json::to_vec(&doc)
-            .ok()
-            .and_then(|bytes| {
-                atproto_spaces::did_resolver::DidDocument::parse_json(did, &bytes).ok()
-            })
-            .and_then(|parsed| parsed.atproto_key);
+        let atproto_key = Self::atproto_key_from_document(did, &doc).ok().flatten();
         Ok((endpoint.to_string(), atproto_key))
     }
 
@@ -1418,21 +1411,54 @@ impl DsResolver {
     pub(crate) async fn resolve_did_to_atproto_key(
         &self,
         did: &str,
-    ) -> Result<Option<atproto_spaces::tokens::SpaceVerifyingKey>, FederationError> {
+    ) -> Result<Option<petrel_crypto::ATProtoJWTVerificationKey>, FederationError> {
         let doc = self.fetch_did_document(did).await?;
-        let bytes = serde_json::to_vec(&doc).map_err(|error| {
-            FederationError::Unsupported(format!(
-                "failed to serialize resolved DID document: {error}"
-            ))
-        })?;
-        let parsed = atproto_spaces::did_resolver::DidDocument::parse_json(did, &bytes).map_err(
-            |error| {
-                FederationError::Unsupported(format!(
-                    "resolved DID document has an invalid #atproto key: {error}"
-                ))
-            },
-        )?;
-        Ok(parsed.atproto_key)
+        Self::atproto_key_from_document(did, &doc)
+    }
+
+    fn atproto_key_from_document(
+        did: &str,
+        doc: &serde_json::Value,
+    ) -> Result<Option<petrel_crypto::ATProtoJWTVerificationKey>, FederationError> {
+        let bytes = serde_json::to_vec(doc)
+            .map_err(|e| FederationError::Unsupported(format!("invalid DID document: {e}")))?;
+        if bytes.len() > DID_DOCUMENT_MAX_BYTES {
+            return Err(FederationError::Unsupported(
+                "DID document exceeds 256 KiB".into(),
+            ));
+        }
+        if doc["id"].as_str() != Some(did) {
+            return Err(FederationError::Unsupported(
+                "DID document identifier mismatch".into(),
+            ));
+        }
+        // Registry documents can carry JSON-LD contexts and service endpoints of
+        // several shapes. Only verification methods participate in key resolution.
+        let mut keys = serde_json::json!({"id": did});
+        if let Some(methods) = doc.get("verificationMethod") {
+            keys["verificationMethod"] = methods.clone();
+            if let Some(methods) = keys["verificationMethod"].as_array_mut() {
+                for method in methods {
+                    if let Some(fields) = method.as_object_mut() {
+                        // Earlier DID documents omit the controller on local methods.
+                        fields.entry("controller").or_insert_with(|| did.into());
+                    }
+                }
+            }
+        }
+        let parsed: petrel_spaces::SpaceDidDocument = serde_json::from_value(keys)
+            .map_err(|e| FederationError::Unsupported(format!("invalid DID document: {e}")))?;
+        if parsed.verification_method("#atproto_kem").is_some() {
+            petrel_spaces::extract_kem_key(&parsed).map_err(|e| {
+                FederationError::Unsupported(format!("invalid #atproto_kem key: {e}"))
+            })?;
+        }
+        if parsed.verification_method("#atproto").is_none() {
+            return Ok(None);
+        }
+        petrel_spaces::extract_signing_key(&parsed, "#atproto")
+            .map(Some)
+            .map_err(|e| FederationError::Unsupported(format!("invalid #atproto key: {e}")))
     }
 
     /// Fetch and parse a DID document (did:web or did:plc), with SSRF
@@ -2942,6 +2968,39 @@ mod tests {
     }
     use super::*;
     use base64::Engine as _;
+
+    #[test]
+    fn repository_key_uses_requested_did_and_handles_legacy_document_shapes() {
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+        let did = "did:web:peer.example";
+        let key = p256::SecretKey::from_slice(&[3; 32]).unwrap().public_key();
+        let point = key.to_encoded_point(true);
+        let multikey = [0x80, 0x24]
+            .into_iter()
+            .chain(point.as_bytes().iter().copied())
+            .collect::<Vec<_>>();
+        let mut document = serde_json::json!({
+            "@context": "https://www.w3.org/ns/did/v1",
+            "id": did,
+            "service": [{"id":"#other", "type":"OtherService", "serviceEndpoint":{"url":"https://peer.example"}}],
+            "verificationMethod": [{"id":"#atproto","type":"Multikey","publicKeyMultibase":multibase::encode(multibase::Base::Base58Btc, multikey)}]
+        });
+        let resolved = DsResolver::atproto_key_from_document(did, &document)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resolved.public_key().unwrap().compressed_representation(),
+            point.as_bytes()
+        );
+        assert!(
+            DsResolver::atproto_key_from_document("did:web:elsewhere.example", &document).is_err()
+        );
+        document["verificationMethod"][0]["id"] = "did:web:elsewhere.example#atproto".into();
+        assert!(DsResolver::atproto_key_from_document(did, &document)
+            .unwrap()
+            .is_none());
+    }
 
     async fn response_from_raw(raw: Vec<u8>) -> reqwest::Response {
         use tokio::io::AsyncReadExt as _;

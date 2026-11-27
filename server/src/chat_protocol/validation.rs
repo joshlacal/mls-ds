@@ -97,10 +97,10 @@ pub fn encode_existing_direct_conversation_result(
     });
     let value_bytes = serde_json::to_vec(&value)
         .map_err(|_| AuthPrimitiveError::invalid("cannot encode existing direct result"))?;
-    let output: catbird_atproto::generated::blue_catbird::chat::create_conversation::CreateConversationOutput<jacquard_common::DefaultStr> =
+    let output: catbird_server::blue_catbird::chat::create_conversation::Output =
         serde_json::from_slice(&value_bytes)
             .map_err(|_| AuthPrimitiveError::invalid("invalid existing direct result"))?;
-    serde_json::to_vec(&output)
+    catbird_server::atproto_conv::wire_json_bytes(&output)
         .map_err(|_| AuthPrimitiveError::invalid("cannot encode existing direct result"))
 }
 

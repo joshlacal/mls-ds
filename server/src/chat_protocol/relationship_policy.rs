@@ -10,7 +10,6 @@ use crate::util::outbound_body;
 use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::join_all;
-use jacquard_common::types::cid::IpldCid;
 use reqwest::redirect::Policy as RedirectPolicy;
 use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
@@ -1513,7 +1512,7 @@ fn valid_cid(cid: &str) -> bool {
     if !(2..=128).contains(&cid.len()) || !cid.is_ascii() {
         return false;
     }
-    IpldCid::try_from(cid).is_ok_and(|parsed| parsed.to_string() == cid)
+    petrel_core::Cid::parse(cid).is_ok_and(|parsed| parsed.to_string() == cid)
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]

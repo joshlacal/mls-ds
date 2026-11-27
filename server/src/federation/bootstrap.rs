@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use catbird_atproto::generated::blue_catbird::chat::ConversationCoordinates;
+use crate::blue_catbird::chat::ConversationCoordinates;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -376,15 +376,15 @@ fn direct_welcome_coordinates_match(
     ) && matches!(
         next.get("groupId"),
         Some(CanonicalValueRef::Bytes(value))
-            if value == binding.coordinates.group_id.as_ref()
+            if value == binding.coordinates.group_id.0.as_slice()
     ) && matches!(
         next.get("groupContextHash"),
         Some(CanonicalValueRef::Bytes(value))
-            if value == binding.coordinates.group_context_hash.as_ref()
+            if value == binding.coordinates.group_context_hash.0.as_slice()
     ) && matches!(
         next.get("confirmationTag"),
         Some(CanonicalValueRef::Bytes(value))
-            if value == binding.coordinates.confirmation_tag.as_ref()
+            if value == binding.coordinates.confirmation_tag.0.as_slice()
     ) && matches!(
         next.get("lifecycle"),
         Some(CanonicalValueRef::Text(value))

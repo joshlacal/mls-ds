@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
+use crate::blue_catbird::mls_ds::deliver_message::Input as DeliverMessage;
 use axum::extract::State;
 use axum::Json;
-use catbird_atproto::generated::blue_catbird::mlsDS::deliver_message::DeliverMessage;
-use jacquard_common::DefaultStr;
 use tracing::{debug, warn};
 
 use crate::auth::AuthUser;
@@ -29,18 +28,13 @@ pub async fn deliver_message(
         return Err(FederationError::SignerUnavailable);
     };
 
-    let msg: DeliverMessage<DefaultStr> = serde_json::from_str(&body).map_err(|e| {
-        FederationError::Json(serde_json::Error::io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Invalid DeliverMessage body: {e}"),
-        )))
-    })?;
-
-    if msg.extra_data.as_ref().map_or(false, |m| !m.is_empty()) {
-        return Err(FederationError::InvalidEnvelope {
-            reason: "unknown fields in DeliverMessage request".to_string(),
-        });
-    }
+    // Petrel inputs accept and drop unknown fields, so the top-level keys are
+    // checked against the lexicon here (400 InvalidEnvelope on an unknown one).
+    let msg: DeliverMessage = super::strict_input::decode_ds_input(
+        &body,
+        "DeliverMessage",
+        super::strict_input::DELIVER_MESSAGE_INPUT_FIELDS,
+    )?;
 
     let header = validate_envelope_header(&msg.header)?;
     let locator = validate_entry_locator(&msg.entry_locator)?;
@@ -73,8 +67,8 @@ pub async fn deliver_message(
             header,
             msg.recipient_did.as_str().to_string(),
             locator,
-            msg.entry_bytes.to_vec(),
-            msg.signed_request_bytes.to_vec(),
+            msg.entry_bytes.0.to_vec(),
+            msg.signed_request_bytes.0.to_vec(),
         )
         .await?;
 
@@ -86,7 +80,8 @@ pub async fn deliver_message(
             "Accepted federated message"
         );
 
-        let value = serde_json::to_value(output).map_err(FederationError::Json)?;
+        let value = catbird_server::atproto_conv::wire_json_value(&output)
+            .map_err(FederationError::Json)?;
         Ok(Json(value))
     }
     .await;

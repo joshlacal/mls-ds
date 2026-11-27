@@ -110,7 +110,19 @@ fn fresh_rust_dtos_preserve_all_five_frozen_signing_domains_without_extra_data()
         let raw = signed_wrapper(&case.generated_request);
         let generated: Value = serde_json::from_slice(raw).unwrap();
         assert!(generated["$type"].is_string(), "{}", case.name);
-        assert!(generated["body"].get("$type").is_none(), "{}", case.name);
+        let legacy: Value = serde_json::from_slice(&case.legacy_wrapper).unwrap();
+        assert_eq!(
+            generated["body"]["$type"], legacy["body"]["$type"],
+            "{}",
+            case.name
+        );
+        let mut old_rust = generated.clone();
+        old_rust["body"].as_object_mut().unwrap().remove("$type");
+        assert_frozen_products(
+            &serde_json::to_vec(&old_rust).unwrap(),
+            &case.public_key,
+            &case.expected,
+        );
         assert!(
             generated["signature"]["$bytes"].is_string(),
             "{}",
@@ -406,7 +418,7 @@ fn generated_and_legacy_origins_share_canonical_reads_and_preserve_historical_by
                 "blue.catbird.chat.defs#conversationEntry",
             )
             .unwrap();
-            let dto: catbird_atproto::blue_catbird::chat::ConversationEntry =
+            let dto: catbird_server::blue_catbird::chat::ConversationEntry =
                 serde_json::from_slice(canonical.bytes()).unwrap();
             let from_dto = read_projection::encode_canonical_generated_chat_json_v1(
                 &dto,
@@ -433,7 +445,7 @@ fn generated_and_legacy_origins_share_canonical_reads_and_preserve_historical_by
                 let envelope =
                     json!({"entries":[wire], "nextAfterSeq":expected["seq"], "hasMore":false});
                 let bytes = serde_json::to_vec(&envelope).unwrap();
-                let _: catbird_atproto::blue_catbird::chat::get_entries::GetEntriesOutput =
+                let _: catbird_server::blue_catbird::chat::get_entries::Output =
                     serde_json::from_slice(&bytes).unwrap();
                 fs::write(
                     directory.join(format!("{}-{origin}.get-entries.json", case.name)),

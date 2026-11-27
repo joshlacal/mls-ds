@@ -6,9 +6,8 @@
 // assemble planner inputs, executor artifacts, or replay bytes.
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use catbird_atproto::generated::blue_catbird::chat as chat_dto;
+use catbird_server::blue_catbird::chat as chat_dto;
 use chrono::{DateTime, SecondsFormat, Utc};
-use jacquard_common::DefaultStr;
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, Postgres, Transaction};
@@ -122,8 +121,13 @@ impl SubmitTransitionCanonicalResponse {
         if bytes.is_empty() {
             return Err(SubmitTransitionFacadeError::InvalidCanonicalMaterial);
         }
-        let _: chat_dto::submit_transition::SubmitTransitionOutput<DefaultStr> =
-            match serde_json::from_slice(&bytes) {
+        let _: chat_dto::submit_transition::Output =
+            match serde_json::from_slice(&bytes).and_then(|value| {
+                catbird_server::chat_protocol::retained_json::decode_output(
+                    "blue.catbird.chat.submitTransition",
+                    value,
+                )
+            }) {
                 Ok(o) => o,
                 Err(_) => {
                     return Err(SubmitTransitionFacadeError::InvalidCanonicalMaterial);
@@ -709,7 +713,7 @@ async fn execute_first_submit_transition<T: PublicTransport>(
         let conversation_id = Uuid::from_bytes(*parsed.prior.conversation_id());
         if verified.output.receipt.conversation_id != conversation_id.to_string()
             || !crate::identity::dids_equivalent(
-                &verified.output.receipt.sequencer_did,
+                verified.output.receipt.sequencer_did.as_str(),
                 &sequencer_ds,
             )
             || verified.output.receipt.sequencer_term != sequencer_term
@@ -723,9 +727,10 @@ async fn execute_first_submit_transition<T: PublicTransport>(
 
         if verified.output.coordinates.epoch as u64 != succ.epoch()
             || verified.output.coordinates.state_version as u64 != succ.state_version()
-            || verified.output.coordinates.group_id.as_ref() != succ.group_id()
-            || verified.output.coordinates.group_context_hash.as_ref() != succ.group_context_hash()
-            || verified.output.coordinates.confirmation_tag.as_ref() != succ.confirmation_tag()
+            || verified.output.coordinates.group_id.0.as_slice() != succ.group_id()
+            || verified.output.coordinates.group_context_hash.0.as_slice()
+                != succ.group_context_hash()
+            || verified.output.coordinates.confirmation_tag.0.as_slice() != succ.confirmation_tag()
         {
             return Err(SubmitTransitionFacadeError::InvalidCanonicalMaterial);
         }
@@ -1165,25 +1170,26 @@ pub(in crate::chat_protocol::repository) fn canonical_response_from_plan(
         "entry": entry,
         "welcomes": welcomes,
     });
-    // Jacquard's generated DTO borrows strings from the deserializer input.
-    // `serde_json::from_value` cannot provide that backing storage and fails on
-    // canonical byte objects with "expected a borrowed string". Serialize the
-    // canonical value first, then deserialize from the retained byte buffer.
-    let value_bytes = serde_json::to_vec(&value).map_err(|e| {
-        tracing::error!(error = %e, value = %value, "canonical_response_from_plan: value to_vec failed");
+    let output: chat_dto::submit_transition::Output = catbird_server::chat_protocol::retained_json::decode_output("blue.catbird.chat.submitTransition", value).map_err(|e| {
+        tracing::error!(error = %e, "canonical_response_from_plan: generated output decoding failed");
         SubmitTransitionFacadeError::InvalidCanonicalMaterial
     })?;
-    let output: chat_dto::submit_transition::SubmitTransitionOutput<DefaultStr> =
-        serde_json::from_slice(&value_bytes).map_err(|e| {
-            tracing::error!(error = %e, value = %value, "canonical_response_from_plan: value from_slice failed");
-            SubmitTransitionFacadeError::InvalidCanonicalMaterial
-        })?;
-    let bytes = serde_json::to_vec(&output).map_err(|e| {
+    let bytes = catbird_server::chat_protocol::retained_json::encode_output(
+        "blue.catbird.chat.submitTransition",
+        &output,
+    )
+    .map_err(|e| {
         tracing::error!(error = %e, "canonical_response_from_plan: to_vec failed");
         SubmitTransitionFacadeError::InvalidCanonicalMaterial
     })?;
-    let round_trip: chat_dto::submit_transition::SubmitTransitionOutput<DefaultStr> =
-        serde_json::from_slice(&bytes).map_err(|e| {
+    let round_trip: chat_dto::submit_transition::Output = serde_json::from_slice(&bytes)
+        .and_then(|value| {
+            catbird_server::chat_protocol::retained_json::decode_output(
+                "blue.catbird.chat.submitTransition",
+                value,
+            )
+        })
+        .map_err(|e| {
             tracing::error!(error = %e, "canonical_response_from_plan: from_slice failed");
             SubmitTransitionFacadeError::InvalidCanonicalMaterial
         })?;
@@ -1793,13 +1799,17 @@ fn canonical_response_from_replay_rows(
             .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?,
         "welcomes": welcomes,
     });
-    let value_bytes = serde_json::to_vec(&value)
+    let output: chat_dto::submit_transition::Output =
+        catbird_server::chat_protocol::retained_json::decode_output(
+            "blue.catbird.chat.submitTransition",
+            value,
+        )
         .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
-    let output: chat_dto::submit_transition::SubmitTransitionOutput<DefaultStr> =
-        serde_json::from_slice(&value_bytes)
-            .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
-    let bytes = serde_json::to_vec(&output)
-        .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
+    let bytes = catbird_server::chat_protocol::retained_json::encode_output(
+        "blue.catbird.chat.submitTransition",
+        &output,
+    )
+    .map_err(|_| SubmitTransitionFacadeError::InvalidCanonicalMaterial)?;
     SubmitTransitionCanonicalResponse::new(bytes)
 }
 

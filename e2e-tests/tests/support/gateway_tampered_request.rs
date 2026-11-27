@@ -235,14 +235,7 @@ impl GatewaySender<'_> {
                 sequencer_receipt_authority_key: sequencer_receipt_key,
                 text: "Unverifiable introduction the recipient must never surface".into(),
                 invitation: None,
-                metadata: GroupMetadataV1 {
-                    version: 1,
-                    title: String::new(),
-                    description: String::new(),
-                    avatar_blob_locator: None,
-                    avatar_content_type: None,
-                    space_avatar: None,
-                },
+                metadata: GroupMetadataV1::new("", ""),
             })?;
         tamper_introduction_ciphertext(&mut journal.bootstrap)?;
         let bootstrap = &journal.bootstrap;

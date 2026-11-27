@@ -68,7 +68,7 @@ async fn deletion_cut(
                 return Err(Failure::NotEntitled);
             }
             let proof: crate::labyrinth::auth::WriteBodyWire =
-                serde_json::from_slice(&wire.write_body).map_err(|_| Failure::NotEntitled)?;
+                serde_json::from_slice(&wire.write_body.0).map_err(|_| Failure::NotEntitled)?;
             if proof.endpoint_nsid != "blue.catbird.labyrinth.deleteAccountData"
                 || Uuid::parse_str(&proof.actor_device_id).map_err(|_| Failure::NotEntitled)?
                     == device

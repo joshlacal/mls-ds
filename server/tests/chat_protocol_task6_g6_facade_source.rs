@@ -202,7 +202,7 @@ fn g6_replay_proof_is_sealed_to_canonical_device_output() {
         "expected_status",
         "post_state_digest",
         "validates_seal",
-        "RevokeDeviceOutput::<DefaultStr>",
+        "RevokeDeviceOutput",
         "DeviceView",
         "G6_REPLAY_POST_STATE_DOMAIN",
     ] {

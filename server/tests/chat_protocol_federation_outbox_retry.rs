@@ -23,10 +23,10 @@ mod common;
 use std::sync::Arc;
 
 use base64::Engine as _;
-use catbird_atproto::generated::blue_catbird::chat::ConversationCoordinates;
 use catbird_server::auth::{
     cache_test_did_document, AuthMiddleware, DidDocument, VerificationMethod,
 };
+use catbird_server::blue_catbird::chat::ConversationCoordinates;
 use catbird_server::chat_protocol::test_support::repository::{
     enqueue_clean_federation_message_jobs, enqueue_federated_welcome_job, AppendEntry,
 };
@@ -1234,48 +1234,36 @@ async fn test_outbound_queue_receipt_db_persistence_failure_retries_and_never_ma
     };
     seed_genesis_conversation_for_test(&pool, conversation_id, entry_id, &source_locator).await;
 
-    let msg = catbird_atproto::generated::blue_catbird::mlsDS::deliver_message::DeliverMessage::<
-        jacquard_common::DefaultStr,
-    > {
-        header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
-            protocol_version: jacquard_common::deps::smol_str::SmolStr::from("1"),
-            received_at: catbird_server::sqlx_jacquard::chrono_to_canonical_datetime(
+    let msg = catbird_server::blue_catbird::mls_ds::deliver_message::Input {
+        header: catbird_server::blue_catbird::mls_ds::EnvelopeHeaderV1 {
+            protocol_version: catbird_server::blue_catbird::mls_ds::ProtocolVersion::Value1,
+            received_at: catbird_server::atproto_conv::chrono_to_canonical_datetime(
                 chrono::Utc::now(),
             ),
-            delivery_id: jacquard_common::deps::smol_str::SmolStr::from(item_id.clone()),
-            conversation_id: jacquard_common::deps::smol_str::SmolStr::from(convo_id.clone()),
-            sender_ds_did: jacquard_common::types::string::Did::new_owned(service_did_base())
-                .unwrap(),
-            receiver_ds_did: jacquard_common::types::string::Did::new_owned(peer_did.clone())
-                .unwrap(),
-            sequencer_did: jacquard_common::types::string::Did::new_owned(service_did_base())
-                .unwrap(),
+            delivery_id: String::from(item_id.clone()),
+            conversation_id: String::from(convo_id.clone()),
+            sender_ds_did: petrel_core::Did::parse(service_did_base()).unwrap(),
+            receiver_ds_did: petrel_core::Did::parse(peer_did.clone()).unwrap(),
+            sequencer_did: petrel_core::Did::parse(service_did_base()).unwrap(),
             sequencer_term: 1,
-            payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[42u8; 32]),
+            payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[42u8; 32])),
             extra_data: None,
         },
-        recipient_did: jacquard_common::types::string::Did::new_owned(
-            "did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string(),
-        )
-        .unwrap(),
-        entry_locator: catbird_atproto::generated::blue_catbird::mlsDS::EntryLocatorV1 {
-            entry_id: jacquard_common::deps::smol_str::SmolStr::from(
-                source_locator.entry_id.to_string(),
-            ),
+        recipient_did: petrel_core::Did::parse("did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string())
+            .unwrap(),
+        entry_locator: catbird_server::blue_catbird::mls_ds::EntryLocatorV1 {
+            entry_id: String::from(source_locator.entry_id.to_string()),
             seq: source_locator.seq as i64,
-            accepted_payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            accepted_payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(
                 &source_locator.accepted_payload_sha256,
-            ),
-            outer_entry_fingerprint: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            )),
+            outer_entry_fingerprint: petrel_core::Bytes(<[u8]>::to_vec(
                 &source_locator.outer_entry_fingerprint,
-            ),
+            )),
             extra_data: None,
         },
-        entry_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(b"sample-entry-bytes"),
-        signed_request_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(
-            b"sample-signed-request-bytes",
-        ),
-        extra_data: None,
+        entry_bytes: petrel_core::Bytes(<[u8]>::to_vec(b"sample-entry-bytes")),
+        signed_request_bytes: petrel_core::Bytes(<[u8]>::to_vec(b"sample-signed-request-bytes")),
     };
     let payload = serde_json::to_vec(&msg).unwrap();
     let expected_envelope_digest =
@@ -1474,48 +1462,36 @@ async fn test_outbound_queue_valid_signed_receipt_marks_delivered_and_stores_res
     };
     seed_genesis_conversation_for_test(&pool, conversation_id, entry_id, &source_locator).await;
 
-    let msg = catbird_atproto::generated::blue_catbird::mlsDS::deliver_message::DeliverMessage::<
-        jacquard_common::DefaultStr,
-    > {
-        header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
-            protocol_version: jacquard_common::deps::smol_str::SmolStr::from("1"),
-            received_at: catbird_server::sqlx_jacquard::chrono_to_canonical_datetime(
+    let msg = catbird_server::blue_catbird::mls_ds::deliver_message::Input {
+        header: catbird_server::blue_catbird::mls_ds::EnvelopeHeaderV1 {
+            protocol_version: catbird_server::blue_catbird::mls_ds::ProtocolVersion::Value1,
+            received_at: catbird_server::atproto_conv::chrono_to_canonical_datetime(
                 chrono::Utc::now(),
             ),
-            delivery_id: jacquard_common::deps::smol_str::SmolStr::from(item_id.clone()),
-            conversation_id: jacquard_common::deps::smol_str::SmolStr::from(convo_id.clone()),
-            sender_ds_did: jacquard_common::types::string::Did::new_owned(service_did_base())
-                .unwrap(),
-            receiver_ds_did: jacquard_common::types::string::Did::new_owned(peer_did.clone())
-                .unwrap(),
-            sequencer_did: jacquard_common::types::string::Did::new_owned(service_did_base())
-                .unwrap(),
+            delivery_id: String::from(item_id.clone()),
+            conversation_id: String::from(convo_id.clone()),
+            sender_ds_did: petrel_core::Did::parse(service_did_base()).unwrap(),
+            receiver_ds_did: petrel_core::Did::parse(peer_did.clone()).unwrap(),
+            sequencer_did: petrel_core::Did::parse(service_did_base()).unwrap(),
             sequencer_term: 1,
-            payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[42u8; 32]),
+            payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[42u8; 32])),
             extra_data: None,
         },
-        recipient_did: jacquard_common::types::string::Did::new_owned(
-            "did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string(),
-        )
-        .unwrap(),
-        entry_locator: catbird_atproto::generated::blue_catbird::mlsDS::EntryLocatorV1 {
-            entry_id: jacquard_common::deps::smol_str::SmolStr::from(
-                source_locator.entry_id.to_string(),
-            ),
+        recipient_did: petrel_core::Did::parse("did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string())
+            .unwrap(),
+        entry_locator: catbird_server::blue_catbird::mls_ds::EntryLocatorV1 {
+            entry_id: String::from(source_locator.entry_id.to_string()),
             seq: source_locator.seq as i64,
-            accepted_payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            accepted_payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(
                 &source_locator.accepted_payload_sha256,
-            ),
-            outer_entry_fingerprint: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            )),
+            outer_entry_fingerprint: petrel_core::Bytes(<[u8]>::to_vec(
                 &source_locator.outer_entry_fingerprint,
-            ),
+            )),
             extra_data: None,
         },
-        entry_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(b"sample-entry-bytes"),
-        signed_request_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(
-            b"sample-signed-request-bytes",
-        ),
-        extra_data: None,
+        entry_bytes: petrel_core::Bytes(<[u8]>::to_vec(b"sample-entry-bytes")),
+        signed_request_bytes: petrel_core::Bytes(<[u8]>::to_vec(b"sample-signed-request-bytes")),
     };
     let payload = serde_json::to_vec(&msg).unwrap();
     let expected_envelope_digest =
@@ -2042,16 +2018,14 @@ async fn test_recovery_fulfillment_remote_welcome_creates_typed_outbox_job_and_r
     };
 
     let coordinates = ConversationCoordinates {
-        conversation_id: jacquard_common::deps::smol_str::SmolStr::from(
-            convo_id.hyphenated().to_string(),
-        ),
+        conversation_id: String::from(convo_id.hyphenated().to_string()),
         generation: 1,
         state_version: 1,
         epoch: 1,
-        group_id: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x44u8; 32]),
-        group_context_hash: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x55u8; 32]),
-        confirmation_tag: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x66u8; 32]),
-        lifecycle: jacquard_common::deps::smol_str::SmolStr::from("active"),
+        group_id: petrel_core::Bytes(<[u8]>::to_vec(&[0x44u8; 32])),
+        group_context_hash: petrel_core::Bytes(<[u8]>::to_vec(&[0x55u8; 32])),
+        confirmation_tag: petrel_core::Bytes(<[u8]>::to_vec(&[0x66u8; 32])),
+        lifecycle: catbird_server::blue_catbird::chat::Lifecycle::Active,
         extra_data: None,
     };
 
@@ -2189,16 +2163,14 @@ async fn test_recovery_fulfillment_absent_participant_fails_hard_and_rolls_back(
     };
 
     let coordinates = ConversationCoordinates {
-        conversation_id: jacquard_common::deps::smol_str::SmolStr::from(
-            convo_id.hyphenated().to_string(),
-        ),
+        conversation_id: String::from(convo_id.hyphenated().to_string()),
         generation: 1,
         state_version: 1,
         epoch: 1,
-        group_id: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x44u8; 32]),
-        group_context_hash: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x55u8; 32]),
-        confirmation_tag: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x66u8; 32]),
-        lifecycle: jacquard_common::deps::smol_str::SmolStr::from("active"),
+        group_id: petrel_core::Bytes(<[u8]>::to_vec(&[0x44u8; 32])),
+        group_context_hash: petrel_core::Bytes(<[u8]>::to_vec(&[0x55u8; 32])),
+        confirmation_tag: petrel_core::Bytes(<[u8]>::to_vec(&[0x66u8; 32])),
+        lifecycle: catbird_server::blue_catbird::chat::Lifecycle::Active,
         extra_data: None,
     };
 
@@ -2572,16 +2544,14 @@ async fn test_recovery_fulfillment_pending_remote_welcome_creates_typed_outbox_j
     };
 
     let coordinates = ConversationCoordinates {
-        conversation_id: jacquard_common::deps::smol_str::SmolStr::from(
-            convo_id.hyphenated().to_string(),
-        ),
+        conversation_id: String::from(convo_id.hyphenated().to_string()),
         generation: 1,
         state_version: 1,
         epoch: 1,
-        group_id: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x44u8; 32]),
-        group_context_hash: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x55u8; 32]),
-        confirmation_tag: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x66u8; 32]),
-        lifecycle: jacquard_common::deps::smol_str::SmolStr::from("active"),
+        group_id: petrel_core::Bytes(<[u8]>::to_vec(&[0x44u8; 32])),
+        group_context_hash: petrel_core::Bytes(<[u8]>::to_vec(&[0x55u8; 32])),
+        confirmation_tag: petrel_core::Bytes(<[u8]>::to_vec(&[0x66u8; 32])),
+        lifecycle: catbird_server::blue_catbird::chat::Lifecycle::Active,
         extra_data: None,
     };
 
@@ -2765,30 +2735,22 @@ async fn test_submit_commit_valid_receipt_marks_delivered_end_to_end_mock() {
     let sig = signing_key.sign(canonical.transcript_bytes());
     wrapper_val["signature"] = serde_json::json!(STANDARD.encode(sig.to_bytes()));
     let valid_signed_req = serde_json::to_vec(&wrapper_val).unwrap();
-    let msg = catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit::<
-        jacquard_common::DefaultStr,
-    > {
-        header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
-            protocol_version: jacquard_common::deps::smol_str::SmolStr::from("1"),
-            received_at: catbird_server::sqlx_jacquard::chrono_to_canonical_datetime(
+    let msg = catbird_server::blue_catbird::mls_ds::submit_commit::Input {
+        header: catbird_server::blue_catbird::mls_ds::EnvelopeHeaderV1 {
+            protocol_version: catbird_server::blue_catbird::mls_ds::ProtocolVersion::Value1,
+            received_at: catbird_server::atproto_conv::chrono_to_canonical_datetime(
                 chrono::Utc::now(),
             ),
-            delivery_id: jacquard_common::deps::smol_str::SmolStr::from(item_id.clone()),
-            conversation_id: jacquard_common::deps::smol_str::SmolStr::from(convo_id.clone()),
-            sender_ds_did: jacquard_common::types::string::Did::new_owned(service_did_base())
-                .unwrap(),
-            receiver_ds_did: jacquard_common::types::string::Did::new_owned(peer_did.clone())
-                .unwrap(),
-            sequencer_did: jacquard_common::types::string::Did::new_owned(peer_did.clone())
-                .unwrap(),
+            delivery_id: String::from(item_id.clone()),
+            conversation_id: String::from(convo_id.clone()),
+            sender_ds_did: petrel_core::Did::parse(service_did_base()).unwrap(),
+            receiver_ds_did: petrel_core::Did::parse(peer_did.clone()).unwrap(),
+            sequencer_did: petrel_core::Did::parse(peer_did.clone()).unwrap(),
             sequencer_term: 1,
-            payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[42u8; 32]),
+            payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[42u8; 32])),
             extra_data: None,
         },
-        signed_request_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(
-            &valid_signed_req,
-        ),
-        extra_data: None,
+        signed_request_bytes: petrel_core::Bytes(<[u8]>::to_vec(&valid_signed_req)),
     };
     let payload = serde_json::to_vec(&msg).unwrap();
     let expected_envelope_digest =
@@ -2916,7 +2878,7 @@ async fn test_submit_commit_valid_receipt_marks_delivered_end_to_end_mock() {
         "welcomes": []
     }}"#
     );
-    let st_dto: catbird_atproto::generated::blue_catbird::chat::submit_transition::SubmitTransitionOutput =
+    let st_dto: catbird_server::blue_catbird::chat::submit_transition::Output =
         serde_json::from_str(&st_expected_json).unwrap();
     let canonical_result_bytes = serde_json::to_vec(&st_dto).unwrap();
     let expected_result_sha256: [u8; 32] = Sha256::digest(&canonical_result_bytes).into();
@@ -3246,48 +3208,36 @@ async fn test_recomputed_envelope_digest_mismatch_marks_dead_immediately() {
         outer_entry_fingerprint: [2u8; 32],
     };
 
-    let msg = catbird_atproto::generated::blue_catbird::mlsDS::deliver_message::DeliverMessage::<
-        jacquard_common::DefaultStr,
-    > {
-        header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
-            protocol_version: jacquard_common::deps::smol_str::SmolStr::from("1"),
-            received_at: catbird_server::sqlx_jacquard::chrono_to_canonical_datetime(
+    let msg = catbird_server::blue_catbird::mls_ds::deliver_message::Input {
+        header: catbird_server::blue_catbird::mls_ds::EnvelopeHeaderV1 {
+            protocol_version: catbird_server::blue_catbird::mls_ds::ProtocolVersion::Value1,
+            received_at: catbird_server::atproto_conv::chrono_to_canonical_datetime(
                 chrono::Utc::now(),
             ),
-            delivery_id: jacquard_common::deps::smol_str::SmolStr::from(item_id.clone()),
-            conversation_id: jacquard_common::deps::smol_str::SmolStr::from(convo_id.clone()),
-            sender_ds_did: jacquard_common::types::string::Did::new_owned(service_did_base())
-                .unwrap(),
-            receiver_ds_did: jacquard_common::types::string::Did::new_owned(peer_did.clone())
-                .unwrap(),
-            sequencer_did: jacquard_common::types::string::Did::new_owned(service_did_base())
-                .unwrap(),
+            delivery_id: String::from(item_id.clone()),
+            conversation_id: String::from(convo_id.clone()),
+            sender_ds_did: petrel_core::Did::parse(service_did_base()).unwrap(),
+            receiver_ds_did: petrel_core::Did::parse(peer_did.clone()).unwrap(),
+            sequencer_did: petrel_core::Did::parse(service_did_base()).unwrap(),
             sequencer_term: 1,
-            payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[42u8; 32]),
+            payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[42u8; 32])),
             extra_data: None,
         },
-        recipient_did: jacquard_common::types::string::Did::new_owned(
-            "did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string(),
-        )
-        .unwrap(),
-        entry_locator: catbird_atproto::generated::blue_catbird::mlsDS::EntryLocatorV1 {
-            entry_id: jacquard_common::deps::smol_str::SmolStr::from(
-                source_locator.entry_id.to_string(),
-            ),
+        recipient_did: petrel_core::Did::parse("did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string())
+            .unwrap(),
+        entry_locator: catbird_server::blue_catbird::mls_ds::EntryLocatorV1 {
+            entry_id: String::from(source_locator.entry_id.to_string()),
             seq: source_locator.seq as i64,
-            accepted_payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            accepted_payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(
                 &source_locator.accepted_payload_sha256,
-            ),
-            outer_entry_fingerprint: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            )),
+            outer_entry_fingerprint: petrel_core::Bytes(<[u8]>::to_vec(
                 &source_locator.outer_entry_fingerprint,
-            ),
+            )),
             extra_data: None,
         },
-        entry_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(b"sample-entry-bytes"),
-        signed_request_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(
-            b"sample-signed-request-bytes",
-        ),
-        extra_data: None,
+        entry_bytes: petrel_core::Bytes(<[u8]>::to_vec(b"sample-entry-bytes")),
+        signed_request_bytes: petrel_core::Bytes(<[u8]>::to_vec(b"sample-signed-request-bytes")),
     };
     let payload = serde_json::to_vec(&msg).unwrap();
 
@@ -3453,8 +3403,7 @@ async fn test_store_federation_receipt_db_conflict_exact_compares_digest_and_byt
 
     // 4. Conflicting envelope digest in receipt must fail with Protocol error
     let mut conflicting_receipt = receipt.clone();
-    conflicting_receipt.envelope_sha256 =
-        jacquard_common::deps::bytes::Bytes::copy_from_slice(&[0x99u8; 32]);
+    conflicting_receipt.envelope_sha256 = petrel_core::Bytes(<[u8]>::to_vec(&[0x99u8; 32]));
     let err_envelope = catbird_server::federation::queue::store_federation_receipt(
         &pool,
         &conflicting_receipt,
@@ -3604,66 +3553,55 @@ async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_deliver_we
         outer_entry_fingerprint: [2u8; 32],
     };
 
-    let msg = catbird_atproto::generated::blue_catbird::mlsDS::deliver_welcome::DeliverWelcome::<
-        jacquard_common::DefaultStr,
-    > {
-        header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
-            protocol_version: "1".into(),
-            received_at: catbird_server::sqlx_jacquard::chrono_to_canonical_datetime(
+    let msg = catbird_server::blue_catbird::mls_ds::deliver_welcome::Input {
+        header: catbird_server::blue_catbird::mls_ds::EnvelopeHeaderV1 {
+            protocol_version: catbird_server::blue_catbird::mls_ds::ProtocolVersion::Value1,
+            received_at: catbird_server::atproto_conv::chrono_to_canonical_datetime(
                 chrono::Utc::now(),
             ),
             delivery_id: delivery_id.to_string().into(),
             conversation_id: convo_id.clone().into(),
-            sender_ds_did: service_did_base().into(),
-            receiver_ds_did: peer_did.clone().into(),
-            sequencer_did: service_did_base().into(),
+            sender_ds_did: service_did_base().parse().unwrap(),
+            receiver_ds_did: peer_did.parse().unwrap(),
+            sequencer_did: service_did_base().parse().unwrap(),
             sequencer_term: 1,
-            payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[42u8; 32]),
+            payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[42u8; 32])),
             extra_data: None,
         },
-        recipient_did: jacquard_common::types::string::Did::new_owned(
-            "did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string(),
-        )
-        .unwrap(),
+        recipient_did: petrel_core::Did::parse("did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string())
+            .unwrap(),
         recipient_device_id: Uuid::new_v4().to_string().into(),
         recovery_request_id: Uuid::new_v4().to_string().into(),
-        coordinates: catbird_atproto::generated::blue_catbird::chat::ConversationCoordinates {
+        coordinates: catbird_server::blue_catbird::chat::ConversationCoordinates {
             conversation_id: convo_id.clone().into(),
             epoch: 1,
             generation: 0,
             state_version: 1,
-            lifecycle: "active".into(),
-            group_id: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[1u8; 32]),
-            group_context_hash: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[2u8; 32]),
-            confirmation_tag: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[3u8; 32]),
+            lifecycle: catbird_server::blue_catbird::chat::Lifecycle::Active,
+            group_id: petrel_core::Bytes(<[u8]>::to_vec(&[1u8; 32])),
+            group_context_hash: petrel_core::Bytes(<[u8]>::to_vec(&[2u8; 32])),
+            confirmation_tag: petrel_core::Bytes(<[u8]>::to_vec(&[3u8; 32])),
             extra_data: None,
         },
         welcome_id: Uuid::new_v4().to_string().into(),
-        welcome_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(b"welcome"),
-        welcome_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&Sha256::digest(
-            b"welcome",
-        )),
-        key_package_ref: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[11u8; 32]),
-        tree_summary_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[12u8; 32]),
-        public_snapshot_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[13u8; 32]),
-        entry_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(b"sample-entry-bytes"),
-        signed_request_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(
-            b"sample-signed-request-bytes",
-        ),
-        entry_locator: catbird_atproto::generated::blue_catbird::mlsDS::EntryLocatorV1 {
-            entry_id: jacquard_common::deps::smol_str::SmolStr::from(
-                source_locator.entry_id.to_string(),
-            ),
+        welcome_bytes: petrel_core::Bytes(<[u8]>::to_vec(b"welcome")),
+        welcome_sha256: petrel_core::Bytes(<[u8]>::to_vec(&Sha256::digest(b"welcome"))),
+        key_package_ref: petrel_core::Bytes(<[u8]>::to_vec(&[11u8; 32])),
+        tree_summary_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[12u8; 32])),
+        public_snapshot_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[13u8; 32])),
+        entry_bytes: petrel_core::Bytes(<[u8]>::to_vec(b"sample-entry-bytes")),
+        signed_request_bytes: petrel_core::Bytes(<[u8]>::to_vec(b"sample-signed-request-bytes")),
+        entry_locator: catbird_server::blue_catbird::mls_ds::EntryLocatorV1 {
+            entry_id: String::from(source_locator.entry_id.to_string()),
             seq: source_locator.seq as i64,
-            accepted_payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            accepted_payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(
                 &source_locator.accepted_payload_sha256,
-            ),
-            outer_entry_fingerprint: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            )),
+            outer_entry_fingerprint: petrel_core::Bytes(<[u8]>::to_vec(
                 &source_locator.outer_entry_fingerprint,
-            ),
+            )),
             extra_data: None,
         },
-        extra_data: None,
     };
     let payload = serde_json::to_vec(&msg).unwrap();
     let envelope_digest =
@@ -3729,45 +3667,36 @@ async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_deliver_me
         outer_entry_fingerprint: [2u8; 32],
     };
 
-    let msg = catbird_atproto::generated::blue_catbird::mlsDS::deliver_message::DeliverMessage::<
-        jacquard_common::DefaultStr,
-    > {
-        header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
-            protocol_version: "1".into(),
-            received_at: catbird_server::sqlx_jacquard::chrono_to_canonical_datetime(
+    let msg = catbird_server::blue_catbird::mls_ds::deliver_message::Input {
+        header: catbird_server::blue_catbird::mls_ds::EnvelopeHeaderV1 {
+            protocol_version: catbird_server::blue_catbird::mls_ds::ProtocolVersion::Value1,
+            received_at: catbird_server::atproto_conv::chrono_to_canonical_datetime(
                 chrono::Utc::now(),
             ),
             delivery_id: delivery_id.to_string().into(),
             conversation_id: convo_id.clone().into(),
-            sender_ds_did: service_did_base().into(),
-            receiver_ds_did: peer_did.clone().into(),
-            sequencer_did: service_did_base().into(),
+            sender_ds_did: service_did_base().parse().unwrap(),
+            receiver_ds_did: peer_did.parse().unwrap(),
+            sequencer_did: service_did_base().parse().unwrap(),
             sequencer_term: 1,
-            payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[42u8; 32]),
+            payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[42u8; 32])),
             extra_data: None,
         },
-        recipient_did: jacquard_common::types::string::Did::new_owned(
-            "did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string(),
-        )
-        .unwrap(),
-        entry_locator: catbird_atproto::generated::blue_catbird::mlsDS::EntryLocatorV1 {
-            entry_id: jacquard_common::deps::smol_str::SmolStr::from(
-                source_locator.entry_id.to_string(),
-            ),
+        recipient_did: petrel_core::Did::parse("did:plc:ragtjsm2j2vknwk6zpkrhgah".to_string())
+            .unwrap(),
+        entry_locator: catbird_server::blue_catbird::mls_ds::EntryLocatorV1 {
+            entry_id: String::from(source_locator.entry_id.to_string()),
             seq: source_locator.seq as i64,
-            accepted_payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            accepted_payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(
                 &source_locator.accepted_payload_sha256,
-            ),
-            outer_entry_fingerprint: jacquard_common::deps::bytes::Bytes::copy_from_slice(
+            )),
+            outer_entry_fingerprint: petrel_core::Bytes(<[u8]>::to_vec(
                 &source_locator.outer_entry_fingerprint,
-            ),
+            )),
             extra_data: None,
         },
-        entry_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(b"sample-entry-bytes"),
-        signed_request_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(
-            b"sample-signed-request-bytes",
-        ),
-        extra_data: None,
+        entry_bytes: petrel_core::Bytes(<[u8]>::to_vec(b"sample-entry-bytes")),
+        signed_request_bytes: petrel_core::Bytes(<[u8]>::to_vec(b"sample-signed-request-bytes")),
     };
     let payload = serde_json::to_vec(&msg).unwrap();
     let envelope_digest =
@@ -3939,27 +3868,22 @@ async fn test_outbound_queue_valid_signed_receipt_wrong_result_sha256_submit_com
     wrapper_val["signature"] = serde_json::json!(STANDARD.encode(sig.to_bytes()));
     let valid_signed_req = serde_json::to_vec(&wrapper_val).unwrap();
 
-    let msg = catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit::<
-        jacquard_common::DefaultStr,
-    > {
-        header: catbird_atproto::generated::blue_catbird::mlsDS::EnvelopeHeaderV1 {
-            protocol_version: "1".into(),
-            received_at: catbird_server::sqlx_jacquard::chrono_to_canonical_datetime(
+    let msg = catbird_server::blue_catbird::mls_ds::submit_commit::Input {
+        header: catbird_server::blue_catbird::mls_ds::EnvelopeHeaderV1 {
+            protocol_version: catbird_server::blue_catbird::mls_ds::ProtocolVersion::Value1,
+            received_at: catbird_server::atproto_conv::chrono_to_canonical_datetime(
                 chrono::Utc::now(),
             ),
             delivery_id: item_id.clone().into(),
             conversation_id: convo_id.clone().into(),
-            sender_ds_did: service_did_base().into(),
-            receiver_ds_did: peer_did.clone().into(),
-            sequencer_did: peer_did.clone().into(),
+            sender_ds_did: service_did_base().parse().unwrap(),
+            receiver_ds_did: peer_did.parse().unwrap(),
+            sequencer_did: peer_did.parse().unwrap(),
             sequencer_term: 1,
-            payload_sha256: jacquard_common::deps::bytes::Bytes::copy_from_slice(&[42u8; 32]),
+            payload_sha256: petrel_core::Bytes(<[u8]>::to_vec(&[42u8; 32])),
             extra_data: None,
         },
-        signed_request_bytes: jacquard_common::deps::bytes::Bytes::copy_from_slice(
-            &valid_signed_req,
-        ),
-        extra_data: None,
+        signed_request_bytes: petrel_core::Bytes(<[u8]>::to_vec(&valid_signed_req)),
     };
     let payload = serde_json::to_vec(&msg).unwrap();
     let envelope_digest =

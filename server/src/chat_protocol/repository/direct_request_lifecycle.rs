@@ -146,7 +146,7 @@ pub(crate) async fn load_request_projection(
 ) -> Result<
     Option<(
         serde_json::Value,
-        catbird_atproto::generated::blue_catbird::chat::DirectRequestState,
+        catbird_server::blue_catbird::chat::DirectRequestState,
     )>,
     super::inventory::InventoryRepositoryError,
 > {
@@ -283,7 +283,13 @@ pub(crate) async fn pending_request_welcomes(
         let provenance: Value = serde_json::from_slice(&row.try_get::<Vec<u8>, _>("provenance")?)
             .map_err(|_| E::InvalidMaterialization)?;
         let view = json!({"$type":"blue.catbird.chat.defs#directRequestWelcomeView","welcomeId":request_id,"conversationId":row.try_get::<Uuid,_>("conversation_id")?,"transitionSeq":entry["seq"],"coordinates":publication["body"]["next"],"status":"pending","opaqueWelcome":STANDARD.encode(row.try_get::<Vec<u8>,_>("full_welcome")?),"sha256":STANDARD.encode(row.try_get::<Vec<u8>,_>("full_welcome_sha256")?),"recipientDid":user_did,"recipientDeviceId":device_id,"provenance":provenance});
-        let typed:catbird_atproto::generated::blue_catbird::chat::get_pending_welcomes::GetPendingWelcomesOutputItemsItem=crate::chat_protocol::transcript::decode_direct_request_generated_view(&serde_json::to_vec(&view).map_err(|_|E::InvalidMaterialization)?, "directRequestWelcomeView", true).map_err(|_|E::InvalidMaterialization)?;
+        let typed: catbird_server::blue_catbird::chat::get_pending_welcomes::OutputItems =
+            crate::chat_protocol::transcript::decode_direct_request_generated_view(
+                &serde_json::to_vec(&view).map_err(|_| E::InvalidMaterialization)?,
+                "directRequestWelcomeView",
+                true,
+            )
+            .map_err(|_| E::InvalidMaterialization)?;
         items.push((
             request_id,
             serde_json::to_vec(
@@ -321,7 +327,13 @@ pub(crate) async fn pending_request_welcomes(
         let provenance: Value = serde_json::from_slice(&row.try_get::<Vec<u8>, _>("provenance")?)
             .map_err(|_| E::InvalidMaterialization)?;
         let view = json!({"$type":"blue.catbird.chat.defs#directRequestWelcomeView","welcomeId":request_id,"conversationId":row.try_get::<Uuid,_>("conversation_id")?,"transitionSeq":entry["seq"],"coordinates":publication["body"]["next"],"status":"pending","opaqueWelcome":STANDARD.encode(row.try_get::<Vec<u8>,_>("full_welcome")?),"sha256":STANDARD.encode(row.try_get::<Vec<u8>,_>("full_welcome_sha256")?),"recipientDid":user_did,"recipientDeviceId":device_id,"provenance":provenance});
-        let typed:catbird_atproto::generated::blue_catbird::chat::get_pending_welcomes::GetPendingWelcomesOutputItemsItem=crate::chat_protocol::transcript::decode_direct_request_generated_view(&serde_json::to_vec(&view).map_err(|_|E::InvalidMaterialization)?, "directRequestWelcomeView", true).map_err(|_|E::InvalidMaterialization)?;
+        let typed: catbird_server::blue_catbird::chat::get_pending_welcomes::OutputItems =
+            crate::chat_protocol::transcript::decode_direct_request_generated_view(
+                &serde_json::to_vec(&view).map_err(|_| E::InvalidMaterialization)?,
+                "directRequestWelcomeView",
+                true,
+            )
+            .map_err(|_| E::InvalidMaterialization)?;
         items.push((
             request_id,
             serde_json::to_vec(

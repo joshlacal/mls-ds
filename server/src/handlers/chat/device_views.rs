@@ -10,12 +10,11 @@
 //! mismatch is an internal invariant violation, never a silent default (seal-2b
 //! ruling (c)).
 
-use jacquard_common::deps::bytes::Bytes;
-use jacquard_common::deps::smol_str::SmolStr;
-use jacquard_common::DefaultStr;
+use petrel_core::Bytes;
 
-use catbird_atproto::generated::blue_catbird::chat as chat_dto;
+use crate::blue_catbird::chat as chat_dto;
 
+use crate::atproto_conv::chrono_to_datetime;
 use crate::chat_protocol::error::{ChatEndpoint, ChatProtocolErrorCode};
 use crate::chat_protocol::repository::device_directory::{
     DeviceDirectoryError, DeviceDirectoryView,
@@ -23,13 +22,12 @@ use crate::chat_protocol::repository::device_directory::{
 use crate::chat_protocol::repository::inventory::InventoryRepositoryError;
 use crate::chat_protocol::repository::key_packages::KeyPackageRepositoryError;
 use crate::chat_protocol::transcript::{CanonicalValueRef, ClosedObjectRef};
-use crate::sqlx_jacquard::chrono_to_datetime;
 
 use super::errors::ChatFailure;
 
 /// The canonical hyphenated lowercase UUID string for a device id.
-fn device_id_string(view: &DeviceDirectoryView) -> SmolStr {
-    SmolStr::from(view.device_id.to_string())
+fn device_id_string(view: &DeviceDirectoryView) -> String {
+    String::from(view.device_id.to_string())
 }
 
 /// Decode the pinned capability JSON into the generated `deviceCapability` DTO.
@@ -39,8 +37,8 @@ fn device_id_string(view: &DeviceDirectoryView) -> SmolStr {
 fn decode_capability(
     view: &DeviceDirectoryView,
     endpoint: ChatEndpoint,
-) -> Result<chat_dto::DeviceCapability<DefaultStr>, ChatFailure> {
-    serde_json::from_str::<chat_dto::DeviceCapability<DefaultStr>>(&view.capabilities_json)
+) -> Result<chat_dto::DeviceCapability, ChatFailure> {
+    serde_json::from_str::<chat_dto::DeviceCapability>(&view.capabilities_json)
         .map_err(|_| ChatFailure::invariant(endpoint))
 }
 
@@ -48,21 +46,19 @@ fn decode_capability(
 /// verbatim by replenish (post-publish) and getOwnDevices; enroll and rebind
 /// build a `deviceView` with the same field shaping but override the fields the
 /// mutation changes (rebind) or that no row yet carries (enroll first-execution).
-pub(super) fn device_view_from_directory(
-    view: &DeviceDirectoryView,
-) -> chat_dto::DeviceView<DefaultStr> {
+pub(super) fn device_view_from_directory(view: &DeviceDirectoryView) -> chat_dto::DeviceView {
     chat_dto::DeviceView {
         auth_generation: view.auth_generation,
         available_package_count: view.available_package_count,
         created_at: chrono_to_datetime(view.created_at),
         device_id: device_id_string(view),
-        device_name: Some(SmolStr::from(view.device_name.as_str())),
+        device_name: Some(String::from(view.device_name.as_str())),
         dormant_at: view.dormant_at.map(chrono_to_datetime),
-        key_id: SmolStr::from(view.key_id.as_str()),
+        key_id: String::from(view.key_id.as_str()),
         last_active_at: Some(chrono_to_datetime(view.last_active_at)),
         reserved_package_count: view.reserved_package_count,
-        signature_public_key: Bytes::from(view.signing_public_key.clone()),
-        status: SmolStr::from(view.wire_status()),
+        signature_public_key: Bytes(Vec::from(view.signing_public_key.clone())),
+        status: crate::atproto_conv::open_enum(view.wire_status()),
         updated_at: chrono_to_datetime(view.updated_at),
         extra_data: None,
     }
@@ -75,24 +71,22 @@ pub(super) fn addressable_device_from_directory(
     view: &DeviceDirectoryView,
     user_did: &str,
     endpoint: ChatEndpoint,
-) -> Result<chat_dto::AddressableDevice<DefaultStr>, ChatFailure> {
+) -> Result<chat_dto::AddressableDevice, ChatFailure> {
     let capability = decode_capability(view, endpoint)?;
-    let user_did = jacquard_common::types::string::Did::new_owned(user_did)
-        .map_err(|_| ChatFailure::invariant(endpoint))?;
+    let user_did =
+        petrel_core::Did::parse(user_did).map_err(|_| ChatFailure::invariant(endpoint))?;
     Ok(chat_dto::AddressableDevice {
         available_package_count: view.available_package_count,
         capability,
         device_id: device_id_string(view),
-        key_id: SmolStr::from(view.key_id.as_str()),
+        key_id: String::from(view.key_id.as_str()),
         user_did,
         extra_data: None,
     })
 }
 
 /// Wrap a `deviceView` as an `ownDeviceView` (getOwnDevices fence item).
-pub(super) fn own_device_view(
-    device: chat_dto::DeviceView<DefaultStr>,
-) -> chat_dto::OwnDeviceView<DefaultStr> {
+pub(super) fn own_device_view(device: chat_dto::DeviceView) -> chat_dto::OwnDeviceView {
     chat_dto::OwnDeviceView {
         direct_request_key_pool: None,
         device,

@@ -16,6 +16,10 @@
 
 pub mod handlers;
 pub mod revocation_fanout;
+pub(crate) mod tokens;
+mod wire;
+#[cfg(feature = "test-support")]
+pub use wire::add_inventory_entry;
 
 use std::{
     collections::HashMap,
@@ -26,21 +30,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use atproto_spaces::{
-    kem::P256SecretKey,
-    tokens::{
-        inspect_untrusted_space_token, mint_space_token, verify_space_token, SpaceKeyResolver,
-        SpaceSigningKey, SpaceTokenClaims, SpaceTokenKind, SpaceVerifyingKey,
-    },
-};
 use axum::Router;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use p256::ecdsa::{
     signature::Signer, Signature, SigningKey as P256SigningKey, VerifyingKey as P256VerifyingKey,
 };
+use p256::SecretKey as P256SecretKey;
+use petrel_crypto::{ATProtoJWTVerificationKey as SpaceVerifyingKey, ATProtoKeyCurve, PublicKey};
+use petrel_spaces::{SigningKeyPair, SpaceError, SpaceRef};
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
+use tokens::{ParsedToken, SpaceTokenClaims, SpaceTokenKind};
 
 use crate::{push_gateway::ssrf::validate_https_url_with_resolver, storage::DbPool};
 
@@ -162,15 +163,8 @@ impl SpaceHostRuntime {
         &self.config.inventory_cursor_key
     }
 
-    pub fn space_signing_key(&self) -> SpaceSigningKey {
-        SpaceSigningKey::P256 {
-            signing_key: self.config.signing_key.clone(),
-            kid: "#atproto".to_string(),
-        }
-    }
-
     pub fn authority_verifying_key(&self) -> SpaceVerifyingKey {
-        SpaceVerifyingKey::P256(*self.config.signing_key.verifying_key())
+        p256_verification_key(self.config.signing_key.verifying_key())
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -185,7 +179,7 @@ impl SpaceHostRuntime {
             guard.insert(
                 canonical,
                 (
-                    SpaceVerifyingKey::P256(*verifying_key),
+                    p256_verification_key(verifying_key),
                     endpoint_url.trim_end_matches('/').to_string(),
                 ),
             );
@@ -202,7 +196,7 @@ impl SpaceHostRuntime {
         if let Ok(mut guard) = self.test_client_keys.write() {
             guard.insert(
                 format!("{client_id_url}#{kid}"),
-                SpaceVerifyingKey::P256(*verifying_key),
+                p256_verification_key(verifying_key),
             );
         }
     }
@@ -219,14 +213,24 @@ impl SpaceHostRuntime {
         .to_string()
     }
 
-    pub fn mint_credential(
-        &self,
-        claims: &SpaceTokenClaims,
-    ) -> Result<String, atproto_spaces::SpacesError> {
-        mint_space_token(
-            SpaceTokenKind::Credential,
-            &self.space_signing_key(),
-            claims,
+    pub(crate) fn mint_credential(&self, claims: &SpaceTokenClaims) -> Result<String, SpaceError> {
+        let key = SigningKeyPair::from_p256_bytes(&self.config.signing_key.to_bytes())?;
+        petrel_spaces::mint_credential_token(
+            &key,
+            &petrel_core::Did::parse(&claims.iss)
+                .map_err(|e| SpaceError::InvalidDid(e.to_string()))?,
+            &petrel_spaces::parse_space_ref(&claims.sub)?,
+            claims.cnf_kid().ok_or(SpaceError::InvalidTokenFormat)?,
+            claims
+                .iat
+                .try_into()
+                .map_err(|_| SpaceError::InvalidTokenFormat)?,
+            claims
+                .exp
+                .try_into()
+                .map_err(|_| SpaceError::InvalidTokenFormat)?,
+            Some(&claims.jti),
+            Some("#atproto"),
         )
     }
 
@@ -320,7 +324,7 @@ impl SpaceHostRuntime {
         &self,
         did_or_ref: &str,
         force_refresh: bool,
-    ) -> Result<(SpaceVerifyingKey, String, bool), atproto_spaces::SpacesError> {
+    ) -> Result<(SpaceVerifyingKey, String, bool), SpaceError> {
         let bare_did = crate::identity::canonical_did(did_or_ref).to_string();
         if bare_did == self.config.authority_did {
             #[cfg(feature = "sim")]
@@ -390,10 +394,10 @@ impl SpaceHostRuntime {
             format!("{}/{}", plc_base.trim_end_matches('/'), bare_did)
         } else if bare_did.starts_with("did:web:") {
             crate::identity::did_web_document_url(&bare_did).ok_or_else(|| {
-                atproto_spaces::SpacesError::DidResolution(format!("invalid did:web: {bare_did}"))
+                SpaceError::DidResolutionFailed(format!("invalid did:web: {bare_did}"))
             })?
         } else {
-            return Err(atproto_spaces::SpacesError::InvalidDid(bare_did));
+            return Err(SpaceError::InvalidDid(bare_did));
         };
 
         let validated = validate_https_url_with_resolver(
@@ -402,20 +406,20 @@ impl SpaceHostRuntime {
             false,
             crate::push_gateway::ssrf::system_dns_resolve,
         )
-        .map_err(|e| atproto_spaces::SpacesError::DidResolution(e.to_string()))?;
+        .map_err(|e| SpaceError::DidResolutionFailed(e.to_string()))?;
 
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(10))
             .resolve_to_addrs(&validated.host, &validated.pinned_addrs)
             .build()
-            .map_err(|e| atproto_spaces::SpacesError::DidResolution(e.to_string()))?;
+            .map_err(|e| SpaceError::DidResolutionFailed(e.to_string()))?;
 
         let resp = crate::sim_hooks::send_reqwest(client.get(&validated.effective_url))
             .await
-            .map_err(atproto_spaces::SpacesError::DidResolution)?;
+            .map_err(SpaceError::DidResolutionFailed)?;
         if !resp.status().is_success() {
-            return Err(atproto_spaces::SpacesError::DidResolution(format!(
+            return Err(SpaceError::DidResolutionFailed(format!(
                 "DID document HTTP {}",
                 resp.status().as_u16()
             )));
@@ -423,7 +427,7 @@ impl SpaceHostRuntime {
         let doc: Value = resp
             .json()
             .await
-            .map_err(|e| atproto_spaces::SpacesError::DidResolution(e.to_string()))?;
+            .map_err(|e| SpaceError::DidResolutionFailed(e.to_string()))?;
 
         let vk = extract_atproto_verifying_key(&doc, &bare_did)?;
         let fragment = did_or_ref
@@ -470,7 +474,7 @@ impl SpaceHostRuntime {
         client_id_url: &str,
         kid: &str,
         force_refresh: bool,
-    ) -> Result<SpaceVerifyingKey, atproto_spaces::SpacesError> {
+    ) -> Result<SpaceVerifyingKey, SpaceError> {
         let cache_key = format!("{client_id_url}#{kid}");
 
         #[cfg(any(test, feature = "test-support"))]
@@ -503,29 +507,30 @@ impl SpaceHostRuntime {
             allow_loopback,
             crate::push_gateway::ssrf::system_dns_resolve,
         )
-        .map_err(|e| atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string()))?;
+        .map_err(|e| SpaceError::Unauthorized(e.to_string()))?;
 
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(10))
             .resolve_to_addrs(&validated.host, &validated.pinned_addrs)
             .build()
-            .map_err(|e| atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string()))?;
+            .map_err(|e| SpaceError::Unauthorized(e.to_string()))?;
 
         let resp = crate::sim_hooks::send_reqwest(client.get(&validated.effective_url))
             .await
-            .map_err(atproto_spaces::SpacesError::InvalidClientAttestation)?;
+            .map_err(SpaceError::Unauthorized)?;
         if !resp.status().is_success() {
-            return Err(atproto_spaces::SpacesError::InvalidClientAttestation(
-                format!("client metadata HTTP {}", resp.status().as_u16()),
-            ));
+            return Err(SpaceError::Unauthorized(format!(
+                "client metadata HTTP {}",
+                resp.status().as_u16()
+            )));
         }
         let meta: Value = resp
             .json()
             .await
-            .map_err(|e| atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string()))?;
+            .map_err(|e| SpaceError::Unauthorized(e.to_string()))?;
         if meta.get("client_id").and_then(Value::as_str) != Some(client_id_url) {
-            return Err(atproto_spaces::SpacesError::InvalidClientAttestation(
+            return Err(SpaceError::Unauthorized(
                 "client metadata client_id mismatch".into(),
             ));
         }
@@ -544,38 +549,36 @@ impl SpaceHostRuntime {
                 allow_jwks_loopback,
                 crate::push_gateway::ssrf::system_dns_resolve,
             )
-            .map_err(|e| atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string()))?;
+            .map_err(|e| SpaceError::Unauthorized(e.to_string()))?;
             let jwks_client = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(10))
                 .resolve_to_addrs(&jwks_validated.host, &jwks_validated.pinned_addrs)
                 .build()
-                .map_err(|e| {
-                    atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string())
-                })?;
+                .map_err(|e| SpaceError::Unauthorized(e.to_string()))?;
             let jwks_resp =
                 crate::sim_hooks::send_reqwest(jwks_client.get(&jwks_validated.effective_url))
                     .await
-                    .map_err(atproto_spaces::SpacesError::InvalidClientAttestation)?;
+                    .map_err(SpaceError::Unauthorized)?;
             if !jwks_resp.status().is_success() {
-                return Err(atproto_spaces::SpacesError::InvalidClientAttestation(
-                    format!("client jwks_uri HTTP {}", jwks_resp.status().as_u16()),
-                ));
+                return Err(SpaceError::Unauthorized(format!(
+                    "client jwks_uri HTTP {}",
+                    jwks_resp.status().as_u16()
+                )));
             }
-            let jwks_doc: Value = jwks_resp.json().await.map_err(|e| {
-                atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string())
-            })?;
+            let jwks_doc: Value = jwks_resp
+                .json()
+                .await
+                .map_err(|e| SpaceError::Unauthorized(e.to_string()))?;
             jwks_doc
                 .get("keys")
                 .and_then(Value::as_array)
                 .cloned()
                 .ok_or_else(|| {
-                    atproto_spaces::SpacesError::InvalidClientAttestation(
-                        "client jwks_uri missing keys array".into(),
-                    )
+                    SpaceError::Unauthorized("client jwks_uri missing keys array".into())
                 })?
         } else {
-            return Err(atproto_spaces::SpacesError::InvalidClientAttestation(
+            return Err(SpaceError::Unauthorized(
                 "client metadata missing jwks and jwks_uri".into(),
             ));
         };
@@ -587,63 +590,41 @@ impl SpaceHostRuntime {
         Ok(vk)
     }
 
-    /// `Send`-safe wrapper around `atproto_spaces::tokens::verify_space_token` with one-shot key refresh.
-    pub async fn verify_space_token_send(
+    /// Resolve the issuer key once and refresh it once on a signature mismatch.
+    pub(crate) async fn verify_space_token_send(
         &self,
         kind: SpaceTokenKind,
         jwt: &str,
-        now_sec: u64,
-    ) -> Result<SpaceTokenClaims, atproto_spaces::SpacesError> {
-        let (_alg, untrusted) = inspect_untrusted_space_token(kind, jwt, now_sec)?;
-        if kind == SpaceTokenKind::ClientAttestation {
-            let hdr_b64 = jwt.split('.').next().unwrap_or_default();
-            let hdr_bytes = URL_SAFE_NO_PAD.decode(hdr_b64).map_err(|e| {
-                atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string())
-            })?;
-            let hdr_json: Value = serde_json::from_slice(&hdr_bytes).map_err(|e| {
-                atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string())
-            })?;
-            let kid = hdr_json
-                .get("kid")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    atproto_spaces::SpacesError::InvalidClientAttestation("missing JOSE kid".into())
-                })?
-                .to_string();
-            let vk = self
-                .resolve_client_attestation_key(&untrusted.iss, &kid, false)
-                .await?;
-            let resolver = SinglePreResolvedKey(vk);
-            return match futures::executor::block_on(verify_space_token(
-                kind, jwt, &resolver, now_sec,
-            )) {
-                Ok(claims) => Ok(claims),
-                Err(_) => {
-                    let refreshed_vk = self
-                        .resolve_client_attestation_key(&untrusted.iss, &kid, true)
-                        .await?;
-                    let refreshed = SinglePreResolvedKey(refreshed_vk);
-                    futures::executor::block_on(verify_space_token(kind, jwt, &refreshed, now_sec))
-                }
+        now: u64,
+    ) -> Result<SpaceTokenClaims, SpaceError> {
+        let token = ParsedToken::parse(kind, jwt, now)?;
+        for refresh in [false, true] {
+            let key = if kind == SpaceTokenKind::ClientAttestation {
+                self.resolve_client_attestation_key(
+                    &token.claims.iss,
+                    token
+                        .header
+                        .kid
+                        .as_deref()
+                        .ok_or(SpaceError::InvalidTokenFormat)?,
+                    refresh,
+                )
+                .await?
+            } else {
+                self.resolve_did_entry(&token.claims.iss, refresh).await?.0
             };
-        }
-        let (vk, _, _) = self.resolve_did_entry(&untrusted.iss, false).await?;
-        let resolver = SinglePreResolvedKey(vk);
-        match futures::executor::block_on(verify_space_token(kind, jwt, &resolver, now_sec)) {
-            Ok(claims) => Ok(claims),
-            Err(_) => {
-                let (refreshed_vk, _, _) = self.resolve_did_entry(&untrusted.iss, true).await?;
-                let refreshed = SinglePreResolvedKey(refreshed_vk);
-                futures::executor::block_on(verify_space_token(kind, jwt, &refreshed, now_sec))
+            if token.verify(&key) {
+                return Ok(token.claims);
             }
         }
+        Err(SpaceError::InvalidSignature)
     }
 }
 
 fn extract_client_jwk_verifying_key(
     keys: &[Value],
     expected_kid: &str,
-) -> Result<SpaceVerifyingKey, atproto_spaces::SpacesError> {
+) -> Result<SpaceVerifyingKey, SpaceError> {
     for jwk in keys {
         if jwk.get("kid").and_then(Value::as_str) != Some(expected_kid) {
             continue;
@@ -651,31 +632,33 @@ fn extract_client_jwk_verifying_key(
         if jwk.get("kty").and_then(Value::as_str) != Some("EC")
             || jwk.get("crv").and_then(Value::as_str) != Some("P-256")
         {
-            return Err(atproto_spaces::SpacesError::InvalidClientAttestation(
+            return Err(SpaceError::Unauthorized(
                 "client attestation JWK must be EC P-256".into(),
             ));
         }
         if let Some(alg) = jwk.get("alg").and_then(Value::as_str) {
             if alg != "ES256" {
-                return Err(atproto_spaces::SpacesError::InvalidClientAttestation(
-                    format!("unsupported client attestation JWK alg {alg}"),
-                ));
+                return Err(SpaceError::Unauthorized(format!(
+                    "unsupported client attestation JWK alg {alg}"
+                )));
             }
         }
-        let x_b64 = jwk.get("x").and_then(Value::as_str).ok_or_else(|| {
-            atproto_spaces::SpacesError::InvalidClientAttestation("JWK missing x".into())
-        })?;
-        let y_b64 = jwk.get("y").and_then(Value::as_str).ok_or_else(|| {
-            atproto_spaces::SpacesError::InvalidClientAttestation("JWK missing y".into())
-        })?;
+        let x_b64 = jwk
+            .get("x")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SpaceError::Unauthorized("JWK missing x".into()))?;
+        let y_b64 = jwk
+            .get("y")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SpaceError::Unauthorized("JWK missing y".into()))?;
         let x = URL_SAFE_NO_PAD
             .decode(x_b64)
-            .map_err(|e| atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string()))?;
+            .map_err(|e| SpaceError::Unauthorized(e.to_string()))?;
         let y = URL_SAFE_NO_PAD
             .decode(y_b64)
-            .map_err(|e| atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string()))?;
+            .map_err(|e| SpaceError::Unauthorized(e.to_string()))?;
         if x.len() != 32 || y.len() != 32 {
-            return Err(atproto_spaces::SpacesError::InvalidClientAttestation(
+            return Err(SpaceError::Unauthorized(
                 "P-256 JWK coordinates must be 32 bytes".into(),
             ));
         }
@@ -684,37 +667,29 @@ fn extract_client_jwk_verifying_key(
         sec1[1..33].copy_from_slice(&x);
         sec1[33..65].copy_from_slice(&y);
         let vk = P256VerifyingKey::from_sec1_bytes(&sec1)
-            .map_err(|e| atproto_spaces::SpacesError::InvalidClientAttestation(e.to_string()))?;
-        return Ok(SpaceVerifyingKey::P256(vk));
+            .map_err(|e| SpaceError::Unauthorized(e.to_string()))?;
+        return Ok(p256_verification_key(&vk));
     }
-    Err(atproto_spaces::SpacesError::InvalidClientAttestation(
-        format!("client metadata JWKS has no key matching kid {expected_kid}"),
-    ))
+    Err(SpaceError::Unauthorized(format!(
+        "client metadata JWKS has no key matching kid {expected_kid}"
+    )))
 }
 
-struct SinglePreResolvedKey(SpaceVerifyingKey);
-
-#[async_trait::async_trait(?Send)]
-impl SpaceKeyResolver for SinglePreResolvedKey {
-    async fn resolve_atproto_key(
-        &self,
-        _did_or_issuer: &str,
-        _force_refresh: bool,
-    ) -> atproto_spaces::Result<SpaceVerifyingKey> {
-        Ok(self.0.clone())
-    }
+pub(crate) fn p256_verification_key(key: &P256VerifyingKey) -> SpaceVerifyingKey {
+    let encoded = key.to_encoded_point(true);
+    let public_key = PublicKey::from_sec1(ATProtoKeyCurve::P256, encoded.as_bytes())
+        .expect("validated P-256 point");
+    SpaceVerifyingKey::from_public_key(&public_key)
 }
 
 fn extract_atproto_verifying_key(
     doc: &Value,
     bare_did: &str,
-) -> Result<SpaceVerifyingKey, atproto_spaces::SpacesError> {
+) -> Result<SpaceVerifyingKey, SpaceError> {
     let methods = doc
         .get("verificationMethod")
         .and_then(Value::as_array)
-        .ok_or_else(|| {
-            atproto_spaces::SpacesError::DidResolution("missing verificationMethod".into())
-        })?;
+        .ok_or_else(|| SpaceError::DidResolutionFailed("missing verificationMethod".into()))?;
     let full_id = format!("{bare_did}#atproto");
     let method = methods
         .iter()
@@ -726,26 +701,25 @@ fn extract_atproto_verifying_key(
             )
         })
         .ok_or_else(|| {
-            atproto_spaces::SpacesError::DidResolution("missing #atproto verificationMethod".into())
+            SpaceError::DidResolutionFailed("missing #atproto verificationMethod".into())
         })?;
     let multibase_str = method
         .get("publicKeyMultibase")
         .and_then(Value::as_str)
-        .ok_or_else(|| {
-            atproto_spaces::SpacesError::DidResolution("missing publicKeyMultibase".into())
-        })?;
+        .ok_or_else(|| SpaceError::DidResolutionFailed("missing publicKeyMultibase".into()))?;
     let (_, raw) = multibase::decode(multibase_str)
-        .map_err(|e| atproto_spaces::SpacesError::DidResolution(e.to_string()))?;
+        .map_err(|e| SpaceError::DidResolutionFailed(e.to_string()))?;
     if raw.starts_with(&[0x80, 0x24]) && raw.len() == 35 {
         let vk = P256VerifyingKey::from_sec1_bytes(&raw[2..])
-            .map_err(|e| atproto_spaces::SpacesError::DidResolution(e.to_string()))?;
-        Ok(SpaceVerifyingKey::P256(vk))
+            .map_err(|e| SpaceError::DidResolutionFailed(e.to_string()))?;
+        Ok(p256_verification_key(&vk))
     } else if raw.starts_with(&[0xe7, 0x01]) && raw.len() == 35 {
         let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(&raw[2..])
-            .map_err(|e| atproto_spaces::SpacesError::DidResolution(e.to_string()))?;
-        Ok(SpaceVerifyingKey::K256(vk))
+            .map_err(|e| SpaceError::DidResolutionFailed(e.to_string()))?;
+        SpaceVerifyingKey::from_secp256k1_public_key(vk.to_encoded_point(true).as_bytes())
+            .map_err(|e| SpaceError::DidResolutionFailed(e.to_string()))
     } else {
-        Err(atproto_spaces::SpacesError::DidResolution(
+        Err(SpaceError::DidResolutionFailed(
             "unsupported #atproto multicodec".into(),
         ))
     }
@@ -764,23 +738,19 @@ fn extract_service_endpoint(doc: &Value, fragment: &str) -> Option<String> {
     None
 }
 
-/// Prefix of every Space ref and in-space record URI (`at:space/{spaceDid}/...`).
-pub(crate) const SPACE_URI_PREFIX: &str = "at:space/";
+pub(crate) fn parse_strict_space_ref(raw: &str) -> Option<SpaceRef> {
+    SpaceRef::parse(raw).ok()
+}
 
-/// Strict Space ref parse for request params and token subjects: only the exact
-/// `at:space/{did}/{spaceType}/{skey}` form is accepted. The alpha `at://{did}/space/...`
-/// form, handle authorities, `at-space://`, the `com.atproto.space.space` spelling and
-/// in-space record URIs are all rejected, as the reference host does.
-pub(crate) fn parse_strict_space_ref(raw: &str) -> Option<atproto_spaces::SpaceUri> {
-    if !raw.starts_with(SPACE_URI_PREFIX) {
-        return None;
-    }
-    let parsed = atproto_spaces::SpaceUri::parse_hedged(raw).ok()?;
-    let canonical = format!(
-        "{SPACE_URI_PREFIX}{}/{}/{}",
-        parsed.authority, parsed.space_type, parsed.rkey
-    );
-    (canonical == raw).then_some(parsed)
+pub fn conversation_space_ref(
+    authority: &str,
+    key: &str,
+) -> Result<SpaceRef, petrel_core::SyntaxError> {
+    SpaceRef::from_parts(
+        &petrel_core::Did::parse(authority)?,
+        &petrel_core::Nsid::parse("blue.catbird.labyrinth.conversation")?,
+        &petrel_core::RecordKey::parse(key)?,
+    )
 }
 
 const TID_CHARS: &[u8; 32] = b"234567abcdefghijklmnopqrstuvwxyz";
@@ -825,9 +795,12 @@ mod tests {
     fn strict_space_ref_accepts_only_the_at_space_form() {
         let space = "at:space/did:web:authority.example/blue.catbird.labyrinth.conversation/c-0";
         let parsed = parse_strict_space_ref(space).expect("canonical Space ref");
-        assert_eq!(parsed.authority, "did:web:authority.example");
-        assert_eq!(parsed.space_type, "blue.catbird.labyrinth.conversation");
-        assert_eq!(parsed.rkey, "c-0");
+        assert_eq!(parsed.space_did().as_str(), "did:web:authority.example");
+        assert_eq!(
+            parsed.space_type().as_str(),
+            "blue.catbird.labyrinth.conversation"
+        );
+        assert_eq!(parsed.skey().as_str(), "c-0");
         for rejected in [
             "at://did:web:authority.example/space/blue.catbird.labyrinth.conversation/c-0",
             "at:space/authority.example/blue.catbird.labyrinth.conversation/c-0",
@@ -857,9 +830,15 @@ mod tests {
         let clock = Arc::new(ManualDsClock::new(now));
         let space_uri =
             "at:space/did:web:authority.example/blue.catbird.labyrinth.conversation/test-0";
-        let credential_kid = atproto_spaces::kem::encode_p256_did_key(&p256::PublicKey::from(
-            runtime.config.signing_key.verifying_key(),
-        ));
+        let credential_kid = petrel_spaces::encode_p256_did_key(
+            runtime
+                .config
+                .signing_key
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes(),
+        )
+        .unwrap();
         let mint = || {
             let claims = SpaceTokenClaims {
                 iss: runtime.authority_did().to_string(),
@@ -868,7 +847,9 @@ mod tests {
                 iat: now.timestamp() as u64,
                 exp: now.timestamp() as u64 + 600,
                 jti: runtime.mint_credential_jti(space_uri, "did:web:writer.example"),
-                cnf_kid: Some(credential_kid.clone()),
+                cnf: Some(petrel_spaces::CnfClaim {
+                    kid: credential_kid.clone(),
+                }),
             };
             let jwt = runtime.mint_credential(&claims).unwrap();
             (claims.jti, jwt)

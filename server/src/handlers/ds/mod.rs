@@ -5,6 +5,7 @@ pub mod fetch_key_package;
 pub mod get_convo_digest;
 pub mod get_convo_events;
 pub mod health_check;
+pub mod strict_input;
 pub mod submit_commit;
 pub mod transfer_sequencer;
 

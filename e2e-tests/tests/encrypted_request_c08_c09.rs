@@ -455,14 +455,7 @@ fn build_publication(
             sequencer_receipt_authority_key: rig.server.sequencer_receipt_public_key.clone(),
             text: "C08/C09 encrypted first contact".into(),
             invitation: None,
-            metadata: GroupMetadataV1 {
-                version: 1,
-                title: String::new(),
-                description: String::new(),
-                avatar_blob_locator: None,
-                avatar_content_type: None,
-                space_avatar: None,
-            },
+            metadata: GroupMetadataV1::new("", ""),
         })?;
     let bootstrap = journal.bootstrap.clone();
     let mut body = prep.prepare["body"].clone();

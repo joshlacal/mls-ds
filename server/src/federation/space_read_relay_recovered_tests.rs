@@ -10,7 +10,9 @@ fn recovered_read_requires_exact_enrollment_and_revocation_absence_at_current_he
     let sibling = "00000000-0000-4000-8000-00000000beef";
     let created = "2026-11-16T00:00:00.000Z";
     let repository = p256::SecretKey::from_slice(&[0x36; 32]).unwrap();
-    let key = SpaceVerifyingKey::P256(p256::ecdsa::VerifyingKey::from(repository.public_key()));
+    let key = crate::space_host::p256_verification_key(&p256::ecdsa::VerifyingKey::from(
+        repository.public_key(),
+    ));
     let actor = ed25519_dalek::SigningKey::from_bytes(&[0x37; 32]);
     let public = actor.verifying_key().to_bytes();
     let device_path = format!("blue.catbird.chat.device/{device}");

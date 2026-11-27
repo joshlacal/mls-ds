@@ -288,14 +288,7 @@ async fn alice_publishes_with_note(
         sequencer_receipt_authority_key: f.server.sequencer_receipt_public_key.clone(),
         text: "Second introduction smuggled with a group note".into(),
         invitation: Some(note),
-        metadata: GroupMetadataV1 {
-            version: 1,
-            title: String::new(),
-            description: String::new(),
-            avatar_blob_locator: None,
-            avatar_content_type: None,
-            space_avatar: None,
-        },
+        metadata: GroupMetadataV1::new("", ""),
     })?;
     let b = &journal.bootstrap;
     let mut body = p.signed["body"].clone();

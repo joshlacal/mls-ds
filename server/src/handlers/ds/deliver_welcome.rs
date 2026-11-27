@@ -1,10 +1,9 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::blue_catbird::mls_ds::deliver_welcome::Input as DeliverWelcome;
 use axum::extract::State;
 use axum::Json;
-use catbird_atproto::generated::blue_catbird::mlsDS::deliver_welcome::DeliverWelcome;
-use jacquard_common::DefaultStr;
 use tracing::debug;
 use uuid::Uuid;
 
@@ -73,18 +72,13 @@ pub async fn deliver_welcome(
         return Err(FederationError::SignerUnavailable);
     };
 
-    let msg: DeliverWelcome<DefaultStr> = serde_json::from_str(&body).map_err(|e| {
-        FederationError::Json(serde_json::Error::io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Invalid DeliverWelcome body: {e}"),
-        )))
-    })?;
-
-    if msg.extra_data.as_ref().is_some_and(|m| !m.is_empty()) {
-        return Err(FederationError::InvalidEnvelope {
-            reason: "unknown fields in DeliverWelcome request".to_string(),
-        });
-    }
+    // Petrel inputs accept and drop unknown fields, so the top-level keys are
+    // checked against the lexicon here (400 InvalidEnvelope on an unknown one).
+    let msg: DeliverWelcome = super::strict_input::decode_ds_input(
+        &body,
+        "DeliverWelcome",
+        super::strict_input::DELIVER_WELCOME_INPUT_FIELDS,
+    )?;
 
     let header = validate_envelope_header(&msg.header)?;
     let locator = validate_entry_locator(&msg.entry_locator)?;
@@ -132,37 +126,37 @@ pub async fn deliver_welcome(
             }
         })?;
 
-    if msg.key_package_ref.len() != 32 {
+    if msg.key_package_ref.0.len() != 32 {
         return Err(FederationError::InvalidEnvelope {
             reason: "keyPackageRef must be exactly 32 bytes".to_string(),
         });
     }
     let mut key_package_ref = [0u8; 32];
-    key_package_ref.copy_from_slice(&msg.key_package_ref);
+    key_package_ref.copy_from_slice(&msg.key_package_ref.0);
 
-    if msg.welcome_sha256.len() != 32 {
+    if msg.welcome_sha256.0.len() != 32 {
         return Err(FederationError::InvalidEnvelope {
             reason: "welcomeSha256 must be exactly 32 bytes".to_string(),
         });
     }
     let mut welcome_sha256 = [0u8; 32];
-    welcome_sha256.copy_from_slice(&msg.welcome_sha256);
+    welcome_sha256.copy_from_slice(&msg.welcome_sha256.0);
 
-    if msg.public_snapshot_sha256.len() != 32 {
+    if msg.public_snapshot_sha256.0.len() != 32 {
         return Err(FederationError::InvalidEnvelope {
             reason: "publicSnapshotSha256 must be exactly 32 bytes".to_string(),
         });
     }
     let mut public_snapshot_sha256 = [0u8; 32];
-    public_snapshot_sha256.copy_from_slice(&msg.public_snapshot_sha256);
+    public_snapshot_sha256.copy_from_slice(&msg.public_snapshot_sha256.0);
 
-    if msg.tree_summary_sha256.len() != 32 {
+    if msg.tree_summary_sha256.0.len() != 32 {
         return Err(FederationError::InvalidEnvelope {
             reason: "treeSummarySha256 must be exactly 32 bytes".to_string(),
         });
     }
     let mut tree_summary_sha256 = [0u8; 32];
-    tree_summary_sha256.copy_from_slice(&msg.tree_summary_sha256);
+    tree_summary_sha256.copy_from_slice(&msg.tree_summary_sha256.0);
 
     if !dids_equivalent(&header.sender_ds_did, &header.sequencer_did) {
         return Err(FederationError::InvalidEnvelope {
@@ -176,10 +170,10 @@ pub async fn deliver_welcome(
         welcome_id,
         recovery_request_id,
         &key_package_ref,
-        &msg.welcome_bytes,
+        &msg.welcome_bytes.0,
         &welcome_sha256,
-        &msg.entry_bytes,
-        &msg.signed_request_bytes,
+        &msg.entry_bytes.0,
+        &msg.signed_request_bytes.0,
         &locator,
         &msg.coordinates,
         &public_snapshot_sha256,
@@ -248,10 +242,10 @@ pub async fn deliver_welcome(
                 welcome_id,
                 recovery_request_id,
                 key_package_ref: &key_package_ref,
-                welcome_bytes: &msg.welcome_bytes,
+                welcome_bytes: &msg.welcome_bytes.0,
                 welcome_sha256: &welcome_sha256,
-                entry_bytes: &msg.entry_bytes,
-                signed_request_bytes: &msg.signed_request_bytes,
+                entry_bytes: &msg.entry_bytes.0,
+                signed_request_bytes: &msg.signed_request_bytes.0,
                 entry_id: locator.entry_id,
                 entry_seq: locator.seq,
                 accepted_payload_sha256: &locator.accepted_payload_sha256,
@@ -294,10 +288,10 @@ pub async fn deliver_welcome(
             welcome_id,
             recovery_request_id,
             key_package_ref,
-            msg.welcome_bytes.to_vec(),
+            msg.welcome_bytes.0.to_vec(),
             welcome_sha256,
-            msg.entry_bytes.to_vec(),
-            msg.signed_request_bytes.to_vec(),
+            msg.entry_bytes.0.to_vec(),
+            msg.signed_request_bytes.0.to_vec(),
             locator,
             msg.coordinates,
             public_snapshot_sha256,
@@ -313,7 +307,8 @@ pub async fn deliver_welcome(
             "Accepted federated welcome"
         );
 
-        let value = serde_json::to_value(output).map_err(FederationError::Json)?;
+        let value = catbird_server::atproto_conv::wire_json_value(&output)
+            .map_err(FederationError::Json)?;
         Ok(Json(value))
     }
     .await;

@@ -360,14 +360,7 @@ async fn stage_request_configured(
             sequencer_receipt_authority_key: server.sequencer_receipt_public_key.clone(),
             text: "Real encrypted first contact".into(),
             invitation: None,
-            metadata: GroupMetadataV1 {
-                version: 1,
-                title: String::new(),
-                description: String::new(),
-                avatar_blob_locator: None,
-                avatar_content_type: None,
-                space_avatar: None,
-            },
+            metadata: GroupMetadataV1::new("", ""),
         })
         .map_err(|error| anyhow::anyhow!("prepare_direct_request_bootstrap: {error}"))?;
     let bootstrap = &journal_record.bootstrap;

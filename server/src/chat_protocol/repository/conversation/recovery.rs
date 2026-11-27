@@ -17,7 +17,7 @@ use crate::chat_protocol::{
     },
 };
 
-type RecoveryView = catbird_atproto::generated::blue_catbird::chat::LeafRecoveryView;
+type RecoveryView = catbird_server::blue_catbird::chat::LeafRecoveryView;
 
 const PENDING_LEAF_RECOVERIES_SQL: &str = r#"
         SELECT request.recovery_request_id, request.conversation_id,
@@ -562,8 +562,12 @@ mod tests {
             "/tests/fixtures/chat_protocol_g7_canonical_json_v1.json"
         )))
         .expect("fixture");
-        let state: catbird_atproto::generated::blue_catbird::chat::ConversationState =
-            serde_json::from_value(fixture["vectors"][0]["value"].clone()).expect("state");
+        let state: catbird_server::blue_catbird::chat::ConversationState =
+            catbird_server::chat_protocol::retained_json::decode_definition(
+                "conversationState",
+                fixture["vectors"][0]["value"].clone(),
+            )
+            .expect("state");
         let recovery = project_recovery(source_row()).expect("recovery view");
         let expected_device = recovery.requester_device_id.to_string();
         let encoded =

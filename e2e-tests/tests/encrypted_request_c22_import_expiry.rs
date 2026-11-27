@@ -35,9 +35,6 @@ use base64::{
     Engine as _,
 };
 use catbird_mls::{
-    atproto::blue_catbird::chat::{
-        get_conversations::GetConversationsOutput, get_pending_welcomes::GetPendingWelcomesOutput,
-    },
     chat_v2::transcript::{
         decode_strict_json,
         direct_request::{self as protocol, DirectRequestKind},
@@ -56,6 +53,10 @@ use encrypted_requests::{
     ServiceIdentity, ShippingServerFixture, REQUEST_TEST_DATABASE_URL,
 };
 use mls_e2e_tests::mls_engine::MlsEngine;
+use petrel_catbird::generated::blue::catbird::chat::{
+    get_conversations::Output as GetConversationsOutput,
+    get_pending_welcomes::Output as GetPendingWelcomesOutput,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{path::PathBuf, process::Command};

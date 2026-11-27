@@ -171,7 +171,7 @@ impl Net {
             .context("unknown account")?;
         let session = format!("{label}-oauth");
         self.pds.add_session(did, &session);
-        let inner = ClientTransport::new(vec![self.ds.base_url.clone(), self.pds.base_url.clone()]);
+        let inner = self.pds.client_transport(&self.ds.base_url);
         inner.set_account(did, key.clone(), DS_DID, &self.pds.base_url, &session);
         let transport = Arc::new(Recorder {
             inner,

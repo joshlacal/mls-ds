@@ -5,11 +5,10 @@
 // conversation membership and cannot accidentally broaden a historical event.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use catbird_atproto::generated::blue_catbird::chat::{
+use catbird_server::blue_catbird::chat::{
     EventEnvelope, ProtocolEventPayload, SubscriptionMessage,
 };
 use chrono::{DateTime, Utc};
-use jacquard_common::DefaultStr;
 use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Row, Transaction};
 
@@ -18,10 +17,10 @@ use super::ticket::{
     TicketRepositoryError,
 };
 use crate::{
+    atproto_conv::{chrono_to_canonical_datetime, chrono_to_datetime},
     chat_protocol::cursor::{
         mint_capability_token, CursorSealer, OsSecureRandom, SealedCapability, SealerBinding,
     },
-    sqlx_jacquard::{chrono_to_canonical_datetime, chrono_to_datetime},
 };
 
 const MAX_BATCH: i64 = 256;
@@ -29,7 +28,7 @@ const MAX_BATCH: i64 = 256;
 #[derive(Clone, Debug)]
 pub(crate) struct VisibleEvent {
     pub(crate) event_position: i64,
-    pub(crate) payload: ProtocolEventPayload<DefaultStr>,
+    pub(crate) payload: ProtocolEventPayload,
     pub(crate) created_at: DateTime<Utc>,
 }
 
@@ -184,7 +183,7 @@ pub(crate) async fn materialize_envelope(
     previous_cursor: &str,
     previous_cursor_hash: [u8; 32],
     sealer: &CursorSealer,
-) -> Result<(SubscriptionMessage<DefaultStr>, String, [u8; 32]), TicketRepositoryError> {
+) -> Result<(SubscriptionMessage, String, [u8; 32]), TicketRepositoryError> {
     // Same-session streams must share one committed successor. The caller has
     // already revalidated device/protocol authority; lock the retained parent
     // before looking for a receipt, including when that receipt is absent.
@@ -282,8 +281,8 @@ pub(crate) async fn materialize_envelope(
         previous_cursor: previous_cursor.into(),
         extra_data: None,
     }));
-    let canonical_bytes =
-        serde_json::to_vec(&message).map_err(|_| TicketRepositoryError::InvalidReceipt)?;
+    let canonical_bytes = catbird_server::atproto_conv::wire_json_bytes(&message)
+        .map_err(|_| TicketRepositoryError::InvalidReceipt)?;
     let envelope_hash: [u8; 32] = Sha256::digest(&canonical_bytes).into();
 
     if expected_envelope_hash != [0; 32] {
@@ -298,7 +297,7 @@ pub(crate) async fn materialize_envelope(
                 return Err(TicketRepositoryError::InvalidReceipt);
             };
             envelope.created_at = chrono_to_datetime(event_created_at);
-            let legacy_bytes = serde_json::to_vec(&legacy_message)
+            let legacy_bytes = catbird_server::atproto_conv::wire_json_bytes(&legacy_message)
                 .map_err(|_| TicketRepositoryError::InvalidReceipt)?;
             let legacy_hash: [u8; 32] = Sha256::digest(&legacy_bytes).into();
             if expected_envelope_hash != legacy_hash {
@@ -361,13 +360,13 @@ mod tests {
         kind: &'static str,
         created_at: &'a str,
         cursor: &'a str,
-        payload: &'a ProtocolEventPayload<DefaultStr>,
+        payload: &'a ProtocolEventPayload,
         previous_cursor: &'a str,
     }
 
     #[test]
     fn receipt_digest_matches_both_merged_producers() {
-        let payload: ProtocolEventPayload<DefaultStr> = serde_json::from_value(serde_json::json!({
+        let payload: ProtocolEventPayload = serde_json::from_value(serde_json::json!({
             "$type": "blue.catbird.chat.defs#watermarkEvent",
             "issuedAt": "2026-09-27T08:31:28.000000Z"
         }))
@@ -383,7 +382,7 @@ mod tests {
                 previous_cursor: "predecessor".into(),
                 extra_data: None,
             }));
-            let main_bytes = serde_json::to_vec(&message).unwrap();
+            let main_bytes = catbird_server::atproto_conv::wire_json_bytes(&message).unwrap();
             let millis = created_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
             let encrypted_line_bytes = serde_json::to_vec(&EncryptedRequestsLineWireEnvelope {
                 kind: "blue.catbird.chat.defs#eventEnvelope",

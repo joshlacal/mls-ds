@@ -23,17 +23,15 @@ use axum::{
     http::HeaderMap,
     response::{IntoResponse, Response},
 };
-use jacquard_common::deps::bytes::Bytes as JacquardBytes;
-use jacquard_common::deps::smol_str::SmolStr;
-use jacquard_common::DefaultStr;
+use petrel_core::Bytes as LexiconBytes;
 
-use catbird_atproto::generated::blue_catbird::chat as chat_dto;
+use crate::blue_catbird::chat as chat_dto;
 
+use crate::atproto_conv::chrono_to_datetime;
 use crate::chat_protocol::error::ChatEndpoint;
 use crate::chat_protocol::repository::key_packages::NewKeyPackage;
 use crate::chat_protocol::repository::prelude::{self, PreparedEnrollmentOperation};
 use crate::chat_protocol::wire::{self, KeyPackageValidationPolicy};
-use crate::sqlx_jacquard::chrono_to_datetime;
 use crate::storage::DbPool;
 
 use super::context;
@@ -139,26 +137,24 @@ async fn enroll(
             .map_err(|error| key_package_failure(ENDPOINT, error))?;
         let coarse_active_at =
             crate::chat_protocol::device_activity::coarse_activity_day(trusted_at);
-        let device = chat_dto::DeviceView::<DefaultStr> {
+        let device = chat_dto::DeviceView {
             auth_generation: 1,
             available_package_count: batch_count,
             created_at: chrono_to_datetime(trusted_at),
-            device_id: SmolStr::from(effect.device_id().to_string()),
-            device_name: Some(SmolStr::from(device_name.as_str())),
+            device_id: String::from(effect.device_id().to_string()),
+            device_name: Some(String::from(device_name.as_str())),
             dormant_at: None,
-            key_id: SmolStr::from(key_id.as_str()),
+            key_id: String::from(key_id.as_str()),
             last_active_at: Some(chrono_to_datetime(coarse_active_at)),
             reserved_package_count: 0,
-            signature_public_key: JacquardBytes::from(expected_signature_key.clone()),
-            status: SmolStr::from(enrolled_status),
+            signature_public_key: LexiconBytes(expected_signature_key.to_vec()),
+            status: crate::atproto_conv::open_enum(enrolled_status),
             updated_at: chrono_to_datetime(trusted_at),
             extra_data: None,
         };
-        let output = chat_dto::enroll_device::EnrollDeviceOutput::<DefaultStr> {
-            device,
-            extra_data: None,
-        };
-        serde_json::to_vec(&output).map_err(|_| ChatFailure::invariant(ENDPOINT))?
+        let output = chat_dto::enroll_device::Output { device };
+        catbird_server::atproto_conv::wire_json_bytes(&output)
+            .map_err(|_| ChatFailure::invariant(ENDPOINT))?
     };
 
     prelude::complete_enrollment_bootstrap_operation(

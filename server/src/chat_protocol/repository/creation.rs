@@ -5,8 +5,7 @@
 // the caller-owned transaction and the already-arbitrated operation.
 
 use base64::Engine as _;
-use catbird_atproto::generated::blue_catbird::chat as chat_dto;
-use jacquard_common::DefaultStr;
+use catbird_server::blue_catbird::chat as chat_dto;
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Row, Transaction};
@@ -107,9 +106,14 @@ pub(crate) struct CreationCanonicalResponse {
 
 impl CreationCanonicalResponse {
     fn new(bytes: Vec<u8>) -> Result<Self, CreationFacadeError> {
-        let _: chat_dto::create_conversation::CreateConversationOutput<DefaultStr> =
-            serde_json::from_slice(&bytes)
-                .map_err(|_| CreationFacadeError::InvalidCanonicalMaterial)?;
+        let _: chat_dto::create_conversation::Output = serde_json::from_slice(&bytes)
+            .and_then(|value| {
+                catbird_server::chat_protocol::retained_json::decode_output(
+                    "blue.catbird.chat.createConversation",
+                    value,
+                )
+            })
+            .map_err(|_| CreationFacadeError::InvalidCanonicalMaterial)?;
         let sha256 = Sha256::digest(&bytes).into();
         let mut digest = Sha256::new();
         digest.update(RESPONSE_DOMAIN);
@@ -597,13 +601,18 @@ fn creation_response(
         .successor_coordinate()
         .ok_or(CreationFacadeError::InvalidCanonicalMaterial)?;
     let value = json!({"result":{"$type":"blue.catbird.chat.defs#conversationCreatedResult","coordinates":coordinate_json(coordinate)?,"entry":serde_json::from_slice::<JsonValue>(entry).map_err(|_| CreationFacadeError::InvalidCanonicalMaterial)?}});
-    let value_bytes =
-        serde_json::to_vec(&value).map_err(|_| CreationFacadeError::InvalidCanonicalMaterial)?;
-    let output: chat_dto::create_conversation::CreateConversationOutput<DefaultStr> =
-        serde_json::from_slice(&value_bytes)
-            .map_err(|_| CreationFacadeError::InvalidCanonicalMaterial)?;
+    let output: chat_dto::create_conversation::Output =
+        catbird_server::chat_protocol::retained_json::decode_output(
+            "blue.catbird.chat.createConversation",
+            value,
+        )
+        .map_err(|_| CreationFacadeError::InvalidCanonicalMaterial)?;
     CreationCanonicalResponse::new(
-        serde_json::to_vec(&output).map_err(|_| CreationFacadeError::InvalidCanonicalMaterial)?,
+        catbird_server::chat_protocol::retained_json::encode_output(
+            "blue.catbird.chat.createConversation",
+            &output,
+        )
+        .map_err(|_| CreationFacadeError::InvalidCanonicalMaterial)?,
     )
 }
 

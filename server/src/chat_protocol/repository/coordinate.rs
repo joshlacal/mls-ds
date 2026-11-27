@@ -1,9 +1,8 @@
 // Canonical JSON representation for coordinate-bearing response DTOs.
 //
-// The chat lexicon declares these fields as `bytes`. Jacquard's generated
-// `ConversationCoordinates` uses `serde_bytes_helper`, whose JSON contract is
-// an object containing `$bytes` and a standard-base64 string. It is not the
-// bare string form. Every response endpoint carrying coordinates must use
+// The chat lexicon declares these fields as `bytes`. Existing coordinate
+// receipts use an object containing `$bytes` and a padded standard-base64
+// string. Every response endpoint carrying coordinates must use
 // this helper so creation, submitTransition, acceptance, leave, and reset
 // cannot drift independently.
 //
@@ -79,9 +78,7 @@ mod tests {
     fn superseded_fixture() -> PublicGroupSnapshotCoordinate {
         fixture(PublicGroupSnapshotLifecycle::Superseded)
     }
-    /// The `$bytes` wrapper is the entire reason this module exists: the bare
-    /// base64 string form is a different wire contract and Jacquard's generated
-    /// deserializer rejects it.
+    /// Coordinates preserve the deployed DAG-JSON byte wrapper.
     #[test]
     fn byte_fields_are_dollar_bytes_objects_not_bare_strings() {
         let coordinate = active_fixture();

@@ -17,11 +17,10 @@
 
 mod common;
 
-use atproto_spaces::{
-    http_signature::sign_credential_request,
-    kem::encode_p256_did_key,
-    tokens::{mint_space_token, SpaceSigningKey, SpaceTokenClaims, SpaceTokenKind},
-};
+#[path = "common/space_fixtures.rs"]
+mod space_fixtures;
+use space_fixtures::{did_key, signed_headers};
+
 use axum::{
     extract::Query,
     http::{HeaderMap, StatusCode},
@@ -1053,7 +1052,7 @@ async fn stateless_3a_space_credential_and_read_relays_preserve_headers_reject_s
 
     let captured_read: Arc<Mutex<Option<CapturedUpstreamRead>>> = Arc::new(Mutex::new(None));
     let cap_clone = captured_read.clone();
-    let authority_multibase = encode_p256_did_key(
+    let authority_multibase = did_key(
         &P256PublicKey::from_sec1_bytes(
             authority_key
                 .verifying_key()
@@ -1179,24 +1178,9 @@ async fn stateless_3a_space_credential_and_read_relays_preserve_headers_reject_s
     // 1. relaySpaceCredential exchanges delegation token via home mls-ds with ZERO DB writes!
     let now_sec = Utc::now().timestamp() as u64;
     let pop_key = P256SigningKey::from_bytes((&[0x73u8; 32]).into()).unwrap();
-    let cnf_kid = encode_p256_did_key(&P256PublicKey::from(pop_key.verifying_key()));
-    let del_token = mint_space_token(
-        SpaceTokenKind::Delegation,
-        &SpaceSigningKey::P256 {
-            signing_key: user_pds_key,
-            kid: "#atproto".to_string(),
-        },
-        &SpaceTokenClaims {
-            iss: user_did.clone(),
-            sub: space_uri.clone(),
-            aud: Some(format!("{authority_did}#atproto_pds")),
-            iat: now_sec,
-            exp: now_sec + 60,
-            jti: "relay-del-1".into(),
-            cnf_kid: None,
-        },
-    )
-    .unwrap();
+    let cnf_kid = did_key(&P256PublicKey::from(pop_key.verifying_key()));
+    let del_token =
+        space_fixtures::delegation(&user_pds_key, &user_did, &space_uri, "relay-del-1", now_sec);
 
     let (cred_status, cred_resp) = http::send(
         home_router.clone(),
@@ -1224,7 +1208,7 @@ async fn stateless_3a_space_credential_and_read_relays_preserve_headers_reject_s
 
     // 2. relaySpaceRead rejects disallowed write NSID (`com.atproto.space.putRecord`) with 400 InvalidNsid!
     let pop_secret = P256Secret::from_slice(&pop_key.to_bytes()).unwrap();
-    let signed_hdrs = sign_credential_request(
+    let signed_hdrs = signed_headers(
         &pop_secret,
         &cred_jwt,
         authority_did,

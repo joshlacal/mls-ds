@@ -1,9 +1,8 @@
 use std::sync::Arc;
 
+use crate::blue_catbird::mls_ds::submit_commit::Input as SubmitCommit;
 use axum::extract::State;
 use axum::Json;
-use catbird_atproto::generated::blue_catbird::mlsDS::submit_commit::SubmitCommit;
-use jacquard_common::DefaultStr;
 use tracing::debug;
 
 use super::deliver_message::{enforce_ds_request_security, record_ds_outcome};
@@ -29,18 +28,13 @@ pub async fn submit_commit(
     let Some(signer) = ack_signer.as_deref() else {
         return Err(FederationError::SignerUnavailable);
     };
-    let msg: SubmitCommit<DefaultStr> = serde_json::from_str(&body).map_err(|e| {
-        FederationError::Json(serde_json::Error::io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Invalid SubmitCommit body: {e}"),
-        )))
-    })?;
-
-    if msg.extra_data.as_ref().is_some_and(|m| !m.is_empty()) {
-        return Err(FederationError::InvalidEnvelope {
-            reason: "unknown fields in SubmitCommit request".to_string(),
-        });
-    }
+    // Petrel inputs accept and drop unknown fields, so the top-level keys are
+    // checked against the lexicon here (400 InvalidEnvelope on an unknown one).
+    let msg: SubmitCommit = super::strict_input::decode_ds_input(
+        &body,
+        "SubmitCommit",
+        super::strict_input::SUBMIT_COMMIT_INPUT_FIELDS,
+    )?;
 
     let header = validate_envelope_header(&msg.header)?;
 
@@ -70,14 +64,15 @@ pub async fn submit_commit(
             &mut tx,
             signer,
             header,
-            msg.signed_request_bytes.to_vec(),
+            msg.signed_request_bytes.0.to_vec(),
             runtime.relationship_authority().as_ref(),
             runtime.i13_receipt_signer(),
         )
         .await?;
 
         let mut commit_entry_val =
-            serde_json::to_value(&output.commit_entry).map_err(FederationError::Json)?;
+            catbird_server::atproto_conv::wire_json_value(&output.commit_entry)
+                .map_err(FederationError::Json)?;
         if commit_entry_val.get("$type").is_none() {
             commit_entry_val["$type"] = serde_json::json!("blue.catbird.chat.defs#commitEntry");
         }
@@ -110,7 +105,8 @@ pub async fn submit_commit(
             "Executed federated submitCommit"
         );
 
-        let value = serde_json::to_value(output).map_err(FederationError::Json)?;
+        let value = catbird_server::atproto_conv::wire_json_value(&output)
+            .map_err(FederationError::Json)?;
         Ok(Json(value))
     }
     .await;

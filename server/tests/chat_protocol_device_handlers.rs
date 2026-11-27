@@ -32,8 +32,12 @@
 mod common;
 
 pub use catbird_server::{
-    atproto_bytes, auth, crypto, federation, handlers, identity, sim_hooks, sqlx_jacquard, util,
+    atproto_bytes, atproto_conv, auth, config, crypto, federation, handlers, identity, sim_hooks,
+    util,
 };
+
+#[path = "common/chat_protocol_labyrinth.rs"]
+pub mod labyrinth;
 
 #[path = "common/chat_protocol_harness.rs"]
 mod chat_protocol;
@@ -843,7 +847,7 @@ async fn enroll_device_happy_path_publishes_batch_and_conforms_to_read_back() {
     );
     assert_eq!(
         device["createdAt"],
-        jacquard_created_at(&view),
+        directory_created_at(&view),
         "returned createdAt == stored created_at"
     );
     tx.rollback().await.ok();
@@ -1241,13 +1245,8 @@ async fn get_own_devices_steady_state_polling_beyond_cap_succeeds_and_stays_boun
 
 /// Render a directory row's `created_at` the same way the handler does, so the
 /// conformance assertion compares like for like.
-fn jacquard_created_at(view: &repository::device_directory::DeviceDirectoryView) -> String {
-    let datetime = jacquard_common::types::string::Datetime::new(view.created_at.fixed_offset());
-    serde_json::to_value(&datetime)
-        .unwrap()
-        .as_str()
-        .unwrap()
-        .to_owned()
+fn directory_created_at(view: &repository::device_directory::DeviceDirectoryView) -> String {
+    catbird_server::atproto_conv::chrono_to_datetime(view.created_at).to_string()
 }
 
 // =============================================================================

@@ -448,7 +448,8 @@ class SiblingBuildInputTests(unittest.TestCase):
     dockerfile = (SERVER / "Dockerfile").read_text()
     workflow = WORKFLOW.read_text()
     pins = {
-        "catbird-atproto": "CATBIRD_ATPROTO_REV",
+        "Petrel": "PETREL_REV",
+        "PetrelCatbird": "PETREL_CATBIRD_REV",
         "catbird-mls": "CATBIRD_MLS_REV",
         "labyrinth": "LABYRINTH_REV",
     }
@@ -492,7 +493,8 @@ class SiblingBuildInputTests(unittest.TestCase):
                 (SERVER / "Cargo.toml").read_text(),
             )
         )
-        self.assertIn("catbird-atproto", repos)
+        self.assertIn("Petrel", repos)
+        self.assertIn("PetrelCatbird", repos)
         self.assertIn("labyrinth", repos)
         jobs = re.split(r"^  (?=[\w-]+:\n)", self.workflow.split("\njobs:\n", 1)[1], flags=re.M)
         builders = [job for job in jobs if "working-directory: ./server" in job or "file: ./server/Dockerfile" in job]

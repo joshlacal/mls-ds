@@ -36,7 +36,7 @@
 #
 # Limits: no PDS runs here (Swan has its own interop lab,
 # ../Swan/interop/compose.sh), so Space-host calls and device-record lookups
-# have nothing to reach. Builds need ../catbird-atproto and ../labyrinth beside
+# have nothing to reach. Builds need ../Petrel, ../PetrelCatbird and ../labyrinth beside
 # this checkout.
 
 x-ds-build: &ds-build
@@ -44,7 +44,8 @@ x-ds-build: &ds-build
   dockerfile: server/Dockerfile
   target: federation-test
   additional_contexts:
-    catbird-atproto: ../catbird-atproto
+    petrel: ../Petrel/rust
+    petrel-catbird: ../PetrelCatbird/rust/petrel-catbird
     labyrinth-protocol: ../labyrinth/labyrinth-protocol
 
 x-ds-environment: &ds-environment

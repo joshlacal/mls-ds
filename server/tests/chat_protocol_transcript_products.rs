@@ -242,7 +242,7 @@ fn all_thirteen_verified_control_variants_mint_one_strict_durable_and_response_p
         );
         let generated_round_trip = serde_json::to_vec(products.response_entry())
             .expect("serialize generated closed union");
-        let round_tripped: catbird_atproto::generated::blue_catbird::chat::ConversationEntry =
+        let round_tripped: catbird_server::blue_catbird::chat::ConversationEntry =
             serde_json::from_slice(&generated_round_trip)
                 .expect("deserialize generated closed union");
         assert_eq!(

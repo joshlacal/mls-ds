@@ -25,7 +25,6 @@ use super::super::cursor::{
 };
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use jacquard_common::deps::smol_str::SmolStr;
 use zeroize::Zeroizing;
 
 const MAX_PROTOCOL_INTEGER: u64 = 9_007_199_254_740_991;
@@ -1884,7 +1883,7 @@ pub(crate) async fn create_inventory_session(
             conversation_projection_source(transaction, authority, &user_did, device_id).await?;
         let dto = super::super::read_projection::conversation_inventory_item(&source)
             .map_err(InventoryRepositoryError::Projection)?;
-        let canonical = super::super::read_projection::encode_canonical_generated_chat_json_v1(
+        let canonical = super::super::read_projection::encode_canonical_petrel_chat_json_v1(
             &dto,
             "blue.catbird.chat.defs#conversationInventoryItem",
         )
@@ -1933,7 +1932,7 @@ pub(crate) async fn create_inventory_session(
             .await?;
             let dto = super::super::read_projection::conversation_inventory_item(&source)
                 .map_err(InventoryRepositoryError::Projection)?;
-            let canonical = super::super::read_projection::encode_canonical_generated_chat_json_v1(
+            let canonical = super::super::read_projection::encode_canonical_petrel_chat_json_v1(
                 &dto,
                 "blue.catbird.chat.defs#conversationInventoryItem",
             )
@@ -2043,7 +2042,7 @@ pub(crate) async fn create_inventory_session(
             i64::try_from(ordinal).map_err(|_| InventoryRepositoryError::InvalidMaterialization)?;
         let dto = super::super::read_projection::welcome_view(source)
             .map_err(InventoryRepositoryError::Projection)?;
-        let canonical = super::super::read_projection::encode_canonical_generated_chat_json_v1(
+        let canonical = super::super::read_projection::encode_canonical_petrel_chat_json_v1(
             &dto,
             "blue.catbird.chat.defs#welcomeView",
         )
@@ -2137,7 +2136,7 @@ pub(crate) async fn create_inventory_session(
     for entry in recovery_entries {
         let dto = super::super::read_projection::leaf_recovery_inbox_item(entry.input)
             .map_err(InventoryRepositoryError::Projection)?;
-        let canonical = super::super::read_projection::encode_canonical_generated_chat_json_v1(
+        let canonical = super::super::read_projection::encode_canonical_petrel_chat_json_v1(
             &dto,
             "blue.catbird.chat.defs#leafRecoveryInboxItem",
         )
@@ -2941,26 +2940,22 @@ fn facade_error_from_inventory(error: InventoryRepositoryError) -> ExistingDevic
 /// generated-DTO projection inside this repository module.
 fn read_facade_device_view(
     view: &super::device_directory::DeviceDirectoryView,
-) -> catbird_atproto::generated::blue_catbird::chat::DeviceView<jacquard_common::DefaultStr> {
-    use jacquard_common::deps::{bytes::Bytes, smol_str::SmolStr};
+) -> catbird_server::blue_catbird::chat::DeviceView {
+    use petrel_core::Bytes;
 
-    catbird_atproto::generated::blue_catbird::chat::DeviceView {
+    catbird_server::blue_catbird::chat::DeviceView {
         auth_generation: view.auth_generation,
         available_package_count: view.available_package_count,
-        created_at: crate::sqlx_jacquard::chrono_to_datetime(view.created_at),
-        device_id: SmolStr::from(view.device_id.to_string()),
-        device_name: Some(SmolStr::from(view.device_name.as_str())),
-        dormant_at: view
-            .dormant_at
-            .map(crate::sqlx_jacquard::chrono_to_datetime),
-        key_id: SmolStr::from(view.key_id.as_str()),
-        last_active_at: Some(crate::sqlx_jacquard::chrono_to_datetime(
-            view.last_active_at,
-        )),
+        created_at: crate::atproto_conv::chrono_to_datetime(view.created_at),
+        device_id: String::from(view.device_id.to_string()),
+        device_name: Some(String::from(view.device_name.as_str())),
+        dormant_at: view.dormant_at.map(crate::atproto_conv::chrono_to_datetime),
+        key_id: String::from(view.key_id.as_str()),
+        last_active_at: Some(crate::atproto_conv::chrono_to_datetime(view.last_active_at)),
         reserved_package_count: view.reserved_package_count,
-        signature_public_key: Bytes::from(view.signing_public_key.clone()),
-        status: SmolStr::from(view.wire_status()),
-        updated_at: crate::sqlx_jacquard::chrono_to_datetime(view.updated_at),
+        signature_public_key: Bytes(Vec::from(view.signing_public_key.clone())),
+        status: catbird_server::atproto_conv::open_enum(view.wire_status()),
+        updated_at: crate::atproto_conv::chrono_to_datetime(view.updated_at),
         extra_data: None,
     }
 }
@@ -2975,30 +2970,21 @@ fn read_facade_device_view(
 fn read_facade_addressable_device(
     view: &super::device_directory::DeviceDirectoryView,
     user_did: &str,
-) -> Result<
-    catbird_atproto::generated::blue_catbird::chat::AddressableDevice<jacquard_common::DefaultStr>,
-    ExistingDeviceReadFacadeError,
-> {
-    use jacquard_common::deps::smol_str::SmolStr;
-
-    let capability = serde_json::from_str::<
-        catbird_atproto::generated::blue_catbird::chat::DeviceCapability<
-            jacquard_common::DefaultStr,
-        >,
-    >(&view.capabilities_json)
-    .map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
-    let user_did = jacquard_common::types::string::Did::new_owned(user_did)
-        .map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
-    Ok(
-        catbird_atproto::generated::blue_catbird::chat::AddressableDevice {
-            available_package_count: view.available_package_count,
-            capability,
-            device_id: SmolStr::from(view.device_id.to_string()),
-            key_id: SmolStr::from(view.key_id.as_str()),
-            user_did,
-            extra_data: None,
-        },
+) -> Result<catbird_server::blue_catbird::chat::AddressableDevice, ExistingDeviceReadFacadeError> {
+    let capability = serde_json::from_str::<catbird_server::blue_catbird::chat::DeviceCapability>(
+        &view.capabilities_json,
     )
+    .map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
+    let user_did =
+        petrel_core::Did::parse(user_did).map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
+    Ok(catbird_server::blue_catbird::chat::AddressableDevice {
+        available_package_count: view.available_package_count,
+        capability,
+        device_id: String::from(view.device_id.to_string()),
+        key_id: String::from(view.key_id.as_str()),
+        user_did,
+        extra_data: None,
+    })
 }
 
 /// `blue.catbird.chat.getDevices` — the complete repository-owned facade.
@@ -3066,14 +3052,9 @@ async fn read_addressable_devices_in_transaction(
         devices.push(read_facade_addressable_device(&view, &row.user_did)?);
     }
 
-    let output = catbird_atproto::generated::blue_catbird::chat::get_devices::GetDevicesOutput::<
-        jacquard_common::DefaultStr,
-    > {
-        devices,
-        extra_data: None,
-    };
-    let response_bytes =
-        serde_json::to_vec(&output).map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
+    let output = catbird_server::blue_catbird::chat::get_devices::Output { devices };
+    let response_bytes = catbird_server::atproto_conv::wire_json_bytes(&output)
+        .map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
     Ok(CanonicalGetDevicesResponse { response_bytes })
 }
 
@@ -3084,11 +3065,7 @@ enum OwnDeviceSnapshotOutcome {
     Retry,
     /// Materialization succeeded. The generated output is complete but NOT yet
     /// serialized: bytes are produced only after the commit below.
-    Materialized(
-        catbird_atproto::generated::blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<
-            jacquard_common::DefaultStr,
-        >,
-    ),
+    Materialized(catbird_server::blue_catbird::chat::get_own_devices::Output),
 }
 
 /// `blue.catbird.chat.getOwnDevices` — the complete repository-owned facade.
@@ -3131,7 +3108,7 @@ pub(crate) async fn create_own_device_snapshot_for_admission(
                     ExistingDeviceReadFacadeError::Storage
                 })?;
                 // Only NOW may bytes exist.
-                let response_bytes = serde_json::to_vec(&output)
+                let response_bytes = catbird_server::atproto_conv::wire_json_bytes(&output)
                     .map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
                 return Ok(CommittedOwnDeviceSnapshot { response_bytes });
             }
@@ -3218,26 +3195,26 @@ async fn materialize_own_device_snapshot(
             .await
             .map_err(|_| ExistingDeviceReadFacadeError::Storage)?
             .map(|hint| {
-                catbird_atproto::generated::blue_catbird::chat::DirectRequestKeyPoolStats {
+                catbird_server::blue_catbird::chat::DirectRequestKeyPoolStats {
                     enabled: hint.enabled,
                     revision: hint.revision,
                     usable_count: hint.usable_count,
                     reserved_count: hint.reserved_count,
-                    as_of: crate::sqlx_jacquard::chrono_to_datetime(hint.as_of),
-                    usable_until: crate::sqlx_jacquard::chrono_to_datetime(hint.usable_until),
+                    as_of: crate::atproto_conv::chrono_to_datetime(hint.as_of),
+                    usable_until: crate::atproto_conv::chrono_to_datetime(hint.usable_until),
                     extra_data: None,
                 }
             })
         } else {
             None
         };
-        let own = catbird_atproto::generated::blue_catbird::chat::OwnDeviceView {
+        let own = catbird_server::blue_catbird::chat::OwnDeviceView {
             direct_request_key_pool,
             device: read_facade_device_view(view),
             extra_data: None,
         };
-        let payload_bytes =
-            serde_json::to_vec(&own).map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
+        let payload_bytes = catbird_server::atproto_conv::wire_json_bytes(&own)
+            .map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
         subjects.push(DeviceInventorySubject {
             subject_device_id: view.device_id,
             payload_bytes,
@@ -3253,8 +3230,8 @@ async fn materialize_own_device_snapshot(
         return Err(ExistingDeviceReadFacadeError::Invariant);
     }
     for (subject, item) in subjects.iter().zip(items.iter()) {
-        let reserialized =
-            serde_json::to_vec(item).map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
+        let reserialized = catbird_server::atproto_conv::wire_json_bytes(item)
+            .map_err(|_| ExistingDeviceReadFacadeError::Invariant)?;
         if reserialized != subject.payload_bytes {
             return Err(ExistingDeviceReadFacadeError::Invariant);
         }
@@ -3302,16 +3279,12 @@ async fn materialize_own_device_snapshot(
 
     // Single page: the whole own-device set materializes at once, so there is no
     // further page and no continuation cursor.
-    let output =
-        catbird_atproto::generated::blue_catbird::chat::get_own_devices::GetOwnDevicesOutput::<
-            jacquard_common::DefaultStr,
-        > {
-            has_more: false,
-            items,
-            next_page_cursor: None,
-            snapshot_expires_at: crate::sqlx_jacquard::chrono_to_datetime(expires_at),
-            extra_data: None,
-        };
+    let output = catbird_server::blue_catbird::chat::get_own_devices::Output {
+        has_more: false,
+        items,
+        next_page_cursor: None,
+        snapshot_expires_at: crate::atproto_conv::chrono_to_datetime(expires_at),
+    };
     Ok(OwnDeviceSnapshotOutcome::Materialized(output))
 }
 // ===========================================================================
@@ -5396,7 +5369,7 @@ async fn remote_group_session_digest(
 /// guard per attempt; no handler retry exists. The composition is: admission ->
 /// fresh guard -> loader seam -> `verify_inventory_fence` ->
 /// `inventory_authorities` -> C1 typed loaders -> C1 projections ->
-/// `encode_canonical_generated_chat_json_v1` exactly once per item -> retain
+/// `encode_canonical_petrel_chat_json_v1` exactly once per item -> retain
 /// the canonical bytes + response SHA-256 -> page read (exact limit) ->
 /// initial receipt (one deterministic unserved-then-served receipt per
 /// `(session, domain, limit, filter)`) -> `CanonicalInventoryResponse`.
@@ -6783,7 +6756,7 @@ pub(crate) async fn pending_welcome_views_for_conversation(
     for (_, source) in retained_welcome_sources(transaction, user_did, device_id, None).await? {
         let dto = super::super::read_projection::welcome_view(&source)
             .map_err(InventoryRepositoryError::Projection)?;
-        let canonical = super::super::read_projection::encode_canonical_generated_chat_json_v1(
+        let canonical = super::super::read_projection::encode_canonical_petrel_chat_json_v1(
             &dto,
             "blue.catbird.chat.defs#welcomeView",
         )
@@ -7031,8 +7004,8 @@ async fn retained_recovery_inbox_entries(
                     .terminal_at
                     .ok_or(InventoryRepositoryError::DurableRowInvalid)?;
                 RetainedRecoveryWorkTerminal::CompletedByTransition {
-                    terminal_transition_id: SmolStr::from(terminal_transition_id.to_string()),
-                    terminal_at: SmolStr::from(canonical_datetime(terminal_at)),
+                    terminal_transition_id: String::from(terminal_transition_id.to_string()),
+                    terminal_at: String::from(canonical_datetime(terminal_at)),
                 }
             }
             "superseded" => {
@@ -7042,19 +7015,19 @@ async fn retained_recovery_inbox_entries(
                 match row.terminal_revocation_id {
                     Some(terminal_revocation_id) => {
                         RetainedRecoveryWorkTerminal::SupersededByRevocation {
-                            terminal_revocation_id: SmolStr::from(
+                            terminal_revocation_id: String::from(
                                 terminal_revocation_id.to_string(),
                             ),
-                            terminal_at: SmolStr::from(canonical_datetime(terminal_at)),
+                            terminal_at: String::from(canonical_datetime(terminal_at)),
                         }
                     }
                     None => RetainedRecoveryWorkTerminal::SupersededByTransition {
-                        terminal_transition_id: SmolStr::from(
+                        terminal_transition_id: String::from(
                             row.terminal_transition_id
                                 .ok_or(InventoryRepositoryError::DurableRowInvalid)?
                                 .to_string(),
                         ),
-                        terminal_at: SmolStr::from(canonical_datetime(terminal_at)),
+                        terminal_at: String::from(canonical_datetime(terminal_at)),
                     },
                 }
             }
@@ -7357,18 +7330,14 @@ pub(crate) async fn read_device_key_for_admission(
     if derived.as_str() != key_id {
         return Err(DeviceKeyReadError::Invariant);
     }
-    let output =
-        catbird_atproto::generated::blue_catbird::chat::get_device_key::GetDeviceKeyOutput::<
-            jacquard_common::DefaultStr,
-        > {
-            owner_did: jacquard_common::types::string::Did::new_owned(owner)
-                .map_err(|_| DeviceKeyReadError::Invariant)?,
-            device_id: jacquard_common::deps::smol_str::SmolStr::from(device.to_string()),
-            key_id: jacquard_common::deps::smol_str::SmolStr::from(key_id),
-            signature_public_key: jacquard_common::deps::bytes::Bytes::from(public_key),
-            extra_data: None,
-        };
-    let response = serde_json::to_vec(&output).map_err(|_| DeviceKeyReadError::Invariant)?;
+    let output = catbird_server::blue_catbird::chat::get_device_key::Output {
+        owner_did: petrel_core::Did::parse(owner).map_err(|_| DeviceKeyReadError::Invariant)?,
+        device_id: String::from(device.to_string()),
+        key_id: String::from(key_id),
+        signature_public_key: petrel_core::Bytes(Vec::from(public_key)),
+    };
+    let response = catbird_server::atproto_conv::wire_json_bytes(&output)
+        .map_err(|_| DeviceKeyReadError::Invariant)?;
     tx.rollback()
         .await
         .map_err(|_| DeviceKeyReadError::Storage)?;

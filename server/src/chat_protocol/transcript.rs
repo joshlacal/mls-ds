@@ -8,9 +8,8 @@
 use std::{collections::BTreeMap, fmt, sync::OnceLock};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use catbird_atproto::generated::blue_catbird::chat as chat_dto;
+use catbird_server::blue_catbird::chat as chat_dto;
 use ed25519_dalek::{Signature, VerifyingKey};
-use jacquard_common::DefaultStr;
 use serde::{
     de::{self, MapAccess, SeqAccess, Visitor},
     ser::{SerializeMap, SerializeSeq},
@@ -3275,7 +3274,7 @@ pub struct VerifiedControlEntry {
 /// receive products minted from a `VerifiedControlEntry`.
 pub(crate) struct CanonicalControlEntryProducts {
     durable_json: Vec<u8>,
-    response_entry: chat_dto::ConversationEntry<DefaultStr>,
+    response_entry: chat_dto::ConversationEntry,
     canonical_response_json: Vec<u8>,
 }
 
@@ -3543,13 +3542,11 @@ fn normalize_generated_response_json(
                 .get("$bytes")
                 .and_then(SchemaValue::as_str)
                 .ok_or_else(|| AuthPrimitiveError::invalid("generated response DAG-JSON bytes"))?;
-            let decoded = decode_standard_base64(encoded)?;
-            if STANDARD.encode(&decoded) != encoded {
-                return Err(AuthPrimitiveError::invalid(
-                    "generated response noncanonical bytes",
-                ));
-            }
-            Ok(SchemaValue::String(encoded.to_owned()))
+            let canonical =
+                catbird_server::atproto_conv::padded_chat_bytes(encoded).map_err(|_| {
+                    AuthPrimitiveError::invalid("generated response noncanonical bytes")
+                })?;
+            Ok(SchemaValue::String(canonical))
         }
         Some("array") => {
             let values = value
@@ -3620,12 +3617,13 @@ impl CanonicalControlEntryProducts {
 
         let generated_dto_json = serde_json::to_vec(&projection.generated_dto_json_value()?)
             .map_err(|_| AuthPrimitiveError::invalid("generated control entry JSON"))?;
-        let response_entry: chat_dto::ConversationEntry<DefaultStr> =
+        let response_entry: chat_dto::ConversationEntry =
             serde_json::from_slice(&generated_dto_json)
                 .map_err(|_| AuthPrimitiveError::invalid("generated control entry decode"))?;
-        let generated_round_trip = serde_json::to_vec(&response_entry)
-            .map_err(|_| AuthPrimitiveError::invalid("generated control entry encode"))?;
-        let round_tripped: chat_dto::ConversationEntry<DefaultStr> =
+        let generated_round_trip =
+            catbird_server::atproto_conv::wire_json_bytes(&response_entry)
+                .map_err(|_| AuthPrimitiveError::invalid("generated control entry encode"))?;
+        let round_tripped: chat_dto::ConversationEntry =
             serde_json::from_slice(&generated_round_trip)
                 .map_err(|_| AuthPrimitiveError::invalid("generated control entry round-trip"))?;
         if round_tripped != response_entry {
@@ -3658,7 +3656,7 @@ impl CanonicalControlEntryProducts {
         &self.durable_json
     }
 
-    pub(crate) fn response_entry(&self) -> &chat_dto::ConversationEntry<DefaultStr> {
+    pub(crate) fn response_entry(&self) -> &chat_dto::ConversationEntry {
         &self.response_entry
     }
 
@@ -4376,21 +4374,24 @@ mod request_presentation_tests {
                 direct_request_generated_view_wire(&typed, "directRequestState", false).unwrap();
             assert_eq!(wire, value);
             assert_eq!(
-                typed.context_hash.as_ref(),
+                typed.context_hash.0.as_slice(),
                 STANDARD
                     .decode(value["contextHash"].as_str().unwrap())
                     .unwrap()
             );
             assert_eq!(
-                typed.preparation_digest.as_ref(),
+                typed.preparation_digest.0.as_slice(),
                 STANDARD
                     .decode(value["preparationDigest"].as_str().unwrap())
                     .unwrap()
             );
             if accepted {
                 let proof = typed.acceptance_proof.unwrap();
-                assert_eq!(proof.entry.signed_request.signature.as_ref(), &[17u8; 64]);
-                assert_eq!(proof.receipt.signature.as_ref(), &[23u8; 64]);
+                assert_eq!(
+                    proof.entry.signed_request.signature.0.as_slice(),
+                    &[17u8; 64]
+                );
+                assert_eq!(proof.receipt.signature.0.as_slice(), &[23u8; 64]);
             }
         }
     }
@@ -4405,7 +4406,7 @@ mod request_presentation_tests {
             "opaqueWelcome":welcome["opaqueWelcome"],"sha256":welcome["sha256"],
             "recipientDid":delivery["recipientDid"],"recipientDeviceId":delivery["recipientDeviceId"],
             "provenance":delivery["provenance"]});
-        type Welcome = chat_dto::get_pending_welcomes::GetPendingWelcomesOutputItemsItem;
+        type Welcome = chat_dto::get_pending_welcomes::OutputItems;
         let typed: Welcome = decode_direct_request_generated_view(
             &serde_json::to_vec(&view).unwrap(),
             "directRequestWelcomeView",

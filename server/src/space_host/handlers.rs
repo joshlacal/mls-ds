@@ -2,18 +2,14 @@
 
 use std::{collections::BTreeMap, future::Future, sync::Arc, time::Duration};
 
-use atproto_spaces::{
-    http_signature::verify_credential_request,
-    kem::{decapsulate_p256, decode_p256_did_key},
-    lthash::{compute_dagcbor_cid, LtHash},
-    mac::{
-        parse_accept_signature, sign_commit_mac, sign_record_mac, MacProfile,
-        ACCEPT_SIGNATURE_HEADER,
-    },
-    star::{validate_canonical_dagcbor_record, write_star_repo, StarRecordEntry, MAX_RECORD_BYTES},
-    tokens::{SpaceTokenClaims, SpaceTokenKind, CREDENTIAL_DEFAULT_LIFETIME_SECS},
-    SpaceUri, SpacesError,
+use super::tokens::{verify_compact, SpaceTokenClaims, SpaceTokenKind};
+use super::wire::{
+    self, parse_accept_signature, sign_commit_mac, sign_record_mac, ACCEPT_SIGNATURE_HEADER,
+    MAX_RECORD_BYTES,
 };
+use petrel_core::{Did, Nsid, RecordKey, SpaceRef, Tid};
+use petrel_spaces::{decapsulate_p256, decode_p256_did_key, LtHash, MacProfile};
+const CREDENTIAL_DEFAULT_LIFETIME_SECS: u64 = 600;
 use axum::{
     body::Bytes,
     extract::{Query, State},
@@ -150,7 +146,7 @@ fn xrpc_err(status: StatusCode, code: &str, message: impl Into<String>) -> Respo
 }
 
 #[allow(clippy::result_large_err)]
-fn parse_canonical_space_uri(raw: &str, expected_authority: &str) -> Result<SpaceUri, Response> {
+fn parse_canonical_space_uri(raw: &str, expected_authority: &str) -> Result<SpaceRef, Response> {
     // Strict, like the reference host's `space-ref` param validation: only
     // `at:space/{did}/{type}/{skey}`; the alpha `at://{did}/space/...` form and handle
     // authorities are 400 InvalidRequest.
@@ -161,7 +157,7 @@ fn parse_canonical_space_uri(raw: &str, expected_authority: &str) -> Result<Spac
             "space must be an at:space/{did}/{spaceType}/{skey} Space ref",
         )
     })?;
-    if parsed.authority != expected_authority {
+    if parsed.space_did().as_str() != expected_authority {
         return Err(xrpc_err(
             StatusCode::BAD_REQUEST,
             "InvalidSpaceUri",
@@ -431,7 +427,7 @@ async fn authenticate_credential_request_allowing_repo_audience(
         ));
     }
 
-    let cnf_kid = claims.cnf_kid.as_deref().ok_or_else(|| {
+    let cnf_kid = claims.cnf_kid().ok_or_else(|| {
         xrpc_err(
             StatusCode::UNAUTHORIZED,
             "InvalidSpaceCredential",
@@ -439,15 +435,16 @@ async fn authenticate_credential_request_allowing_repo_audience(
         )
     })?;
 
-    let verified_hdrs = verify_credential_request(headers, cnf_kid, now_sec).map_err(|e| {
-        xrpc_err(
-            StatusCode::UNAUTHORIZED,
-            "InvalidSpaceSignature",
-            e.to_string(),
-        )
-    })?;
+    let verified_audience =
+        wire::presentation_audience(headers, cnf_kid, now_sec).map_err(|e| {
+            xrpc_err(
+                StatusCode::UNAUTHORIZED,
+                "InvalidSpaceSignature",
+                e.to_string(),
+            )
+        })?;
 
-    let aud_canon = crate::identity::canonical_did(&verified_hdrs.audience_did);
+    let aud_canon = crate::identity::canonical_did(&verified_audience);
     let matches_authority = aud_canon == runtime.authority_did();
     let matches_repo =
         extra_audience_did.is_some_and(|repo| aud_canon == crate::identity::canonical_did(repo));
@@ -594,12 +591,12 @@ async fn authenticate_service_jwt(
         .resolve_did_entry(iss, false)
         .await
         .map_err(|e| xrpc_err(StatusCode::UNAUTHORIZED, "InvalidToken", e.to_string()))?;
-    if !vk.verify_raw(alg, signing_input.as_bytes(), &sig_bytes) {
+    if !verify_compact(&vk, alg, signing_input.as_bytes(), &sig_bytes) {
         let (vk_refreshed, _, _) = runtime
             .resolve_did_entry(iss, true)
             .await
             .map_err(|e| xrpc_err(StatusCode::UNAUTHORIZED, "InvalidToken", e.to_string()))?;
-        if !vk_refreshed.verify_raw(alg, signing_input.as_bytes(), &sig_bytes) {
+        if !verify_compact(&vk_refreshed, alg, signing_input.as_bytes(), &sig_bytes) {
             return Err(xrpc_err(
                 StatusCode::UNAUTHORIZED,
                 "InvalidToken",
@@ -810,9 +807,6 @@ async fn authorize_space_sync(
             .await
         {
             Ok(c) => c,
-            Err(SpacesError::InvalidClientAttestation(msg)) => {
-                return xrpc_err(StatusCode::BAD_REQUEST, "InvalidClientAttestation", msg);
-            }
             Err(e) => {
                 return xrpc_err(
                     StatusCode::BAD_REQUEST,
@@ -830,8 +824,7 @@ async fn authorize_space_sync(
             );
         }
         if att_claims
-            .cnf_kid
-            .as_deref()
+            .cnf_kid()
             .is_some_and(|kid| kid != credential_key)
         {
             return xrpc_err(
@@ -847,9 +840,6 @@ async fn authorize_space_sync(
         .await
     {
         Ok(c) => c,
-        Err(SpacesError::InvalidDelegationToken(msg)) => {
-            return xrpc_err(StatusCode::UNAUTHORIZED, "InvalidDelegationToken", msg);
-        }
         Err(e) => {
             return xrpc_err(
                 StatusCode::UNAUTHORIZED,
@@ -861,8 +851,7 @@ async fn authorize_space_sync(
 
     if del_claims.sub != space_uri
         || del_claims
-            .cnf_kid
-            .as_deref()
+            .cnf_kid()
             .is_some_and(|kid| kid != credential_key)
     {
         return xrpc_err(
@@ -998,7 +987,9 @@ async fn authorize_space_sync(
         iat: now_sec,
         exp: exp_sec,
         jti: cred_jti.clone(),
-        cnf_kid: Some(credential_key.to_string()),
+        cnf: Some(petrel_spaces::CnfClaim {
+            kid: credential_key.to_string(),
+        }),
     };
     let cred_jwt = match runtime.mint_credential(&cred_claims) {
         Ok(jwt) => jwt,
@@ -1088,7 +1079,7 @@ fn inventory_failure(
 }
 
 fn inventory_commitment(rows: &[WriterRow]) -> Result<[u8; 32], InventoryFailure> {
-    let mut hash = LtHash::empty();
+    let mut hash = [0u8; 2048];
     let mut previous_did: Option<&str> = None;
     for row in rows {
         let Some(repo_rev) = row.repo_rev.as_deref() else {
@@ -1106,7 +1097,7 @@ fn inventory_commitment(rows: &[WriterRow]) -> Result<[u8; 32], InventoryFailure
             ));
         };
         if row.removed_at.is_some()
-            || !atproto_spaces::is_valid_did(&row.writer_did)
+            || Did::parse(&row.writer_did).is_err()
             || repo_rev.len() != 13
             || decode_tid_micros(repo_rev).is_none()
             || row.space_rev.len() != 13
@@ -1126,7 +1117,7 @@ fn inventory_commitment(rows: &[WriterRow]) -> Result<[u8; 32], InventoryFailure
                 "writer inventory commitment is not 32 bytes",
             )
         })?;
-        hash.add_inventory_entry(&row.writer_did, repo_rev, &row.space_rev, data)
+        wire::add_inventory_entry(&mut hash, &row.writer_did, repo_rev, &row.space_rev, data)
             .map_err(|_| {
                 inventory_failure(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1136,7 +1127,7 @@ fn inventory_commitment(rows: &[WriterRow]) -> Result<[u8; 32], InventoryFailure
             })?;
         previous_did = Some(&row.writer_did);
     }
-    Ok(hash.commitment())
+    Ok(Sha256::digest(hash).into())
 }
 
 fn cursor_mac(key: &[u8; 32], payload: &[u8]) -> [u8; 32] {
@@ -1451,13 +1442,14 @@ async fn list_writers_snapshot(
                 "invalid Accept-Signature commit MAC request",
             )
         })?;
-    let shared_secret = decapsulate_p256(runtime.kem_key(), &key_share).map_err(|_| {
-        inventory_failure(
-            StatusCode::BAD_REQUEST,
-            "InvalidSpaceMac",
-            "invalid Accept-Signature KEM key share",
-        )
-    })?;
+    let shared_secret = decapsulate_p256(&runtime.kem_key().to_bytes().into(), &key_share)
+        .map_err(|_| {
+            inventory_failure(
+                StatusCode::BAD_REQUEST,
+                "InvalidSpaceMac",
+                "invalid Accept-Signature KEM key share",
+            )
+        })?;
     let limit = match params.get("limit") {
         None => 100,
         Some(value) => value
@@ -1527,7 +1519,7 @@ async fn list_writers_snapshot(
             end,
         )?);
     }
-    let (mac_headers, _) = sign_commit_mac(
+    let mac_headers = sign_commit_mac(
         &shared_secret,
         &key_share,
         &label,
@@ -2184,7 +2176,7 @@ async fn put_members(
     let mut normalized = Vec::with_capacity(input.members.len());
     for member in &input.members {
         let bare = crate::identity::canonical_did(&member.did).to_string();
-        if bare != member.did || !atproto_spaces::is_atproto_did(&bare) {
+        if bare != member.did || !wire::is_atproto_did(&bare) {
             return xrpc_err(
                 StatusCode::BAD_REQUEST,
                 "InvalidRequest",
@@ -2309,7 +2301,7 @@ async fn remove_members(
     let mut bare_dids = Vec::with_capacity(input.dids.len());
     for did in &input.dids {
         let bare = crate::identity::canonical_did(did).to_string();
-        if bare != *did || !atproto_spaces::is_atproto_did(&bare) {
+        if bare != *did || !wire::is_atproto_did(&bare) {
             return xrpc_err(
                 StatusCode::BAD_REQUEST,
                 "InvalidRequest",
@@ -2556,7 +2548,7 @@ async fn check_access(
 
     let (can_read, can_write) = if let Some(raw_repo) = params.get("repo") {
         let bare = crate::identity::canonical_did(raw_repo);
-        if bare != raw_repo || !atproto_spaces::is_atproto_did(bare) {
+        if bare != raw_repo || !wire::is_atproto_did(bare) {
             return xrpc_err(
                 StatusCode::BAD_REQUEST,
                 "InvalidRequest",
@@ -2688,13 +2680,54 @@ fn atproto_json_to_canonical_dagcbor(record: &Value) -> Result<Vec<u8>, String> 
     if out.is_empty() || out.len() > MAX_RECORD_BYTES {
         return Err(format!("encoded record exceeds {MAX_RECORD_BYTES} bytes"));
     }
-    validate_canonical_dagcbor_record(&out).map_err(|e| e.to_string())?;
+    decode_record(&out)?;
     Ok(out)
 }
 
+fn decode_record(bytes: &[u8]) -> Result<petrel_core::Value, String> {
+    if bytes.len() > MAX_RECORD_BYTES {
+        return Err("record exceeds 1 MiB".into());
+    }
+    let value =
+        petrel_core::dagcbor::decode_with(bytes, petrel_core::dagcbor::Limits::REPOSITORY_BLOCK)
+            .map_err(|e| e.to_string())?;
+    if !matches!(value, petrel_core::Value::Object(_)) {
+        return Err("record must be a map".into());
+    }
+    Ok(value)
+}
+
+fn encode_repo_archive(
+    space: &SpaceRef,
+    repo: &str,
+    rev: &str,
+    expected: &[u8; 32],
+    rows: Vec<(String, String, Vec<u8>)>,
+) -> Result<Vec<u8>, String> {
+    let mut records = Vec::with_capacity(rows.len());
+    for (collection, key, bytes) in rows {
+        records.push((format!("{collection}/{key}"), decode_record(&bytes)?));
+    }
+    let borrowed: Vec<_> = records
+        .iter()
+        .map(|(path, value)| (path.as_str(), value))
+        .collect();
+    let archive = petrel_spaces::write_star_repo(
+        space,
+        &Did::parse(repo).map_err(|e| e.to_string())?,
+        &Tid::parse(rev).map_err(|e| e.to_string())?,
+        &borrowed,
+    )
+    .map_err(|e| e.to_string())?;
+    let metadata = petrel_spaces::read_star_metadata(&archive).map_err(|e| e.to_string())?;
+    if &metadata.data != expected {
+        return Err("stored repository commitment does not match records".into());
+    }
+    Ok(archive)
+}
+
 fn canonical_dagcbor_to_atproto_json(bytes: &[u8]) -> Result<Value, String> {
-    let data: jacquard_common::types::value::Data =
-        serde_ipld_dagcbor::from_slice(bytes).map_err(|e| e.to_string())?;
+    let data = decode_record(bytes)?;
     serde_json::to_value(data).map_err(|e| e.to_string())
 }
 
@@ -2733,7 +2766,7 @@ async fn put_record(
     let space_uri = parsed_space.as_str();
 
     let repo_did = crate::identity::canonical_did(&input.repo).to_string();
-    if repo_did != input.repo || !atproto_spaces::is_atproto_did(&repo_did) {
+    if repo_did != input.repo || !wire::is_atproto_did(&repo_did) {
         return xrpc_err(
             StatusCode::BAD_REQUEST,
             "InvalidRequest",
@@ -2747,9 +2780,9 @@ async fn put_record(
             "putRecord issuer must match repo DID",
         );
     }
-    if !atproto_spaces::is_valid_nsid(&input.collection)
+    if Nsid::parse(&input.collection).is_err()
         || input.collection.starts_with("com.atproto.space.")
-        || !atproto_spaces::is_valid_rkey(&input.rkey)
+        || RecordKey::parse(&input.rkey).is_err()
     {
         return xrpc_err(
             StatusCode::BAD_REQUEST,
@@ -2758,10 +2791,11 @@ async fn put_record(
         );
     }
 
-    let record_uri = match parsed_space.record_uri(&repo_did, &input.collection, &input.rkey) {
-        Ok(u) => u,
-        Err(e) => return xrpc_err(StatusCode::BAD_REQUEST, "InvalidRequest", e.to_string()),
-    };
+    let record_uri =
+        match wire::record_uri(&parsed_space, &repo_did, &input.collection, &input.rkey) {
+            Ok(u) => u,
+            Err(e) => return xrpc_err(StatusCode::BAD_REQUEST, "InvalidRequest", e.to_string()),
+        };
 
     let status = match load_active_space_status(runtime.pool(), space_uri).await {
         Ok(s) => s,
@@ -2790,7 +2824,7 @@ async fn put_record(
         Ok(b) => b,
         Err(msg) => return xrpc_err(StatusCode::BAD_REQUEST, "InvalidRequest", msg),
     };
-    let record_cid = compute_dagcbor_cid(&record_cbor);
+    let record_cid = petrel_core::Cid::for_dag_cbor(&record_cbor);
     let record_cid_str = record_cid.to_string();
 
     let now = crate::sim_hooks::current_utc();
@@ -2921,7 +2955,7 @@ async fn put_record(
         }
     };
 
-    let mut lt = LtHash::empty();
+    let mut lt = LtHash::new();
     for (col, rk, cid_s) in &all_records {
         let Ok(parsed_cid) = cid_s.parse::<cid::Cid>() else {
             return xrpc_err(
@@ -2930,9 +2964,9 @@ async fn put_record(
                 "stored record CID is malformed",
             );
         };
-        lt.add_record(col, rk, &parsed_cid);
+        lt.add_entry(&format!("{col}/{rk}"), &parsed_cid.to_string());
     }
-    let data_cid = lt.commitment();
+    let data_cid = lt.digest();
 
     if let Err(e) = sqlx::query(
         "INSERT INTO chat.conversation_space_writers ( \
@@ -3087,9 +3121,9 @@ async fn get_record(
 
     let repo_did = crate::identity::canonical_did(raw_repo);
     if repo_did != raw_repo
-        || !atproto_spaces::is_atproto_did(repo_did)
-        || !atproto_spaces::is_valid_nsid(collection)
-        || !atproto_spaces::is_valid_rkey(rkey)
+        || !wire::is_atproto_did(repo_did)
+        || Nsid::parse(collection).is_err()
+        || RecordKey::parse(rkey).is_err()
     {
         return xrpc_err(
             StatusCode::BAD_REQUEST,
@@ -3097,7 +3131,7 @@ async fn get_record(
             "invalid repo, collection, or rkey",
         );
     }
-    let record_uri = match parsed_space.record_uri(repo_did, collection, rkey) {
+    let record_uri = match wire::record_uri(&parsed_space, repo_did, collection, rkey) {
         Ok(u) => u,
         Err(e) => return xrpc_err(StatusCode::BAD_REQUEST, "InvalidRequest", e.to_string()),
     };
@@ -3129,7 +3163,8 @@ async fn get_record(
                 "invalid Accept-Signature record MAC request",
             );
         };
-        let Ok(shared_secret) = decapsulate_p256(runtime.kem_key(), &key_share) else {
+        let Ok(shared_secret) = decapsulate_p256(&runtime.kem_key().to_bytes().into(), &key_share)
+        else {
             return xrpc_err(
                 StatusCode::BAD_REQUEST,
                 "InvalidSpaceMac",
@@ -3187,7 +3222,7 @@ async fn get_record(
         .into_response();
 
     if let Some((label, key_share, shared_secret)) = requested_mac {
-        let Ok((mac_headers, _)) =
+        let Ok(mac_headers) =
             sign_record_mac(&shared_secret, &key_share, &label, &record_uri, &cid)
         else {
             return xrpc_err(
@@ -3243,7 +3278,7 @@ async fn get_repo(
     let space_uri = parsed_space.as_str();
 
     let repo_did = crate::identity::canonical_did(raw_repo);
-    if repo_did != raw_repo || !atproto_spaces::is_atproto_did(repo_did) {
+    if repo_did != raw_repo || !wire::is_atproto_did(repo_did) {
         return xrpc_err(
             StatusCode::BAD_REQUEST,
             "InvalidRequest",
@@ -3278,7 +3313,8 @@ async fn get_repo(
                 "invalid Accept-Signature commit MAC request",
             );
         };
-        let Ok(shared_secret) = decapsulate_p256(runtime.kem_key(), &key_share) else {
+        let Ok(shared_secret) = decapsulate_p256(&runtime.kem_key().to_bytes().into(), &key_share)
+        else {
             return xrpc_err(
                 StatusCode::BAD_REQUEST,
                 "InvalidSpaceMac",
@@ -3343,25 +3379,17 @@ async fn get_repo(
         }
     };
 
-    let mut entries: Vec<StarRecordEntry> = record_rows
-        .into_iter()
-        .map(|(col, rk, record_dagcbor)| StarRecordEntry {
-            path: format!("{col}/{rk}"),
-            record_dagcbor,
-        })
-        .collect();
-    entries.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
-
-    let star_bytes = match write_star_repo(space_uri, repo_did, &repo_rev, &data_32, &entries) {
-        Ok(b) => b,
-        Err(e) => {
-            return xrpc_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "InternalServerError",
-                e.to_string(),
-            );
-        }
-    };
+    let star_bytes =
+        match encode_repo_archive(&parsed_space, repo_did, &repo_rev, &data_32, record_rows) {
+            Ok(b) => b,
+            Err(e) => {
+                return xrpc_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                    e.to_string(),
+                );
+            }
+        };
 
     let mut response = (StatusCode::OK, star_bytes).into_response();
     response.headers_mut().insert(
@@ -3370,7 +3398,7 @@ async fn get_repo(
     );
 
     if let Some((label, key_share, shared_secret)) = requested_mac {
-        let Ok((mac_headers, _)) = sign_commit_mac(
+        let Ok(mac_headers) = sign_commit_mac(
             &shared_secret,
             &key_share,
             &label,
@@ -3519,6 +3547,11 @@ mod tests {
             row("did:web:b.example", "3l2aaaaaaaaab", 2),
         ];
         let commitment = inventory_commitment(&rows).unwrap();
+        // Published v1 framing: length-prefixed DID and both revisions, then 32 raw bytes.
+        assert_eq!(
+            hex::encode(commitment),
+            "e3763de1cbe33648c5bd074304affa7d430238e8ac6ddfa08ee5c2d223dbbee3"
+        );
         let changed = vec![
             row("did:web:a.example", "3l2aaaaaaaaaa", 1),
             row("did:web:b.example", "3l2aaaaaaaaab", 3),

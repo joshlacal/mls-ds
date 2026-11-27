@@ -10,13 +10,13 @@
 
 use std::sync::Arc;
 
+use crate::blue_catbird::chat::register_push_gateway::Input as RegisterPushGateway;
 use axum::{
     body::Bytes,
     extract::State,
     http::HeaderMap,
     response::{IntoResponse, Response},
 };
-use catbird_atproto::generated::blue_catbird::chat::register_push_gateway::RegisterPushGateway;
 use chrono::{DateTime, SecondsFormat, Utc};
 use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use serde_json::json;
@@ -149,7 +149,7 @@ async fn register(
     let verifying_key =
         VerifyingKey::from_bytes(&pubkey_arr).map_err(|_| ChatFailure::invariant(ENDPOINT))?;
     let sig_arr: [u8; 64] =
-        input.signature.as_ref().try_into().map_err(|_| {
+        input.signature.0.as_slice().try_into().map_err(|_| {
             ChatFailure::protocol(ENDPOINT, ChatProtocolErrorCode::InvalidSignature)
         })?;
     let signature = Signature::from_bytes(&sig_arr);

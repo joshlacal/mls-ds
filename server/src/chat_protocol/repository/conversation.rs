@@ -9,7 +9,7 @@
 mod recovery;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use jacquard_common::{deps::smol_str::SmolStr, types::string::Did};
+use petrel_core::Did;
 use sqlx::{FromRow, Postgres, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
@@ -22,7 +22,7 @@ use super::super::{
     },
     read_projection::{
         conversation_coordinates_dto, conversation_state_view,
-        encode_canonical_generated_chat_json_v1, CheckedConversationCoordinates,
+        encode_canonical_petrel_chat_json_v1, CheckedConversationCoordinates,
     },
 };
 
@@ -152,16 +152,14 @@ async fn read_conversation_state_in_transaction(
         };
 
         return conversation_state_response(
-            catbird_atproto::generated::blue_catbird::chat::get_conversation_state::
-                GetConversationStateOutput {
-                    account_deletions,
-                    deletions_cursor,
-                    pending_leave_requests,
-                    pending_leaf_recovery_requests: Some(pending_leaf_recovery_requests),
-                    pending_reset_requests,
-                    state,
-                    extra_data: None,
-                },
+            catbird_server::blue_catbird::chat::get_conversation_state::Output {
+                account_deletions,
+                deletions_cursor,
+                pending_leave_requests,
+                pending_leaf_recovery_requests: Some(pending_leaf_recovery_requests),
+                pending_reset_requests,
+                state,
+            },
         );
     }
 
@@ -203,16 +201,14 @@ async fn read_conversation_state_in_transaction(
     };
 
     conversation_state_response(
-        catbird_atproto::generated::blue_catbird::chat::get_conversation_state::
-            GetConversationStateOutput {
-                account_deletions,
-                deletions_cursor,
-                pending_leave_requests: Vec::new(),
-                pending_leaf_recovery_requests: Some(Vec::new()),
-                pending_reset_requests: Vec::new(),
-                state,
-                extra_data: None,
-            },
+        catbird_server::blue_catbird::chat::get_conversation_state::Output {
+            account_deletions,
+            deletions_cursor,
+            pending_leave_requests: Vec::new(),
+            pending_leaf_recovery_requests: Some(Vec::new()),
+            pending_reset_requests: Vec::new(),
+            state,
+        },
     )
 }
 
@@ -252,10 +248,8 @@ const ACCOUNT_DELETED_ENTRY_KIND: &str = "blue.catbird.chat.defs#accountDeletedE
 pub(crate) async fn load_account_deletions(
     transaction: &mut Transaction<'_, Postgres>,
     conversation_id: Uuid,
-) -> Result<
-    Vec<catbird_atproto::generated::blue_catbird::chat::AccountDeletedEntry>,
-    ConversationStateReadError,
-> {
+) -> Result<Vec<catbird_server::blue_catbird::chat::AccountDeletedEntry>, ConversationStateReadError>
+{
     Ok(
         load_account_deletion_page(transaction, conversation_id, None)
             .await?
@@ -269,7 +263,7 @@ pub(crate) async fn load_account_deletion_page(
     after: Option<i64>,
 ) -> Result<
     (
-        Vec<catbird_atproto::generated::blue_catbird::chat::AccountDeletedEntry>,
+        Vec<catbird_server::blue_catbird::chat::AccountDeletedEntry>,
         Option<i64>,
     ),
     ConversationStateReadError,
@@ -357,8 +351,7 @@ pub(crate) async fn load_account_deletion_page(
 /// which re-projects the generated view and proves no signed request material
 /// changed before emitting `{"$bytes"}` presentation.
 fn conversation_state_response(
-    output: catbird_atproto::generated::blue_catbird::chat::get_conversation_state::
-        GetConversationStateOutput,
+    output: catbird_server::blue_catbird::chat::get_conversation_state::Output,
 ) -> Result<CanonicalConversationStateResponse, ConversationStateReadError> {
     let Some(request) = &output.state.direct_request else {
         return Ok(CanonicalConversationStateResponse {
@@ -375,8 +368,8 @@ fn conversation_state_response(
             )?,
         });
     };
-    let mut wire =
-        serde_json::to_value(&output).map_err(|_| ConversationStateReadError::Invariant)?;
+    let mut wire = catbird_server::atproto_conv::wire_json_value(&output)
+        .map_err(|_| ConversationStateReadError::Invariant)?;
     wire["state"]["directRequest"] =
         crate::chat_protocol::transcript::direct_request_generated_view_wire(
             request,
@@ -393,7 +386,7 @@ fn conversation_state_response(
     })
 }
 
-fn append_canonical_array<T: serde::Serialize>(
+fn append_canonical_array<T: serde::Serialize + serde::de::DeserializeOwned + PartialEq>(
     bytes: &mut Vec<u8>,
     values: &[T],
     definition_id: &'static str,
@@ -402,7 +395,7 @@ fn append_canonical_array<T: serde::Serialize>(
         if index != 0 {
             bytes.push(b',');
         }
-        let canonical = encode_canonical_generated_chat_json_v1(value, definition_id)
+        let canonical = encode_canonical_petrel_chat_json_v1(value, definition_id)
             .map_err(|_| ConversationStateReadError::Invariant)?;
         bytes.extend_from_slice(canonical.bytes());
     }
@@ -410,11 +403,11 @@ fn append_canonical_array<T: serde::Serialize>(
 }
 
 fn canonical_conversation_state_response(
-    account_deletions: &[catbird_atproto::generated::blue_catbird::chat::AccountDeletedEntry],
-    state: &catbird_atproto::generated::blue_catbird::chat::ConversationState,
-    pending_leaf_recovery_requests: &[catbird_atproto::generated::blue_catbird::chat::LeafRecoveryView],
-    pending_leave_requests: &[catbird_atproto::generated::blue_catbird::chat::LeaveRequestView],
-    pending_reset_requests: &[catbird_atproto::generated::blue_catbird::chat::ResetRequestView],
+    account_deletions: &[catbird_server::blue_catbird::chat::AccountDeletedEntry],
+    state: &catbird_server::blue_catbird::chat::ConversationState,
+    pending_leaf_recovery_requests: &[catbird_server::blue_catbird::chat::LeafRecoveryView],
+    pending_leave_requests: &[catbird_server::blue_catbird::chat::LeaveRequestView],
+    pending_reset_requests: &[catbird_server::blue_catbird::chat::ResetRequestView],
 ) -> Result<Vec<u8>, ConversationStateReadError> {
     canonical_conversation_state_response_page(
         account_deletions,
@@ -427,15 +420,15 @@ fn canonical_conversation_state_response(
 }
 
 fn canonical_conversation_state_response_page(
-    account_deletions: &[catbird_atproto::generated::blue_catbird::chat::AccountDeletedEntry],
+    account_deletions: &[catbird_server::blue_catbird::chat::AccountDeletedEntry],
     deletions_cursor: Option<i64>,
-    state: &catbird_atproto::generated::blue_catbird::chat::ConversationState,
-    pending_leaf_recovery_requests: &[catbird_atproto::generated::blue_catbird::chat::LeafRecoveryView],
-    pending_leave_requests: &[catbird_atproto::generated::blue_catbird::chat::LeaveRequestView],
-    pending_reset_requests: &[catbird_atproto::generated::blue_catbird::chat::ResetRequestView],
+    state: &catbird_server::blue_catbird::chat::ConversationState,
+    pending_leaf_recovery_requests: &[catbird_server::blue_catbird::chat::LeafRecoveryView],
+    pending_leave_requests: &[catbird_server::blue_catbird::chat::LeaveRequestView],
+    pending_reset_requests: &[catbird_server::blue_catbird::chat::ResetRequestView],
 ) -> Result<Vec<u8>, ConversationStateReadError> {
     let canonical_state =
-        encode_canonical_generated_chat_json_v1(state, "blue.catbird.chat.defs#conversationState")
+        encode_canonical_petrel_chat_json_v1(state, "blue.catbird.chat.defs#conversationState")
             .map_err(|_| ConversationStateReadError::Invariant)?;
     let mut bytes = Vec::with_capacity(canonical_state.bytes().len() + 64);
     bytes.extend_from_slice(br#"{"accountDeletions":["#);
@@ -551,8 +544,8 @@ async fn load_pending_requests(
     conversation_id: Uuid,
 ) -> Result<
     (
-        Vec<catbird_atproto::generated::blue_catbird::chat::LeaveRequestView>,
-        Vec<catbird_atproto::generated::blue_catbird::chat::ResetRequestView>,
+        Vec<catbird_server::blue_catbird::chat::LeaveRequestView>,
+        Vec<catbird_server::blue_catbird::chat::ResetRequestView>,
     ),
     ConversationStateReadError,
 > {
@@ -605,10 +598,8 @@ fn checked_prior(
     epoch: i64,
     group_context_hash: &[u8],
     confirmation_tag: &[u8],
-) -> Result<
-    catbird_atproto::generated::blue_catbird::chat::ConversationCoordinates,
-    ConversationStateReadError,
-> {
+) -> Result<catbird_server::blue_catbird::chat::ConversationCoordinates, ConversationStateReadError>
+{
     let checked = CheckedConversationCoordinates::new(
         &conversation_id.to_string(),
         generation,
@@ -625,75 +616,66 @@ fn checked_prior(
 
 fn canonical_datetime(
     value: DateTime<Utc>,
-) -> catbird_atproto::generated::blue_catbird::chat::CanonicalDatetime {
-    catbird_atproto::generated::blue_catbird::chat::CanonicalDatetime::raw_str(
+) -> catbird_server::blue_catbird::chat::CanonicalDatetime {
+    catbird_server::blue_catbird::chat::CanonicalDatetime::parse(
         value.to_rfc3339_opts(SecondsFormat::Millis, true),
     )
+    .expect("canonical millis UTC is a valid AT Protocol datetime")
 }
 
-fn requester_did(value: &str) -> Result<Did<SmolStr>, ConversationStateReadError> {
-    Did::new(SmolStr::from(value)).map_err(|_| ConversationStateReadError::Invariant)
+fn requester_did(value: &str) -> Result<Did, ConversationStateReadError> {
+    Did::parse(String::from(value)).map_err(|_| ConversationStateReadError::Invariant)
 }
 
 fn reset_view(
     row: PendingResetRow,
     conversation_id: Uuid,
-) -> Result<
-    catbird_atproto::generated::blue_catbird::chat::ResetRequestView,
-    ConversationStateReadError,
-> {
-    Ok(
-        catbird_atproto::generated::blue_catbird::chat::ResetRequestView {
-            conversation_id: SmolStr::from(conversation_id.to_string()),
-            expires_at: canonical_datetime(row.expires_at),
-            prior: checked_prior(
-                conversation_id,
-                row.prior_generation,
-                row.prior_state_version,
-                &row.prior_group_id,
-                row.prior_epoch,
-                &row.prior_group_context_hash,
-                &row.prior_confirmation_tag,
-            )?,
-            reason: SmolStr::from(row.reason),
-            requested_at: canonical_datetime(row.received_at),
-            requester_device_id: SmolStr::from(row.requester_device_id.to_string()),
-            requester_did: requester_did(&row.requester_did)?,
-            reset_request_id: SmolStr::from(row.reset_request_id.to_string()),
-            status: catbird_atproto::generated::blue_catbird::chat::ResetRequestViewStatus::Pending,
-            extra_data: None,
-        },
-    )
+) -> Result<catbird_server::blue_catbird::chat::ResetRequestView, ConversationStateReadError> {
+    Ok(catbird_server::blue_catbird::chat::ResetRequestView {
+        conversation_id: String::from(conversation_id.to_string()),
+        expires_at: canonical_datetime(row.expires_at),
+        prior: checked_prior(
+            conversation_id,
+            row.prior_generation,
+            row.prior_state_version,
+            &row.prior_group_id,
+            row.prior_epoch,
+            &row.prior_group_context_hash,
+            &row.prior_confirmation_tag,
+        )?,
+        reason: catbird_server::atproto_conv::open_enum(row.reason),
+        requested_at: canonical_datetime(row.received_at),
+        requester_device_id: String::from(row.requester_device_id.to_string()),
+        requester_did: requester_did(&row.requester_did)?,
+        reset_request_id: String::from(row.reset_request_id.to_string()),
+        status: catbird_server::blue_catbird::chat::ResetRequestViewStatus::Pending,
+        extra_data: None,
+    })
 }
 
 fn leave_view(
     row: PendingLeaveRow,
     conversation_id: Uuid,
-) -> Result<
-    catbird_atproto::generated::blue_catbird::chat::LeaveRequestView,
-    ConversationStateReadError,
-> {
-    Ok(
-        catbird_atproto::generated::blue_catbird::chat::LeaveRequestView {
-            conversation_id: SmolStr::from(conversation_id.to_string()),
-            expires_at: canonical_datetime(row.expires_at),
-            leave_request_id: SmolStr::from(row.leave_request_id.to_string()),
-            prior: checked_prior(
-                conversation_id,
-                row.prior_generation,
-                row.prior_state_version,
-                &row.prior_group_id,
-                row.prior_epoch,
-                &row.prior_group_context_hash,
-                &row.prior_confirmation_tag,
-            )?,
-            requested_at: canonical_datetime(row.received_at),
-            requester_device_id: SmolStr::from(row.requester_device_id.to_string()),
-            requester_did: requester_did(&row.requester_did)?,
-            status: SmolStr::from("pending"),
-            extra_data: None,
-        },
-    )
+) -> Result<catbird_server::blue_catbird::chat::LeaveRequestView, ConversationStateReadError> {
+    Ok(catbird_server::blue_catbird::chat::LeaveRequestView {
+        conversation_id: String::from(conversation_id.to_string()),
+        expires_at: canonical_datetime(row.expires_at),
+        leave_request_id: String::from(row.leave_request_id.to_string()),
+        prior: checked_prior(
+            conversation_id,
+            row.prior_generation,
+            row.prior_state_version,
+            &row.prior_group_id,
+            row.prior_epoch,
+            &row.prior_group_context_hash,
+            &row.prior_confirmation_tag,
+        )?,
+        requested_at: canonical_datetime(row.received_at),
+        requester_device_id: String::from(row.requester_device_id.to_string()),
+        requester_did: requester_did(&row.requester_did)?,
+        status: catbird_server::atproto_conv::open_enum("pending"),
+        extra_data: None,
+    })
 }
 
 /// `participantView.labyrinthHead` (labyrinth design §1a, Y5): each
@@ -705,7 +687,7 @@ fn leave_view(
 /// test harnesses `include!` this file into their own crates.
 async fn attach_labyrinth_heads(
     transaction: &mut Transaction<'_, Postgres>,
-    participants: &mut [catbird_atproto::generated::blue_catbird::chat::ParticipantView<SmolStr>],
+    participants: &mut [catbird_server::blue_catbird::chat::ParticipantView],
 ) -> Result<(), sqlx::Error> {
     if participants.is_empty() {
         return Ok(());
@@ -734,14 +716,12 @@ async fn attach_labyrinth_heads(
             .iter()
             .find(|(did, ..)| did == participant.user_did.as_str())
         {
-            participant.labyrinth_head = Some(
-                catbird_atproto::generated::blue_catbird::chat::LabyrinthHead {
-                    attestation_key_id: SmolStr::from(key_id.as_str()),
-                    epoch_head: jacquard_common::deps::bytes::Bytes::copy_from_slice(head),
-                    epoch_number: *epoch_number,
-                    extra_data: None,
-                },
-            );
+            participant.labyrinth_head = Some(catbird_server::blue_catbird::chat::LabyrinthHead {
+                attestation_key_id: String::from(key_id.as_str()),
+                epoch_head: petrel_core::Bytes(<[u8]>::to_vec(head)),
+                epoch_number: *epoch_number,
+                extra_data: None,
+            });
         }
     }
     Ok(())
@@ -795,9 +775,11 @@ mod tests {
             "../../../tests/fixtures/chat_protocol_g7_canonical_json_v1.json"
         ))
         .expect("parse fixture");
-        let state: catbird_atproto::generated::blue_catbird::chat::ConversationState<
-            jacquard_common::DefaultStr,
-        > = serde_json::from_value(fixture["vectors"][0]["value"].clone())
+        let state: catbird_server::blue_catbird::chat::ConversationState =
+            catbird_server::chat_protocol::retained_json::decode_definition(
+                "conversationState",
+                fixture["vectors"][0]["value"].clone(),
+            )
             .expect("decode fixture state");
         let conversation_id = Uuid::new_v4();
         let pending_leave_requests = (0..2)
@@ -895,9 +877,11 @@ mod tests {
             "../../../tests/fixtures/chat_protocol_g7_canonical_json_v1.json"
         ))
         .expect("parse fixture");
-        let mut state: catbird_atproto::generated::blue_catbird::chat::ConversationState<
-            jacquard_common::DefaultStr,
-        > = serde_json::from_value(fixture["vectors"][0]["value"].clone())
+        let mut state: catbird_server::blue_catbird::chat::ConversationState =
+            catbird_server::chat_protocol::retained_json::decode_definition(
+                "conversationState",
+                fixture["vectors"][0]["value"].clone(),
+            )
             .expect("decode fixture state");
         let without: serde_json::Value = serde_json::from_slice(
             &canonical_conversation_state_response(&[], &state, &[], &[], &[])
@@ -907,14 +891,13 @@ mod tests {
         assert!(without
             .pointer("/state/participants/0/labyrinthHead")
             .is_none());
-        state.participants[0].labyrinth_head = Some(
-            catbird_atproto::generated::blue_catbird::chat::LabyrinthHead {
-                attestation_key_id: SmolStr::from("key-id"),
-                epoch_head: jacquard_common::deps::bytes::Bytes::from_static(&[7; 32]),
+        state.participants[0].labyrinth_head =
+            Some(catbird_server::blue_catbird::chat::LabyrinthHead {
+                attestation_key_id: String::from("key-id"),
+                epoch_head: petrel_core::Bytes(<[u8]>::to_vec(&[7; 32])),
                 epoch_number: 3,
                 extra_data: None,
-            },
-        );
+            });
         let with: serde_json::Value = serde_json::from_slice(
             &canonical_conversation_state_response(&[], &state, &[], &[], &[])
                 .expect("encode with head"),

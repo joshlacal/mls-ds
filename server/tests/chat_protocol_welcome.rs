@@ -30,8 +30,12 @@
 mod common;
 
 pub use catbird_server::{
-    atproto_bytes, auth, crypto, federation, handlers, identity, sim_hooks, sqlx_jacquard, util,
+    atproto_bytes, atproto_conv, auth, config, crypto, federation, handlers, identity, sim_hooks,
+    util,
 };
+
+#[path = "common/chat_protocol_labyrinth.rs"]
+pub mod labyrinth;
 
 #[path = "common/chat_protocol_harness.rs"]
 mod chat_protocol;

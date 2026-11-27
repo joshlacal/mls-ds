@@ -3,7 +3,7 @@
 //! non-shipping proof copy. All values below are fabricated and unminted.
 #![cfg(all(test, feature = "test-support"))]
 
-use catbird_atproto::generated::blue_catbird::chat::SubscriptionMessage;
+use catbird_server::blue_catbird::chat::SubscriptionMessage;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::path::Path;

@@ -8,10 +8,9 @@
 #[cfg(test)]
 use std::sync::Arc;
 
-use catbird_atproto::generated::blue_catbird::chat as chat_dto;
+use catbird_server::blue_catbird::chat as chat_dto;
 use chrono::SecondsFormat;
 use chrono::{DateTime, Duration, Utc};
-use jacquard_common::DefaultStr;
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 use sqlx::{Acquire, FromRow, Postgres, Transaction};
@@ -322,8 +321,8 @@ impl ResetCanonicalResponse {
         requested_at: DateTime<Utc>,
         expires_at: DateTime<Utc>,
     ) -> Result<Self, ResetFacadeError> {
-        let output: chat_dto::request_reset::RequestResetOutput<DefaultStr> =
-            serde_json::from_value(json!({
+        let output: chat_dto::request_reset::Output =
+            catbird_server::chat_protocol::retained_json::decode_output("blue.catbird.chat.requestReset", json!({
                 "entry": parse_json(entry_json)?,
                 "resetRequest": {
                     "resetRequestId": reset_request_id.hyphenated().to_string(),
@@ -341,8 +340,11 @@ impl ResetCanonicalResponse {
                 tracing::warn!(%error, "requestReset canonical response does not decode as RequestResetOutput");
                 ResetFacadeError::InvalidCanonicalMaterial
             })?;
-        let bytes =
-            serde_json::to_vec(&output).map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
+        let bytes = catbird_server::chat_protocol::retained_json::encode_output(
+            "blue.catbird.chat.requestReset",
+            &output,
+        )
+        .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
         Self::new(ResetOperationEndpoint::RequestReset, bytes)
     }
 
@@ -351,15 +353,21 @@ impl ResetCanonicalResponse {
         retired: &PublicGroupSnapshotCoordinate,
         successor: &PublicGroupSnapshotCoordinate,
     ) -> Result<Self, ResetFacadeError> {
-        let output: chat_dto::activate_reset::ActivateResetOutput<DefaultStr> =
-            serde_json::from_value(json!({
-                "entry": parse_json(entry_json)?,
-                "retiredCoordinates": coordinate_json(retired)?,
-                "successorCoordinates": coordinate_json(successor)?,
-            }))
+        let output: chat_dto::activate_reset::Output =
+            catbird_server::chat_protocol::retained_json::decode_output(
+                "blue.catbird.chat.activateReset",
+                json!({
+                    "entry": parse_json(entry_json)?,
+                    "retiredCoordinates": coordinate_json(retired)?,
+                    "successorCoordinates": coordinate_json(successor)?,
+                }),
+            )
             .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
-        let bytes =
-            serde_json::to_vec(&output).map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
+        let bytes = catbird_server::chat_protocol::retained_json::encode_output(
+            "blue.catbird.chat.activateReset",
+            &output,
+        )
+        .map_err(|_| ResetFacadeError::InvalidCanonicalMaterial)?;
         Self::new(ResetOperationEndpoint::ActivateReset, bytes)
     }
 
@@ -4039,7 +4047,7 @@ mod canonical_response_tests {
                 "{field} must be a $bytes object"
             );
         }
-        serde_json::from_value::<chat_dto::ConversationCoordinates<DefaultStr>>(json)
+        serde_json::from_value::<chat_dto::ConversationCoordinates>(json)
             .expect("coordinate must decode as the generated DTO");
     }
 }

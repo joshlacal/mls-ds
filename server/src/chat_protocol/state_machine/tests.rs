@@ -33,7 +33,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine,
 };
-use catbird_atproto::generated::blue_catbird::chat as chat_dto;
+use catbird_server::blue_catbird::chat as chat_dto;
 use ed25519_dalek::{Signer, SigningKey};
 use openmls::prelude::{tls_codec::Serialize as TlsSerialize, *};
 use openmls_basic_credential::SignatureKeyPair;
@@ -3135,19 +3135,13 @@ fn existing_direct_creation_result_requires_and_round_trips_its_union_type() {
     });
     let missing_type = serde_json::to_string(&serde_json::json!({ "result": result.clone() }))
         .expect("serialize missing type");
-    assert!(
-        serde_json::from_str::<chat_dto::create_conversation::CreateConversationOutput>(
-            &missing_type
-        )
-        .is_err()
-    );
+    assert!(serde_json::from_str::<chat_dto::create_conversation::Output>(&missing_type).is_err());
 
     result["$type"] = serde_json::json!("blue.catbird.chat.defs#existingDirectConversationResult");
     let tagged = serde_json::to_string(&serde_json::json!({ "result": result }))
         .expect("serialize tagged result");
-    let decoded =
-        serde_json::from_str::<chat_dto::create_conversation::CreateConversationOutput>(&tagged)
-            .expect("typed existing direct result");
+    let decoded = serde_json::from_str::<chat_dto::create_conversation::Output>(&tagged)
+        .expect("typed existing direct result");
     let encoded = serde_json::to_value(decoded).expect("serialize typed result");
     assert_eq!(
         encoded["result"]["$type"],

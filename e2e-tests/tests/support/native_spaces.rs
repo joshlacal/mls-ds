@@ -7,22 +7,27 @@
 //! PDS semantics follow catbird-sim's `SimPds` and catbird-mls's
 //! `NativeArchiveAuthFixture`, over HTTP: an opaque OAuth bearer per account;
 //! `getDelegationToken` minted with the account's `#atproto` key; personal
-//! mailbox credentials from `getSpaceCredential` (conversation credentials come
+//! mailbox credentials from `authorizeSpaceSync` (conversation credentials come
 //! from the real mls-ds SpaceHost); RFC 9421 credential reads whose audience is
-//! the writer, with `Atproto-Space-Want-Mac` answered from the writer's
+//! the writer, with `Accept-Signature` answered from the writer's
 //! `#atproto_kem` secret; real DAG-CBOR CIDs, LtHash commits, `listRepoOps`
 //! replay and STAR `getRepo`. A conversation-Space write commits only after the
-//! Space authority accepts the PDS's service-authenticated `notifyWrite`.
-//! `notifyCredentialRevoked` / `notifySpaceDeleted` must carry the authority's
-//! service auth. DID documents live in one [`DidDirectory`] (the stand-in for
-//! PLC / did:web) that every PDS's `resolveDid` serves.
+//! Space authority accepts the PDS's service-authenticated `notifyRepoUpdate`.
+//! Credential revocations require the authority's service auth. The active
+//! deletion webhook requires a token confirmed by the registration handshake.
+//! DID documents live in one [`DidDirectory`] (the stand-in for PLC / did:web)
+//! that every PDS's `resolveDid` serves.
 // The PDS handlers' `Err` is the XRPC error response itself.
 #![allow(clippy::result_large_err)]
+
+#[path = "../../../server/tests/common/space_fixtures.rs"]
+mod space_fixtures;
+pub use space_fixtures::delegation;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     future::Future,
-    io::{BufRead as _, BufReader},
+    io::{BufRead as _, BufReader, Write as _},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
@@ -34,23 +39,6 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use atproto_spaces::{
-    did_resolver::{DidDocument, StaticDidResolver},
-    http_signature::verify_credential_request,
-    kem::{decapsulate_p256, decode_p256_did_key, encode_p256_did_key},
-    lthash::{compute_dagcbor_cid, LtHash},
-    mac::{
-        compute_commit_mac, compute_record_mac, format_commit_mac_header, format_record_mac_header,
-        parse_want_mac_header, COMMIT_MAC_TYPE, RECORD_MAC_TYPE, SPACE_MAC_HEADER_NAME,
-        SPACE_WANT_MAC_HEADER_NAME,
-    },
-    star::{validate_canonical_dagcbor_record, write_star_repo, StarRecordEntry},
-    tokens::{
-        mint_space_token, verify_space_token, SpaceSigningKey, SpaceTokenClaims, SpaceTokenKind,
-        ATPROTO_KEY_ID, CREDENTIAL_DEFAULT_LIFETIME_SECS, DELEGATION_MAX_LIFETIME_SECS,
-    },
-    SpaceUri,
-};
 use axum::{
     body::{Body, Bytes},
     extract::State,
@@ -75,6 +63,14 @@ use p256::{
     ecdsa::{signature::Signer as _, Signature, SigningKey, VerifyingKey},
     pkcs8::{EncodePrivateKey as _, LineEnding},
     PublicKey, SecretKey,
+};
+use petrel_core::{AtUri, Did, SpaceRef};
+use petrel_spaces::{
+    compute_dagcbor_cid, decapsulate_p256, decode_p256_did_key, encode_p256_did_key,
+    extract_signing_key, mint_credential_token, parse_accept_signature, parse_space_ref,
+    sign_commit_mac, sign_record_mac, verify_credential_request, verify_credential_token,
+    verify_delegation_token, verify_json_value_for_dag_cbor, write_star_repo, LtHash, MacProfile,
+    SigningKeyPair, SpaceDidDocument, SpaceMacHeaders, StaticDidResolver,
 };
 use rand::RngCore as _;
 use serde_json::{json, Value};
@@ -108,8 +104,9 @@ pub fn p256_to_pem(key: &SigningKey) -> String {
 }
 
 /// `did:key:zDn…` of a P-256 key, as published in `Multikey` verification methods.
-fn did_key(key: &PublicKey) -> String {
-    encode_p256_did_key(key)
+pub fn did_key(key: &PublicKey) -> String {
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    encode_p256_did_key(key.to_encoded_point(true).as_bytes()).expect("fixture P-256 key")
 }
 
 /// An ES256 atproto service-auth JWT (`iss`, `aud`, `lxm`, 60 s), as a PDS mints it.
@@ -132,19 +129,16 @@ pub fn mint_es256_service_jwt(key: &SigningKey, iss: &str, aud: &str, lxm: &str)
     )
 }
 
-fn space_signer(key: &SigningKey) -> SpaceSigningKey {
-    SpaceSigningKey::P256 {
-        signing_key: key.clone(),
-        kid: ATPROTO_KEY_ID.to_owned(),
-    }
+fn space_signer(key: &SigningKey) -> SigningKeyPair {
+    SigningKeyPair::from_p256_bytes(&key.to_bytes()).expect("fixture P-256 key")
 }
 
 // ---------------------------------------------------------------------------
 // DID directory
 // ---------------------------------------------------------------------------
 
-/// Every published DID document (accounts, PDSes' accounts, DSes), served by
-/// each PDS's `com.atproto.identity.resolveDid`.
+/// Published test DID documents, shared by the simulated identity authorities and
+/// the PDS `com.atproto.identity.resolveDid` endpoint.
 #[derive(Clone, Default)]
 pub struct DidDirectory(Arc<RwLock<BTreeMap<String, Value>>>);
 
@@ -162,16 +156,17 @@ impl DidDirectory {
     }
 
     /// `did`'s document parsed the way the client and the DS parse it.
-    fn parsed(&self, did: &str) -> Option<DidDocument> {
+    fn parsed(&self, did: &str) -> Option<SpaceDidDocument> {
         let document = self.document(did)?;
-        DidDocument::parse_json(did, &serde_json::to_vec(&document).ok()?).ok()
+        let parsed: SpaceDidDocument = serde_json::from_value(document).ok()?;
+        (parsed.id.as_str() == did).then_some(parsed)
     }
 
     /// Token verification resolves the issuer from its published document only.
     fn resolver(&self, did: &str) -> StaticDidResolver {
-        let resolver = StaticDidResolver::new();
+        let mut resolver = StaticDidResolver::new();
         if let Some(document) = self.parsed(did) {
-            resolver.insert(document);
+            resolver.insert_document(document);
         }
         resolver
     }
@@ -184,7 +179,7 @@ impl DidDirectory {
 #[derive(Clone)]
 struct Record {
     value: Value,
-    dagcbor: Vec<u8>,
+    typed: petrel_core::Value,
     cid: String,
 }
 
@@ -214,8 +209,11 @@ struct World {
     /// Blobs committed into a Space: `(space, repo, cid)`.
     space_blobs: BTreeMap<(String, String, String), Vec<u8>>,
     spent_delegations: BTreeSet<String>,
-    /// Revoked credential `jti` -> expiry (seconds).
-    revoked: BTreeMap<String, u64>,
+    /// Revoked (space, credential identifier) -> expiry (seconds).
+    revoked: BTreeMap<(String, String), u64>,
+    /// (Space, opaque subscriber token) -> confirmed by the authority's challenge.
+    registrations: BTreeMap<(String, String), bool>,
+    created_spaces: BTreeSet<String>,
     deleted_spaces: BTreeSet<String>,
     sequence: u64,
 }
@@ -233,6 +231,7 @@ struct Pds {
     directory: DidDirectory,
     http: reqwest::Client,
     world: Mutex<World>,
+    public_heads: tokio::sync::Mutex<BTreeMap<String, SignedPublicHead>>,
 }
 
 /// A loopback ATProto PDS. `supports_spaces == false` is a pre-Spaces PDS:
@@ -245,7 +244,7 @@ pub struct SpacesPds {
 
 /// A validated `applyWrites`, visible only after [`Pds::commit`].
 struct StagedWrite {
-    space: SpaceUri,
+    space: SpaceRef,
     repo: String,
     base_micros: u64,
     next: Repo,
@@ -268,6 +267,7 @@ impl SpacesPds {
                 .build()
                 .unwrap(),
             world: Mutex::new(World::default()),
+            public_heads: Default::default(),
         });
         let app = Router::new().fallback(handle).with_state(inner.clone());
         tokio::spawn(async move {
@@ -278,6 +278,13 @@ impl SpacesPds {
             base_url,
             inner,
         }
+    }
+
+    pub fn client_transport(&self, home_ds: &str) -> ClientTransport {
+        ClientTransport::new(
+            vec![home_ds.to_owned(), self.base_url.clone()],
+            self.inner.directory.clone(),
+        )
     }
 
     /// Hosts `did` here: its `#atproto` key, a fresh `#atproto_kem` key and the
@@ -299,7 +306,7 @@ impl SpacesPds {
                      "publicKeyMultibase": multikey(&kem_did_key)},
                 ],
                 "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer",
-                             "serviceEndpoint": self.base_url}],
+                             "serviceEndpoint": self.base_url.replacen("http://", "https://", 1)}],
             }),
         );
         let mut world = self.inner.world.lock().unwrap();
@@ -365,7 +372,18 @@ impl SpacesPds {
             .unwrap()
             .repos
             .get(&(space.to_owned(), repo.to_owned()))
-            .map(|repo| (tid(repo.rev_micros, 0), repo.hash.commitment()))
+            .map(|repo| (tid(repo.rev_micros, 0), repo.hash.digest()))
+    }
+
+    pub fn notify_registration(&self, space: &str) -> Value {
+        let token = Uuid::new_v4().to_string();
+        self.inner
+            .world
+            .lock()
+            .unwrap()
+            .registrations
+            .insert((space.to_owned(), token.clone()), false);
+        json!({"endpoint": self.base_url, "token": token})
     }
 
     pub fn space_deleted(&self, space: &str) -> bool {
@@ -385,6 +403,20 @@ async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // BIRDaemon's loopback transport maps canonical PLC requests to this prefix.
+    if method == Method::GET {
+        if let Some(did) = uri
+            .path()
+            .strip_prefix("/plc.directory/")
+            .filter(|did| did.starts_with("did:plc:"))
+        {
+            return pds
+                .directory
+                .document(did)
+                .map(ok)
+                .unwrap_or_else(|| err(404, "NotFound", did));
+        }
+    }
     let Some(nsid) = uri.path().strip_prefix("/xrpc/") else {
         return err(404, "NotFound", uri.path());
     };
@@ -400,6 +432,13 @@ async fn handle(
         );
     }
     let reply = match (method.as_str(), nsid) {
+        (
+            "GET",
+            "com.atproto.sync.getRecord"
+            | "com.atproto.sync.getLatestCommit"
+            | "com.atproto.sync.getBlocks"
+            | "com.atproto.sync.getRepo",
+        ) => pds.read_public_repository(nsid, &params).await,
         ("POST", "com.atproto.space.applyWrites") => pds.apply_writes(&headers, &body).await,
         ("POST", "com.atproto.space.deleteRecord") => {
             pds.delete_space_record(&headers, &body).await
@@ -407,6 +446,54 @@ async fn handle(
         _ => pds.handle_sync(&method, nsid, &params, &headers, &body),
     };
     reply.unwrap_or_else(|reply| reply)
+}
+
+/// A writer's signed public repository, maintained alongside its public XRPC records.
+struct SignedPublicHead {
+    repo: petrel_repo::Repository,
+    records: BTreeMap<(String, String), String>,
+}
+
+impl SignedPublicHead {
+    async fn refresh(
+        &mut self,
+        current: &BTreeMap<(String, String), Record>,
+        signer: &petrel_repo::P256Keypair,
+    ) -> Result<()> {
+        use petrel_repo::{
+            repository::{create_op, update_op},
+            RepositoryPath, WriteBatch, WriteOp,
+        };
+        let mut writes = Vec::new();
+        for ((collection, rkey), record) in current {
+            match self.records.get(&(collection.clone(), rkey.clone())) {
+                Some(cid) if cid == &record.cid => {}
+                Some(_) => writes.push(update_op(collection, rkey, &record.typed)?),
+                None => writes.push(create_op(collection, rkey, &record.typed)?),
+            }
+        }
+        for (collection, rkey) in self
+            .records
+            .keys()
+            .filter(|key| !current.contains_key(*key))
+        {
+            writes.push(WriteOp::Delete {
+                path: RepositoryPath::new(collection, rkey)?,
+            });
+        }
+        if !writes.is_empty() {
+            self.repo = self
+                .repo
+                .commit_writes(WriteBatch::new(writes)?, signer)
+                .await?
+                .repository;
+            self.records = current
+                .iter()
+                .map(|(key, r)| (key.clone(), r.cid.clone()))
+                .collect();
+        }
+        Ok(())
+    }
 }
 
 impl Pds {
@@ -427,7 +514,9 @@ impl Pds {
                     None => Err(err(404, "DidNotFound", did)),
                 }
             }
-            ("POST", "com.atproto.repo.putRecord") => self.put_record(headers, body),
+            ("POST", "com.atproto.repo.createRecord" | "com.atproto.repo.putRecord") => {
+                self.write_public_record(nsid, headers, body)
+            }
             ("GET", "com.atproto.repo.getRecord") => self.get_record(params),
             ("GET", "com.atproto.repo.listRecords") => self.list_records(params),
             ("POST", "com.atproto.repo.deleteRecord") => self.delete_record(headers, body),
@@ -435,11 +524,17 @@ impl Pds {
             // Staged and Space-scoped blobs never enter public blob storage (Gate 10).
             ("GET", "com.atproto.sync.getBlob") => Err(err(404, "BlobNotFound", "no public blobs")),
             ("GET", "com.atproto.server.getServiceAuth") => self.service_auth(headers, params),
+            ("POST", "com.atproto.space.createSpace") => self.create_space(headers, body),
             ("GET", "com.atproto.space.getSpace") => self.get_space(headers, params),
             ("GET", "com.atproto.space.getDelegationToken") => {
                 self.delegation_token(headers, params, now)
             }
-            ("POST", "com.atproto.space.getSpaceCredential") => self.space_credential(body, now),
+            ("POST", "com.atproto.space.getSpaceCredential") => {
+                self.space_credential(body, now, "credentialKid")
+            }
+            ("POST", "com.atproto.space.authorizeSpaceSync") => {
+                self.space_credential(body, now, "credentialKey")
+            }
             ("GET", "com.atproto.space.listSpaces") => self.list_spaces(headers),
             (
                 "GET",
@@ -450,14 +545,106 @@ impl Pds {
                 | "com.atproto.space.getLatestCommit"
                 | "com.atproto.space.getBlob",
             ) => self.read(nsid, params, headers, now),
-            ("POST", "com.atproto.space.notifyCredentialRevoked") => {
-                self.credentials_revoked(headers, body, now)
-            }
+            (
+                "POST",
+                "com.atproto.space.notifyCredentialRevoked"
+                | "com.atproto.space.notifyCredentialsRevoked",
+            ) => self.credentials_revoked(nsid, headers, body, now),
+            (
+                "POST",
+                "com.atproto.space.confirmRegistration" | "com.atproto.space.notifySpaceUpdate",
+            ) => self.subscriber_notice(nsid, body),
             ("POST", "com.atproto.space.notifySpaceDeleted") => {
                 self.space_deleted(headers, body, now)
             }
             _ => Err(err(501, "MethodNotImplemented", nsid)),
         }
+    }
+
+    async fn signed_public_repository(
+        &self,
+        did: &str,
+    ) -> Result<petrel_repo::Repository, Response> {
+        let mut heads = self.public_heads.lock().await;
+        let (records, key) = {
+            let world = self.world.lock().unwrap();
+            let account = world
+                .accounts
+                .get(did)
+                .ok_or_else(|| err(404, "RepoNotFound", did))?;
+            let records = world
+                .public
+                .iter()
+                .filter(|((repo, _, _), _)| repo == did)
+                .map(|((_, c, r), record)| ((c.clone(), r.clone()), record.clone()))
+                .collect::<BTreeMap<_, _>>();
+            (records, account.key.to_bytes())
+        };
+        let result: anyhow::Result<petrel_repo::Repository> = async {
+            let signer = petrel_repo::P256Keypair::from_bytes(&key.into())?;
+            let head = match heads.entry(did.to_owned()) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(SignedPublicHead {
+                        repo: petrel_repo::Repository::create(Did::parse(did)?, &signer).await?,
+                        records: BTreeMap::new(),
+                    })
+                }
+            };
+            head.refresh(&records, &signer).await?;
+            Ok(head.repo.clone())
+        }
+        .await;
+        result.map_err(|e| err(500, "RepoProofFailed", e))
+    }
+
+    async fn read_public_repository(&self, nsid: &str, params: &BTreeMap<String, String>) -> Reply {
+        use petrel_repo::{car::varint::push_varint, BlockSource as _};
+        let did = required(params, "did")?;
+        let repo = self.signed_public_repository(did).await?;
+        let problem = |e: &dyn std::fmt::Display| err(500, "RepoProofFailed", e);
+        let car = match nsid {
+            "com.atproto.sync.getLatestCommit" => {
+                return Ok(ok(json!({
+                    "cid": repo.commit().cid.to_string(), "rev": repo.revision().to_string()
+                })))
+            }
+            "com.atproto.sync.getRecord" => {
+                let c = required(params, "collection")?;
+                let r = required(params, "rkey")?;
+                let proof = repo.record_proof(c, r).await.map_err(|e| problem(&e))?;
+                // An absent record still has a signed MST non-membership proof.
+                proof.car().map_err(|e| problem(&e))?
+            }
+            "com.atproto.sync.getBlocks" => {
+                let id = petrel_core::Cid::parse(required(params, "cids")?)
+                    .map_err(|e| err(400, "InvalidRequest", e))?;
+                let bytes = repo
+                    .store()
+                    .get_block(&id)
+                    .await
+                    .map_err(|e| problem(&e))?
+                    .ok_or_else(|| err(404, "BlockNotFound", &id))?;
+                // getBlocks carries individual blocks in a rootless CAR. Repository
+                // exports and inclusion proofs instead carry their signed commit root.
+                let header = serde_ipld_dagcbor::to_vec(&json!({"roots": [], "version": 1}))
+                    .map_err(|e| problem(&e))?;
+                let mut output = Vec::new();
+                push_varint(header.len() as u64, &mut output).map_err(|e| problem(&e))?;
+                output.extend_from_slice(&header);
+                push_varint((id.as_bytes().len() + bytes.len()) as u64, &mut output)
+                    .map_err(|e| problem(&e))?;
+                output.extend_from_slice(id.as_bytes());
+                output.extend_from_slice(&bytes);
+                output
+            }
+            "com.atproto.sync.getRepo" => repo.export_car().await.map_err(|e| problem(&e))?,
+            _ => unreachable!("public repository read route"),
+        };
+        Ok(Response::builder()
+            .header(header::CONTENT_TYPE, "application/vnd.ipld.car")
+            .body(Body::from(car))
+            .expect("CAR response"))
     }
 
     /// The account of the request's OAuth session.
@@ -474,7 +661,7 @@ impl Pds {
             .ok_or_else(|| err(401, "InvalidToken", "unknown OAuth session"))
     }
 
-    fn put_record(&self, headers: &HeaderMap, body: &[u8]) -> Reply {
+    fn write_public_record(&self, nsid: &str, headers: &HeaderMap, body: &[u8]) -> Reply {
         let account = self.session(headers)?;
         let body = parse(body)?;
         let repo = text(&body, "repo")?;
@@ -491,7 +678,11 @@ impl Pds {
                 .ok_or_else(|| err(400, "InvalidRequest", "record missing"))?,
         )?;
         let mut world = self.world.lock().unwrap();
-        check_swap(&body, world.public.get(&key))?;
+        let previous = world.public.get(&key);
+        if nsid == "com.atproto.repo.createRecord" && previous.is_some() {
+            return Err(err(400, "InvalidRequest", "record already exists"));
+        }
+        check_swap(&body, previous)?;
         let reply = json!({
             "uri": format!("at://{}/{}/{}", key.0, key.1, key.2),
             "cid": record.cid,
@@ -609,6 +800,39 @@ impl Pds {
         ))
     }
 
+    fn create_space(&self, headers: &HeaderMap, body: &[u8]) -> Reply {
+        let account = self.session(headers)?;
+        let body = parse(body)?;
+        if body["policy"]["$type"] != "com.atproto.personalspace.policy" {
+            return Err(err(
+                400,
+                "UnsupportedPolicy",
+                "personal mailbox policy required",
+            ));
+        }
+        let kind = text(&body, "spaceType")?;
+        let skey = text(&body, "skey")?;
+        if kind != MAILBOX || skey != "self" {
+            return Err(err(
+                400,
+                "InvalidRequest",
+                "expected personal Labyrinth mailbox",
+            ));
+        }
+        let space = parse_space_ref(&format!("at:space/{account}/{kind}/{skey}"))
+            .map_err(|e| err(400, "InvalidRequest", e))?;
+        if !self
+            .world
+            .lock()
+            .unwrap()
+            .created_spaces
+            .insert(space.to_string())
+        {
+            return Err(err(400, "SpaceAlreadyExists", space));
+        }
+        Ok(ok(json!({"space": space})))
+    }
+
     fn get_space(&self, headers: &HeaderMap, params: &BTreeMap<String, String>) -> Reply {
         // The eligibility probe: a Spaces PDS rejects the parameterless call as a bad request.
         if !params.contains_key("space") {
@@ -621,14 +845,17 @@ impl Pds {
             .lock()
             .unwrap()
             .deleted_spaces
-            .contains(&space.raw)
+            .contains(space.as_str())
         {
-            return Err(err(410, "SpaceDeleted", &space.raw));
+            return Err(err(410, "SpaceDeleted", space.as_str()));
         }
-        if space.space_type == MAILBOX && space.authority == account && space.rkey == "self" {
+        if space.space_type().as_str() == MAILBOX
+            && space.space_did().as_str() == account
+            && space.skey().as_str() == "self"
+        {
             return Ok(ok(json!({
-                "uri": space.raw,
-                "policy": {"$type": "com.atproto.space.policy#ownerOnly", "owner": account},
+                "space": space.as_str(),
+                "policy": {"$type": "com.atproto.personalspace.policy"},
             })));
         }
         Err(err(
@@ -647,38 +874,32 @@ impl Pds {
         let account = self.session(headers)?;
         let space = space_uri(params.get("space").map(String::as_str))?;
         let mut world = self.world.lock().unwrap();
-        let claims = SpaceTokenClaims {
-            iss: account.clone(),
-            aud: Some(format!("{}#atproto_pds", space.authority)),
-            sub: space.raw,
-            iat: now,
-            exp: now + DELEGATION_MAX_LIFETIME_SECS,
-            jti: format!("delegation-{}", world.next()),
-            cnf_kid: None,
-        };
-        let token = mint_space_token(
-            SpaceTokenKind::Delegation,
-            &space_signer(&world.accounts[&account].key),
-            &claims,
-        )
-        .map_err(|e| err(500, "InternalServerError", e))?;
+        let jti = format!("delegation-{}", world.next());
+        // The Catbird authority checks the service-scoped audience before accepting a delegation.
+        let token = delegation(
+            &world.accounts[&account].key,
+            &account,
+            space.as_str(),
+            &jti,
+            now,
+        );
         Ok(ok(json!({ "token": token })))
     }
 
     /// The personal-mailbox Space authority: only the owner's delegation earns a credential.
-    fn space_credential(&self, body: &[u8], now: u64) -> Reply {
+    fn space_credential(&self, body: &[u8], now: u64, key_field: &str) -> Reply {
         let body = parse(body)?;
         let space = space_uri(body["space"].as_str())?;
-        let kid = text(&body, "credentialKid")?;
+        let kid = text(&body, key_field)?;
         decode_p256_did_key(kid).map_err(|e| err(400, "InvalidRequest", e))?;
-        if space.space_type != MAILBOX
-            || space.rkey != "self"
+        if space.space_type().as_str() != MAILBOX
+            || space.skey().as_str() != "self"
             || !self
                 .world
                 .lock()
                 .unwrap()
                 .accounts
-                .contains_key(&space.authority)
+                .contains_key(space.space_did().as_str())
         {
             return Err(err(
                 404,
@@ -686,21 +907,21 @@ impl Pds {
                 "not a Space this PDS is authority of",
             ));
         }
-        let delegation = complete(verify_space_token(
-            SpaceTokenKind::Delegation,
+        let delegation = complete(verify_delegation_token(
             text(&body, "delegationToken")?,
-            &self.directory.resolver(&space.authority),
-            now,
+            space.space_did().as_str(),
+            now as i64,
+            &self.directory.resolver(space.space_did().as_str()),
         ))
         .map_err(|e| err(401, "InvalidDelegationToken", e))?;
-        if delegation.iss != space.authority {
+        if delegation.iss != space.space_did().as_str() {
             return Err(err(
                 403,
                 "UserNotAuthorized",
                 "only the owner reads a personal mailbox",
             ));
         }
-        if delegation.sub != space.raw || delegation.exp <= now {
+        if delegation.sub != space.as_str() || delegation.exp <= now as i64 {
             return Err(err(
                 401,
                 "InvalidDelegationToken",
@@ -718,22 +939,20 @@ impl Pds {
                 "replayed delegation jti",
             ));
         }
-        let claims = SpaceTokenClaims {
-            iss: space.authority.clone(),
-            sub: space.raw,
-            aud: None,
-            iat: now,
-            exp: now + CREDENTIAL_DEFAULT_LIFETIME_SECS,
-            jti: format!("credential-{}", world.next()),
-            cnf_kid: Some(kid.to_owned()),
-        };
-        let credential = mint_space_token(
-            SpaceTokenKind::Credential,
-            &space_signer(&world.accounts[&space.authority].key),
-            &claims,
+        let exp = now as i64 + 600;
+        let jti = format!("credential-{}", world.next());
+        let credential = mint_credential_token(
+            &space_signer(&world.accounts[space.space_did().as_str()].key),
+            space.space_did(),
+            &space,
+            kid,
+            now as i64,
+            exp,
+            Some(&jti),
+            Some("#atproto"),
         )
         .map_err(|e| err(500, "InternalServerError", e))?;
-        let expires_at = chrono::DateTime::from_timestamp(claims.exp as i64, 0)
+        let expires_at = chrono::DateTime::from_timestamp(exp, 0)
             .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
         Ok(ok(
             json!({ "credential": credential, "expiresAt": expires_at }),
@@ -749,7 +968,13 @@ impl Pds {
             .filter(|((space, repo), state)| {
                 repo == &account && !state.ops.is_empty() && !world.deleted_spaces.contains(space)
             })
-            .map(|((space, _), _)| json!({ "uri": space }))
+            .map(|((space, _), state)| {
+                json!({
+                    "space": space,
+                    "repoRev": tid(state.rev_micros, 0),
+                    "data": { "$bytes": STANDARD.encode(state.hash.digest()) },
+                })
+            })
             .collect();
         Ok(ok(json!({ "spaces": spaces })))
     }
@@ -768,7 +993,7 @@ impl Pds {
         let account = self.session(headers)?;
         let body = parse(body)?;
         let staged = self.stage_writes(&account, &body)?;
-        if staged.space.space_type == CONVERSATION {
+        if staged.space.space_type().as_str() == CONVERSATION {
             self.notify_write(&staged).await?;
         }
         self.commit(staged)
@@ -779,25 +1004,26 @@ impl Pds {
         if text(body, "repo")? != account {
             return Err(err(403, "Forbidden", "repo must be the session account"));
         }
-        match space.space_type.as_str() {
+        match space.space_type().as_str() {
             CONVERSATION => {}
-            MAILBOX if space.authority == account && space.rkey == "self" => {}
+            MAILBOX if space.space_did().as_str() == account && space.skey().as_str() == "self" => {
+            }
             _ => return Err(err(403, "Forbidden", "no write authority for this Space")),
         }
         let writes = body["writes"]
             .as_array()
             .ok_or_else(|| err(400, "InvalidRequest", "writes missing"))?;
         let world = self.world.lock().unwrap();
-        if world.deleted_spaces.contains(&space.raw) {
-            return Err(err(410, "SpaceDeleted", &space.raw));
+        if world.deleted_spaces.contains(space.as_str()) {
+            return Err(err(410, "SpaceDeleted", space.as_str()));
         }
         let current = world
             .repos
-            .get(&(space.raw.clone(), account.to_owned()))
+            .get(&(space.to_string(), account.to_owned()))
             .cloned()
             .unwrap_or_default();
         let base_micros = current.rev_micros;
-        // Strictly monotonic per repo, as the authority's notifyWrite requires.
+        // Strictly monotonic per repo, as the authority's notifyRepoUpdate requires.
         let rev_micros = now_micros().max(base_micros + 1);
         let rev = tid(rev_micros, 0);
         let mut next = current;
@@ -808,8 +1034,7 @@ impl Pds {
             let rkey = write["rkey"]
                 .as_str()
                 .map_or_else(|| tid(rev_micros, index as u64 + 1), str::to_owned);
-            let uri = space
-                .record_uri(account, collection, &rkey)
+            let uri = record_uri(&space, account, collection, &rkey)
                 .map_err(|e| err(400, "InvalidRequest", e))?;
             let key = (collection.to_owned(), rkey);
             let previous = next.records.get(&key).map(|record| record.cid.clone());
@@ -845,7 +1070,7 @@ impl Pds {
             let cid = written.as_ref().map(|record| record.cid.clone());
             if let Some(record) = written {
                 mix(&mut next.hash, &key, &record, true);
-                result["uri"] = uri.into();
+                result["uri"] = uri.to_string().into();
                 result["cid"] = record.cid.clone().into();
                 next.records.insert(key.clone(), record);
             }
@@ -863,32 +1088,39 @@ impl Pds {
         })
     }
 
-    /// `com.atproto.space.notifyWrite` to the Space authority, service-authenticated
+    /// `com.atproto.space.notifyRepoUpdate` to the Space authority, service-authenticated
     /// by the writer; a refusal is the write's answer.
     async fn notify_write(&self, staged: &StagedWrite) -> Result<(), Response> {
         let endpoint = self
             .directory
-            .parsed(&staged.space.authority)
-            .and_then(|document| document.service_endpoint("#atproto_mls").map(str::to_owned))
+            .parsed(staged.space.space_did().as_str())
+            .and_then(|document| {
+                document
+                    .service("#atproto_mls", None)?
+                    .service_endpoint
+                    .clone()
+            })
             .ok_or_else(|| err(502, "UpstreamFailure", "Space authority has no endpoint"))?;
         let token = {
             let world = self.world.lock().unwrap();
             mint_es256_service_jwt(
                 &world.accounts[&staged.repo].key,
                 &staged.repo,
-                &staged.space.authority,
-                "com.atproto.space.notifyWrite",
+                staged.space.space_did().as_str(),
+                "com.atproto.space.notifyRepoUpdate",
             )
         };
         let response = self
             .http
-            .post(format!("{endpoint}/xrpc/com.atproto.space.notifyWrite"))
+            .post(format!(
+                "{endpoint}/xrpc/com.atproto.space.notifyRepoUpdate"
+            ))
             .bearer_auth(token)
             .json(&json!({
-                "space": staged.space.raw,
+                "space": staged.space.as_str(),
                 "repo": staged.repo,
                 "repoRev": tid(staged.next.rev_micros, 0),
-                "data": {"$bytes": STANDARD.encode(staged.next.hash.commitment())},
+                "data": {"$bytes": STANDARD.encode(staged.next.hash.digest())},
             }))
             .send()
             .await
@@ -907,7 +1139,7 @@ impl Pds {
 
     fn commit(&self, staged: StagedWrite) -> Reply {
         let mut world = self.world.lock().unwrap();
-        let key = (staged.space.raw.clone(), staged.repo.clone());
+        let key = (staged.space.to_string(), staged.repo.clone());
         if world.repos.get(&key).map_or(0, |repo| repo.rev_micros) != staged.base_micros {
             // The authority accepted a commitment over a base this repo no longer has.
             return Err(err(
@@ -949,45 +1181,43 @@ impl Pds {
         let jwt = authorization
             .strip_prefix("Atproto-Space-Credential ")
             .ok_or_else(|| err(401, "AuthRequired", "Space credential required"))?;
-        let claims = complete(verify_space_token(
-            SpaceTokenKind::Credential,
-            jwt,
-            &self.directory.resolver(&space.authority),
-            now,
-        ))
-        .map_err(|e| err(401, "InvalidSpaceCredential", e))?;
-        if claims.iss != space.authority || claims.sub != space.raw || claims.exp <= now {
+        let resolver = self.directory.resolver(space.space_did().as_str());
+        let claims = complete(verify_credential_token(jwt, now as i64, &resolver))
+            .map_err(|e| err(401, "InvalidSpaceCredential", e))?;
+        if claims.iss != space.space_did().as_str()
+            || claims.sub != space.as_str()
+            || claims.exp <= now as i64
+        {
             return Err(err(
                 401,
                 "InvalidSpaceCredential",
                 "credential binding mismatch or expired",
             ));
         }
-        let proof =
-            verify_credential_request(headers, claims.cnf_kid.as_deref().unwrap_or_default(), now)
-                .map_err(|e| err(401, "BadSpaceSignature", e))?;
-        if proof.credential_jwt != jwt || proof.audience_did != writer {
-            return Err(err(
-                401,
-                "BadSpaceSignature",
-                "Atproto-Space-Audience must be the writer",
-            ));
-        }
+        complete(verify_credential_request(
+            headers, writer, now as i64, &resolver,
+        ))
+        .map_err(|e| err(401, "BadSpaceSignature", e))?;
         let world = self.world.lock().unwrap();
-        if world.revoked.contains_key(&claims.jti) {
+        if world
+            .revoked
+            .contains_key(&(space.as_str().to_owned(), claims.jti.clone()))
+        {
             return Err(err(
                 401,
                 "CredentialRevoked",
                 "credential revoked by the Space authority",
             ));
         }
-        if world.deleted_spaces.contains(&space.raw) {
-            return Err(err(410, "SpaceDeleted", &space.raw));
+        if world.deleted_spaces.contains(space.as_str()) {
+            return Err(err(410, "SpaceDeleted", space.as_str()));
         }
         let Some(account) = world.accounts.get(writer) else {
             return Err(err(404, "RepoNotFound", writer));
         };
-        if space.space_type == MAILBOX && (writer != space.authority || space.rkey != "self") {
+        if space.space_type().as_str() == MAILBOX
+            && (writer != space.space_did().as_str() || space.skey().as_str() != "self")
+        {
             return Err(err(
                 403,
                 "Forbidden",
@@ -997,12 +1227,12 @@ impl Pds {
         let empty = Repo::default();
         let repo = world
             .repos
-            .get(&(space.raw.clone(), writer.to_owned()))
+            .get(&(space.to_string(), writer.to_owned()))
             .unwrap_or(&empty);
-        let want = header_value(headers, SPACE_WANT_MAC_HEADER_NAME)?;
+        let want = header_value(headers, "accept-signature")?;
         let rev = tid(repo.rev_micros, 0);
-        let data = repo.hash.commitment();
-        let commit = json!({"space": space.raw, "repo": writer, "ver": 1, "rev": rev, "data": {"$bytes": STANDARD.encode(data)}});
+        let data = repo.hash.digest();
+        let commit = json!({"space": space.as_str(), "repo": writer, "ver": 1, "rev": rev, "data": {"$bytes": STANDARD.encode(data)}});
         match nsid {
             "com.atproto.space.getRecord" => {
                 let collection = required(params, "collection")?;
@@ -1011,17 +1241,19 @@ impl Pds {
                     .records
                     .get(&(collection.to_owned(), rkey.to_owned()))
                     .ok_or_else(|| err(404, "RecordNotFound", rkey))?;
-                let uri = space
-                    .record_uri(writer, collection, rkey)
+                let uri = record_uri(&space, writer, collection, rkey)
                     .map_err(|e| err(400, "InvalidRequest", e))?;
-                let secret = shared_secret(&account.kem, want, RECORD_MAC_TYPE)?;
-                let (_, cid) = multibase::decode(&record.cid)
+                let (secret, keyid) = shared_secret(&account.kem, want, MacProfile::Record)?;
+                let cid = record
+                    .cid
+                    .parse()
                     .map_err(|e| err(500, "InternalServerError", e))?;
-                let mac = compute_record_mac(&secret, &uri, &cid)
+                let mac = sign_record_mac(&secret, &uri, &cid, &keyid)
                     .map_err(|e| err(500, "InternalServerError", e))?;
                 Ok(with_mac(
                     ok(json!({"uri": uri, "cid": record.cid, "value": record.value})),
-                    format_record_mac_header(&mac),
+                    MacProfile::Record,
+                    &mac,
                 ))
             }
             "com.atproto.space.listRecords" => {
@@ -1069,7 +1301,7 @@ impl Pds {
                 let cid = required(params, "cid")?;
                 let bytes = world
                     .space_blobs
-                    .get(&(space.raw.clone(), writer.to_owned(), cid.to_owned()))
+                    .get(&(space.to_string(), writer.to_owned(), cid.to_owned()))
                     .ok_or_else(|| err(404, "BlobNotFound", cid))?;
                 Ok(Response::builder()
                     .status(StatusCode::OK)
@@ -1079,31 +1311,40 @@ impl Pds {
             }
             _ => {
                 // getRepo, getLatestCommit, listRepoOps: commit MACs.
-                let secret = shared_secret(&account.kem, want, COMMIT_MAC_TYPE)?;
-                let mac = format_commit_mac_header(
-                    &compute_commit_mac(&secret, &space.raw, writer, &rev, &data)
-                        .map_err(|e| err(500, "InternalServerError", e))?,
-                );
+                let (secret, keyid) = shared_secret(&account.kem, want, MacProfile::Commit)?;
+                let writer = Did::parse(writer).map_err(|e| err(400, "InvalidRequest", e))?;
+                let rev = rev
+                    .parse()
+                    .map_err(|e| err(500, "InternalServerError", e))?;
+                let mac = sign_commit_mac(&secret, &space, &writer, &rev, &data, &keyid)
+                    .map_err(|e| err(500, "InternalServerError", e))?;
                 if nsid == "com.atproto.space.getRepo" {
-                    let entries: Vec<StarRecordEntry> = repo
+                    let entries: Vec<_> = repo
                         .records
                         .iter()
-                        .map(|((collection, rkey), record)| StarRecordEntry {
-                            path: format!("{collection}/{rkey}"),
-                            record_dagcbor: record.dagcbor.clone(),
+                        .map(|((collection, rkey), record)| {
+                            (format!("{collection}/{rkey}"), &record.typed)
                         })
                         .collect();
-                    let body = write_star_repo(&space.raw, writer, &rev, &data, &entries)
+                    let entries: Vec<_> = entries
+                        .iter()
+                        .map(|(path, value)| (path.as_str(), *value))
+                        .collect();
+                    let body = write_star_repo(&space, &writer, &rev, &entries)
                         .map_err(|e| err(500, "InternalServerError", e))?;
                     let star = Response::builder()
                         .status(StatusCode::OK)
-                        .header(header::CONTENT_TYPE, "application/vnd.atproto.star")
+                        .header(header::CONTENT_TYPE, "application/vnd.dasl.star")
                         .body(Body::from(body))
                         .unwrap();
-                    return Ok(with_mac(star, mac));
+                    return Ok(with_mac(star, MacProfile::Commit, &mac));
                 }
                 if nsid == "com.atproto.space.getLatestCommit" {
-                    return Ok(with_mac(ok(json!({ "commit": commit })), mac));
+                    return Ok(with_mac(
+                        ok(json!({ "commit": commit })),
+                        MacProfile::Commit,
+                        &mac,
+                    ));
                 }
                 let ops: Vec<&Value> = repo
                     .ops
@@ -1145,7 +1386,11 @@ impl Pds {
                 if end < ops.len() {
                     return Ok(ok(json!({ "ops": page, "cursor": end.to_string() })));
                 }
-                Ok(with_mac(ok(json!({ "ops": page, "commit": commit })), mac))
+                Ok(with_mac(
+                    ok(json!({ "ops": page, "commit": commit })),
+                    MacProfile::Commit,
+                    &mac,
+                ))
             }
         }
     }
@@ -1178,15 +1423,16 @@ impl Pds {
         let key = self
             .directory
             .parsed(authority)
-            .and_then(|document| document.atproto_key)
+            .and_then(|document| extract_signing_key(&document, "#atproto").ok())
             .ok_or_else(|| denied("authority has no #atproto key"))?;
         let alg = jwt_header["alg"].as_str().unwrap_or_default();
-        if alg != key.expected_alg()
-            || !key.verify_raw(
-                alg,
-                format!("{header_b64}.{claims_b64}").as_bytes(),
+        if !key
+            .verify(
                 &decode(signature_b64)?,
+                format!("{header_b64}.{claims_b64}").as_bytes(),
+                alg,
             )
+            .unwrap_or(false)
         {
             return Err(denied("bad service auth signature"));
         }
@@ -1207,26 +1453,39 @@ impl Pds {
         Ok(())
     }
 
-    fn credentials_revoked(&self, headers: &HeaderMap, body: &[u8], now: u64) -> Reply {
+    fn credentials_revoked(&self, nsid: &str, headers: &HeaderMap, body: &[u8], now: u64) -> Reply {
         let body = parse(body)?;
         let space = space_uri(body["space"].as_str())?;
-        self.verify_authority(
-            headers,
-            &space.authority,
-            "com.atproto.space.notifyCredentialRevoked",
-            now,
-        )?;
+        self.verify_authority(headers, space.space_did().as_str(), nsid, now)?;
         let credentials = body["credentials"]
             .as_array()
             .ok_or_else(|| err(400, "InvalidRequest", "credentials missing"))?;
+        if !(1..=100).contains(&credentials.len()) {
+            return Err(err(
+                400,
+                "InvalidRequest",
+                "expected 1 to 100 credential identifiers",
+            ));
+        }
         let mut revoked = Vec::with_capacity(credentials.len());
         for credential in credentials {
-            let exp = chrono::DateTime::parse_from_rfc3339(text(credential, "expiresAt")?)
-                .map_err(|e| err(400, "InvalidRequest", e))?;
-            revoked.push((
-                text(credential, "jti")?.to_owned(),
-                exp.timestamp().max(0) as u64,
-            ));
+            let (jti, expires) = if nsid == "com.atproto.space.notifyCredentialsRevoked" {
+                let jti = credential
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        err(400, "InvalidRequest", "expected a credential identifier")
+                    })?;
+                (
+                    jti,
+                    now + petrel_spaces::tokens::MAX_CREDENTIAL_LIFETIME_SECS as u64,
+                )
+            } else {
+                let expires = chrono::DateTime::parse_from_rfc3339(text(credential, "expiresAt")?)
+                    .map_err(|e| err(400, "InvalidRequest", e))?;
+                (text(credential, "jti")?, expires.timestamp().max(0) as u64)
+            };
+            revoked.push(((space.as_str().to_owned(), jti.to_owned()), expires));
         }
         let mut world = self.world.lock().unwrap();
         world.revoked.retain(|_, exp| *exp > now);
@@ -1234,21 +1493,53 @@ impl Pds {
         Ok(ok(json!({})))
     }
 
-    /// The authority deleted the Space: drop this host's copy; it is gone for reads and writes.
+    fn subscriber_notice(&self, nsid: &str, bytes: &[u8]) -> Reply {
+        let body = parse(bytes)?;
+        let space = space_uri(body["space"].as_str())?;
+        let token = text(&body, "token")?;
+        let mut world = self.world.lock().unwrap();
+        let confirmed = world
+            .registrations
+            .get_mut(&(space.as_str().to_owned(), token.to_owned()))
+            .ok_or_else(|| err(403, "Forbidden", "unknown subscriber token"))?;
+        if nsid == "com.atproto.space.confirmRegistration" {
+            let challenge = text(&body, "challenge")?;
+            if challenge.is_empty() || challenge.len() > 512 {
+                return Err(err(400, "InvalidRequest", "invalid registration challenge"));
+            }
+            *confirmed = true;
+            return Ok(ok(json!({"challenge": challenge})));
+        }
+        if !*confirmed {
+            return Err(err(403, "Forbidden", "registration is not confirmed"));
+        }
+        if body["update"]["$type"] != "com.atproto.space.notifySpaceUpdate#spaceDeleted" {
+            return Err(err(400, "InvalidRequest", "expected a spaceDeleted update"));
+        }
+        Ok(Self::delete_hosted_space(&mut world, space))
+    }
+
+    /// Compatibility callback for the older authority-authenticated deletion procedure.
     fn space_deleted(&self, headers: &HeaderMap, body: &[u8], now: u64) -> Reply {
         let body = parse(body)?;
         let space = space_uri(body["space"].as_str())?;
         self.verify_authority(
             headers,
-            &space.authority,
+            space.space_did().as_str(),
             "com.atproto.space.notifySpaceDeleted",
             now,
         )?;
-        let mut world = self.world.lock().unwrap();
-        world.repos.retain(|(s, _), _| s != &space.raw);
-        world.space_blobs.retain(|(s, _, _), _| s != &space.raw);
-        world.deleted_spaces.insert(space.raw);
-        Ok(ok(json!({})))
+        Ok(Self::delete_hosted_space(
+            &mut self.world.lock().unwrap(),
+            space,
+        ))
+    }
+
+    fn delete_hosted_space(world: &mut World, space: SpaceRef) -> Response {
+        world.repos.retain(|(s, _), _| s != space.as_str());
+        world.space_blobs.retain(|(s, _, _), _| s != space.as_str());
+        world.deleted_spaces.insert(space.into_string());
+        ok(json!({}))
     }
 }
 
@@ -1264,16 +1555,17 @@ fn page(records: Vec<Value>, cursor: Option<String>) -> Value {
 fn record(value: &Value) -> Result<Record, Response> {
     let invalid =
         |e: &dyn std::fmt::Display| err(400, "InvalidRecord", format!("invalid record: {e}"));
-    let typed: catbird_atproto::types::value::Data =
-        serde_json::from_value(value.clone()).map_err(|e| invalid(&e))?;
-    let dagcbor = serde_ipld_dagcbor::to_vec(&typed).map_err(|e| invalid(&e))?;
-    validate_canonical_dagcbor_record(&dagcbor).map_err(|e| invalid(&e))?;
-    // Served as written: jacquard re-renders `$bytes` padded, which is not atproto JSON;
-    // the CID binds exactly the DAG-CBOR this JSON decodes to.
+    let typed = verify_json_value_for_dag_cbor(value).map_err(|e| invalid(&e))?;
+    if !matches!(typed, petrel_core::Value::Object(_)) {
+        return Err(invalid(&"record root must be an object"));
+    }
+    let cid = compute_dagcbor_cid(&typed)
+        .map_err(|e| invalid(&e))?
+        .to_string();
     Ok(Record {
         value: value.clone(),
-        cid: compute_dagcbor_cid(&dagcbor).to_string(),
-        dagcbor,
+        cid,
+        typed,
     })
 }
 
@@ -1308,18 +1600,36 @@ fn blob_links(value: &Value) -> Vec<String> {
 }
 
 fn mix(hash: &mut LtHash, (collection, rkey): &(String, String), record: &Record, add: bool) {
-    let cid = record.cid.parse().expect("PDS-minted CID");
+    let path = format!("{collection}/{rkey}");
     if add {
-        hash.add_record(collection, rkey, &cid);
+        hash.add_entry(&path, &record.cid);
     } else {
-        hash.remove_record(collection, rkey, &cid);
+        hash.remove_entry(&path, &record.cid);
     }
 }
 
-fn shared_secret(kem: &SecretKey, want: Option<&str>, kind: &str) -> Result<[u8; 32], Response> {
-    let want = want.ok_or_else(|| err(400, "BadSpaceMac", "Atproto-Space-Want-Mac required"))?;
-    let share = parse_want_mac_header(want, kind).map_err(|e| err(400, "BadSpaceMac", e))?;
-    decapsulate_p256(kem, &share).map_err(|e| err(400, "BadSpaceMac", e))
+fn shared_secret(
+    kem: &SecretKey,
+    want: Option<&str>,
+    profile: MacProfile,
+) -> Result<([u8; 32], String), Response> {
+    let want = want.ok_or_else(|| err(400, "BadSpaceMac", "Accept-Signature required"))?;
+    let request = parse_accept_signature(want).map_err(|e| err(400, "BadSpaceMac", e))?;
+    if request.profile != profile {
+        return Err(err(400, "BadSpaceMac", "unexpected MAC profile"));
+    }
+    let secret = decapsulate_p256(&kem.to_bytes().into(), &request.keyid)
+        .map_err(|e| err(400, "BadSpaceMac", e))?;
+    Ok((*secret, request.keyid))
+}
+
+fn record_uri(
+    space: &SpaceRef,
+    author: &str,
+    collection: &str,
+    key: &str,
+) -> Result<AtUri, petrel_core::SyntaxError> {
+    space.record_uri(&author.parse()?, &collection.parse()?, &key.parse()?)
 }
 
 /// ATProto TID: 53-bit microseconds, 10-bit clock id, base32-sortable.
@@ -1340,8 +1650,8 @@ fn now_micros() -> u64 {
     Utc::now().timestamp_micros().max(0) as u64
 }
 
-fn space_uri(raw: Option<&str>) -> Result<SpaceUri, Response> {
-    SpaceUri::parse(raw.ok_or_else(|| err(400, "InvalidRequest", "space required"))?)
+fn space_uri(raw: Option<&str>) -> Result<SpaceRef, Response> {
+    parse_space_ref(raw.ok_or_else(|| err(400, "InvalidRequest", "space required"))?)
         .map_err(|e| err(400, "InvalidRequest", e))
 }
 
@@ -1409,12 +1719,23 @@ fn ok(body: Value) -> Response {
     (StatusCode::OK, Json(body)).into_response()
 }
 
-fn with_mac(mut response: Response, mac: String) -> Response {
+fn with_mac(mut response: Response, profile: MacProfile, mac: &SpaceMacHeaders) -> Response {
     let headers = response.headers_mut();
-    headers.insert(SPACE_MAC_HEADER_NAME, HeaderValue::from_str(&mac).unwrap());
+    for (name, value) in [
+        (profile.response_header(), &mac.covered_signature),
+        ("signature-input", &mac.signature_input),
+        ("signature", &mac.signature),
+    ] {
+        headers.insert(
+            name,
+            HeaderValue::from_str(value).expect("Petrel generated valid header"),
+        );
+    }
     headers.insert(
         "access-control-expose-headers",
-        HeaderValue::from_static("Atproto-Space-Mac"),
+        HeaderValue::from_static(
+            "Atproto-Space-Commit, Atproto-Space-Record, Signature-Input, Signature",
+        ),
     );
     response
 }
@@ -1483,12 +1804,14 @@ pub struct CleanSlateDsProcess {
     pub receipt_key: SigningKey,
     pub did_document: Value,
     pub pool: PgClient,
+    _recovery_directory: tempfile::TempDir,
     child: Option<Child>,
 }
 
 impl CleanSlateDsProcess {
     pub async fn spawn(service_did: &str, s2s_secret: &[u8]) -> Result<Self> {
-        let admin = pg_connect(&pg_admin_url())
+        let mut database_url = url::Url::parse(&pg_admin_url())?;
+        let admin = pg_connect(database_url.as_str())
             .await
             .context("connect postgres admin db")?;
         let db_name = format!("clean_slate_fed_{}", Uuid::new_v4().simple());
@@ -1496,10 +1819,22 @@ impl CleanSlateDsProcess {
             .batch_execute(&format!("CREATE DATABASE \"{db_name}\""))
             .await
             .with_context(|| format!("create database {db_name}"))?;
-        let db_url = format!("postgresql://127.0.0.1:5432/{db_name}");
+        database_url.set_path(&format!("/{db_name}"));
+        let db_url = database_url.to_string();
         let signing_key = SigningKey::random(&mut rand::rngs::OsRng);
         let receipt_key = SigningKey::random(&mut rand::rngs::OsRng);
+        let recovery_directory = tempfile::tempdir()?;
+        let kek_path = recovery_directory.path().join("kek");
+        let mut key_file = tempfile::NamedTempFile::new_in(recovery_directory.path())?;
+        key_file.write_all(&rand::random::<[u8; 32]>())?;
+        key_file.persist(&kek_path)?;
         let mut child = Command::new(fixture_binary_path())
+            .env("LABYRINTH_RECOVERY_SHARE_KEK_FILE", kek_path)
+            .env("LABYRINTH_RECOVERY_SHARE_KEK_ID", &db_name)
+            .env(
+                "LABYRINTH_RECOVERY_SHARE_TOMBSTONE_FILE",
+                recovery_directory.path().join("deletions"),
+            )
             .env("APP_ENV", "test")
             .env("TEST_DATABASE_URL", &db_url)
             .env("SERVICE_DID", service_did)
@@ -1541,6 +1876,7 @@ impl CleanSlateDsProcess {
             receipt_key,
             did_document,
             pool,
+            _recovery_directory: recovery_directory,
             child: Some(child),
         })
     }
@@ -1622,7 +1958,7 @@ impl Drop for CleanSlateDsProcess {
     }
 }
 
-/// The Space authority `ds` recorded, from the PDS's `notifyWrite`, exactly the
+/// The Space authority `ds` recorded, from the PDS's `notifyRepoUpdate`, exactly the
 /// commit `pds` serves for `writer`'s repo in `space`.
 pub async fn assert_authority_notified(
     ds: &CleanSlateDsProcess,
@@ -1654,13 +1990,14 @@ pub async fn assert_authority_notified(
 // Native client platform transport and key store
 // ---------------------------------------------------------------------------
 
-/// One exchange the transport carried: method, URL, status, XRPC error name.
+/// One HTTP exchange, including the XRPC error response when present.
 #[derive(Clone, Debug)]
 pub struct Exchange {
     pub method: String,
     pub url: String,
     pub status: u16,
     pub error: Option<String>,
+    pub message: Option<String>,
 }
 
 struct AccountSession {
@@ -1677,6 +2014,7 @@ struct AccountSession {
 /// that already authenticate (Space credential presentations). A D1 firewall
 /// refuses every origin outside `allowed_origins`; every exchange is recorded.
 pub struct ClientTransport {
+    directory: DidDirectory,
     allowed_origins: Vec<String>,
     http: reqwest::Client,
     pub blocked_attempts: AtomicUsize,
@@ -1686,8 +2024,9 @@ pub struct ClientTransport {
 }
 
 impl ClientTransport {
-    pub fn new(allowed_origins: Vec<String>) -> Self {
+    fn new(allowed_origins: Vec<String>, directory: DidDirectory) -> Self {
         Self {
+            directory,
             allowed_origins: allowed_origins
                 .into_iter()
                 .map(|u| u.trim_end_matches('/').to_string())
@@ -1810,7 +2149,42 @@ impl ClientTransport {
 }
 
 impl PlatformTransport for ClientTransport {
-    fn execute_http(&self, request: PlatformHttpRequest) -> Result<PlatformHttpResponse, MLSError> {
+    fn execute_http(
+        &self,
+        mut request: PlatformHttpRequest,
+    ) -> Result<PlatformHttpResponse, MLSError> {
+        // Native clients resolve fixture DIDs at their independent identity authority.
+        // Serve these registered documents in memory without contacting the public network.
+        if request.method == "GET" {
+            let did = request
+                .url
+                .strip_prefix("https://plc.directory/")
+                .filter(|did| did.starts_with("did:plc:"))
+                .map(str::to_owned)
+                .or_else(|| {
+                    request
+                        .url
+                        .strip_prefix("https://")?
+                        .strip_suffix("/.well-known/did.json")
+                        .map(|host| format!("did:web:{host}"))
+                });
+            if let Some(document) = did.and_then(|did| self.directory.document(&did)) {
+                return Ok(PlatformHttpResponse {
+                    status: 200,
+                    headers: vec![],
+                    body: serde_json::to_vec(&document).expect("fixture DID document"),
+                });
+            }
+        }
+        // Advertised service endpoints use HTTPS. Map only a known local origin to
+        // its corresponding loopback listener, then apply the same outbound check.
+        for origin in &self.allowed_origins {
+            let advertised = origin.replacen("http://", "https://", 1);
+            if let Some(path) = request.url.strip_prefix(&format!("{advertised}/")) {
+                request.url = format!("{origin}/{path}");
+                break;
+            }
+        }
         self.assert_allowed(&request.url)
             .map_err(|e| MLSError::Internal(e.to_string()))?;
         let authorization = (!request
@@ -1868,20 +2242,24 @@ impl PlatformTransport for ClientTransport {
         })
         .join()
         .map_err(|_| MLSError::Internal("transport panic".into()))?;
-        let (status, error) = match &response {
-            Ok(response) => (
-                response.status,
-                serde_json::from_slice::<Value>(&response.body)
-                    .ok()
-                    .and_then(|body| body["error"].as_str().map(str::to_owned)),
-            ),
-            Err(error) => (0, Some(error.to_string())),
+        let (status, error, message) = match &response {
+            Ok(response) if !(200..300).contains(&response.status) => {
+                let body = serde_json::from_slice::<Value>(&response.body).unwrap_or_default();
+                (
+                    response.status,
+                    body["error"].as_str().map(str::to_owned),
+                    body["message"].as_str().map(str::to_owned),
+                )
+            }
+            Ok(response) => (response.status, None, None),
+            Err(error) => (0, Some(error.to_string()), None),
         };
         self.exchanges.lock().unwrap().push(Exchange {
             method,
             url,
             status,
             error,
+            message,
         });
         response
     }

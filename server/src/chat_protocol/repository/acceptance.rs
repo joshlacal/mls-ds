@@ -6,8 +6,7 @@
 // raw planner or execution-artifact seam.
 
 use base64::Engine as _;
-use catbird_atproto::generated::blue_catbird::chat as chat_dto;
-use jacquard_common::DefaultStr;
+use catbird_server::blue_catbird::chat as chat_dto;
 use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
@@ -92,9 +91,14 @@ pub(crate) struct AcceptanceCanonicalResponse {
 }
 impl AcceptanceCanonicalResponse {
     fn new(bytes: Vec<u8>) -> Result<Self, AcceptanceFacadeError> {
-        let _: chat_dto::accept_conversation::AcceptConversationOutput<DefaultStr> =
-            serde_json::from_slice(&bytes)
-                .map_err(|_| AcceptanceFacadeError::InvalidCanonicalMaterial)?;
+        let _: chat_dto::accept_conversation::Output = serde_json::from_slice(&bytes)
+            .and_then(|value| {
+                catbird_server::chat_protocol::retained_json::decode_output(
+                    "blue.catbird.chat.acceptConversation",
+                    value,
+                )
+            })
+            .map_err(|_| AcceptanceFacadeError::InvalidCanonicalMaterial)?;
         let sha256 = <[u8; 32]>::from(Sha256::digest(&bytes));
         let mut digest = Sha256::new();
         digest.update(RESPONSE_DOMAIN);
@@ -563,13 +567,18 @@ fn acceptance_response(
         "entry": entry_value,
         "recovery": recovery
     });
-    let value_bytes =
-        serde_json::to_vec(&value).map_err(|_| AcceptanceFacadeError::InvalidCanonicalMaterial)?;
-    let output: chat_dto::accept_conversation::AcceptConversationOutput<DefaultStr> =
-        serde_json::from_slice(&value_bytes)
-            .map_err(|_| AcceptanceFacadeError::InvalidCanonicalMaterial)?;
+    let output: chat_dto::accept_conversation::Output =
+        catbird_server::chat_protocol::retained_json::decode_output(
+            "blue.catbird.chat.acceptConversation",
+            value,
+        )
+        .map_err(|_| AcceptanceFacadeError::InvalidCanonicalMaterial)?;
     AcceptanceCanonicalResponse::new(
-        serde_json::to_vec(&output).map_err(|_| AcceptanceFacadeError::InvalidCanonicalMaterial)?,
+        catbird_server::chat_protocol::retained_json::encode_output(
+            "blue.catbird.chat.acceptConversation",
+            &output,
+        )
+        .map_err(|_| AcceptanceFacadeError::InvalidCanonicalMaterial)?,
     )
 }
 

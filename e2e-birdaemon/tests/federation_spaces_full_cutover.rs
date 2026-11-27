@@ -25,13 +25,7 @@ use aes_gcm::{
     aead::{Aead as _, KeyInit as _},
     Aes256Gcm, Nonce as AesNonce,
 };
-use anyhow::Result;
-use atproto_spaces::{
-    http_signature::sign_credential_request,
-    kem::{encapsulate_p256, encode_p256_did_key},
-    mac::{format_want_mac_header, verify_commit_mac, COMMIT_MAC_TYPE, SPACE_MAC_HEADER_NAME},
-    tokens::{mint_space_token, SpaceSigningKey, SpaceTokenClaims, SpaceTokenKind},
-};
+use anyhow::{Context, Result};
 use axum::{
     body::Bytes as AxumBytes,
     http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
@@ -70,12 +64,16 @@ use labyrinth_protocol::receipt::{
     compute_archive_commitment, verify_sequencer_receipt_sec1, SignedSequencerReceipt,
 };
 use native_spaces::{
-    assert_authority_notified, mint_es256_service_jwt, p256_public_jwk, CleanSlateDsProcess,
-    ClientTransport, DidDirectory, MemoryKeyStore, SpacesPds,
+    assert_authority_notified, delegation, did_key, mint_es256_service_jwt, p256_public_jwk,
+    CleanSlateDsProcess, DidDirectory, MemoryKeyStore, SpacesPds,
 };
 use p256::{
     ecdsa::{signature::Verifier as _, Signature as P256Signature, SigningKey as P256SigningKey},
     SecretKey as P256Secret,
+};
+use petrel_spaces::{
+    encapsulate_p256, format_accept_signature, sign_credential_request, verify_commit_mac,
+    MacProfile, SigningKeyPair,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -371,10 +369,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .collect();
 
     // Negative `I15` check: account on `legacy_pds` (non-Spaces PDS) is cleanly blocked with zero KP upload
-    let legacy_transport = Arc::new(ClientTransport::new(vec![
-        ds_a.base_url.clone(),
-        legacy_pds.base_url.clone(),
-    ]));
+    let legacy_transport = Arc::new(legacy_pds.client_transport(&ds_a.base_url));
     let carol_legacy_client = CatbirdMlsClient::open(
         CatbirdMlsClientConfig {
             storage_root: temp_root
@@ -595,10 +590,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     }
 
     // Alice's D1-firewalled transport ONLY permits her home `ds-a` and her own `swan_pds`!
-    let alice_firewall = Arc::new(ClientTransport::new(vec![
-        ds_a.base_url.clone(),
-        swan_pds.base_url.clone(),
-    ]));
+    let alice_firewall = Arc::new(swan_pds.client_transport(&ds_a.base_url));
     alice_firewall.set_account(
         &alice_sdk_did,
         alice_sdk_p256.clone(),
@@ -822,10 +814,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     );
 
     // Step 1: Real-SDK federated enrollment (`alice_sdk` on `ds-a` `did:web` + `bob_sdk` on `ds-b` `did:plc`)
-    let bob_firewall = Arc::new(ClientTransport::new(vec![
-        ds_b.base_url.clone(),
-        swan_pds.base_url.clone(),
-    ]));
+    let bob_firewall = Arc::new(swan_pds.client_transport(&ds_b.base_url));
     bob_firewall.set_account(
         &bob_sdk_did,
         bob_sdk_p256.clone(),
@@ -1805,7 +1794,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     // ========================================================================
     // Scenario 5 & Scenario 6: `.staged` -> `.space` Media Privacy, `3A` Stateless
     // Home-`mls-ds` Space Relays (`relaySpaceCredential` & `relaySpaceRead`),
-    // HPKE `Atproto-Space-Mac`, and `Gate 10` Immediate Removed-Member Eviction
+    // HPKE-authenticated commit headers, and `Gate 10` Immediate Removed-Member Eviction
     // ========================================================================
     // Upload encrypted media to both `swan_pds` (Bob's avatar) and `ref_pds` (Eve's attachment)
     let avatar_sym_key = [0x42_u8; 32];
@@ -1849,7 +1838,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     assert_eq!(staged_public_resp.status(), reqwest::StatusCode::NOT_FOUND);
 
     // Promote Bob's avatar into Conversation Space on `swan_pds`: the PDS commits it only after
-    // `ds-b`, the Space authority, accepts its service-authenticated `notifyWrite`.
+    // `ds-b`, the Space authority, accepts its service-authenticated `notifyRepoUpdate`.
     admin_http
         .post(format!(
             "{}/xrpc/com.atproto.space.applyWrites",
@@ -1958,33 +1947,23 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .await?
         .error_for_status()?;
     let outsider_eph = P256Secret::random(&mut rand::rngs::OsRng);
-    let outsider_cnf = encode_p256_did_key(&outsider_eph.public_key());
-    let now_sec = Utc::now().timestamp() as u64;
-    let ds_b_pds_aud = format!("{DS_B_DID}#atproto_pds");
-    let outsider_del = mint_space_token(
-        SpaceTokenKind::Delegation,
-        &SpaceSigningKey::P256 {
-            signing_key: outsider_p256,
-            kid: "#atproto".into(),
-        },
-        &SpaceTokenClaims {
-            iss: outsider_did.into(),
-            sub: space_uri.clone(),
-            aud: Some(ds_b_pds_aud.clone()),
-            iat: now_sec,
-            exp: now_sec + 60,
-            jti: Uuid::new_v4().to_string(),
-            cnf_kid: None,
-        },
-    )?;
+    let outsider_cnf = did_key(&outsider_eph.public_key());
+    let now = Utc::now().timestamp();
+    let outsider_del = delegation(
+        &outsider_p256,
+        &outsider_did,
+        &space_uri,
+        &Uuid::new_v4().to_string(),
+        now as u64,
+    );
     let outsider_cred_resp = admin_http
         .post(format!(
-            "{}/xrpc/com.atproto.space.getSpaceCredential",
+            "{}/xrpc/com.atproto.space.authorizeSpaceSync",
             ds_b.base_url
         ))
         .json(&json!({
             "space": space_uri,
-            "credentialKid": outsider_cnf,
+            "credentialKey": outsider_cnf,
             "delegationToken": outsider_del,
         }))
         .send()
@@ -1997,32 +1976,26 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
 
     // Mint Eve's active 10-minute Space credential on BOTH `swan_pds` and `ref_pds` use-cases
     let eve_eph = P256Secret::random(&mut rand::rngs::OsRng);
-    let eve_cnf = encode_p256_did_key(&eve_eph.public_key());
-    let eve_del = mint_space_token(
-        SpaceTokenKind::Delegation,
-        &SpaceSigningKey::P256 {
-            signing_key: eve_p256.clone(),
-            kid: "#atproto".into(),
-        },
-        &SpaceTokenClaims {
-            iss: eve_did.into(),
-            sub: space_uri.clone(),
-            aud: Some(ds_b_pds_aud.clone()),
-            iat: now_sec,
-            exp: now_sec + 60,
-            jti: Uuid::new_v4().to_string(),
-            cnf_kid: None,
-        },
-    )?;
+    let eve_proof_key = SigningKeyPair::from_p256_bytes(&eve_eph.to_bytes())?;
+    let eve_cnf = did_key(&eve_eph.public_key());
+    let now = Utc::now().timestamp();
+    let eve_del = delegation(
+        &eve_p256,
+        &eve_did,
+        &space_uri,
+        &Uuid::new_v4().to_string(),
+        now as u64,
+    );
     let eve_cred_json: Value = admin_http
         .post(format!(
-            "{}/xrpc/com.atproto.space.getSpaceCredential",
+            "{}/xrpc/com.atproto.space.authorizeSpaceSync",
             ds_b.base_url
         ))
         .json(&json!({
             "space": space_uri,
-            "credentialKid": eve_cnf,
+            "credentialKey": eve_cnf,
             "delegationToken": eve_del,
+            "notify": ref_pds.notify_registration(&space_uri),
         }))
         .send()
         .await?
@@ -2042,11 +2015,11 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         (&ref_pds.base_url, eve_did, eve_blob_cid.as_str()),
     ] {
         let signed_hdrs = sign_credential_request(
-            &eve_eph,
             &eve_cred,
+            &eve_proof_key,
             writer,
-            Utc::now().timestamp() as u64,
-            &Uuid::new_v4().to_string(),
+            Utc::now().timestamp(),
+            Some(&Uuid::new_v4().to_string()),
         )?;
         let pre_resp = admin_http
             .get(format!(
@@ -2072,23 +2045,16 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     let ds_a_rows_before_relay = count_ds_operational_rows(&ds_a.pool).await?;
 
     let alice_eph = P256Secret::random(&mut rand::rngs::OsRng);
-    let alice_cnf = encode_p256_did_key(&alice_eph.public_key());
-    let alice_del = mint_space_token(
-        SpaceTokenKind::Delegation,
-        &SpaceSigningKey::P256 {
-            signing_key: alice_p256.clone(),
-            kid: "#atproto".into(),
-        },
-        &SpaceTokenClaims {
-            iss: alice_remote_did.clone(),
-            sub: space_uri.clone(),
-            aud: Some(ds_b_pds_aud.clone()),
-            iat: now_sec,
-            exp: now_sec + 60,
-            jti: Uuid::new_v4().to_string(),
-            cnf_kid: None,
-        },
-    )?;
+    let alice_proof_key = SigningKeyPair::from_p256_bytes(&alice_eph.to_bytes())?;
+    let alice_cnf = did_key(&alice_eph.public_key());
+    let now = Utc::now().timestamp();
+    let alice_del = delegation(
+        &alice_p256,
+        &alice_remote_did,
+        &space_uri,
+        &Uuid::new_v4().to_string(),
+        now as u64,
+    );
     let alice_relay_cred_jwt = mint_es256_service_jwt(
         &alice_p256,
         &alice_remote_did,
@@ -2108,6 +2074,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
                 "space": space_uri,
                 "delegationToken": alice_del,
                 "cnfKey": alice_cnf,
+                "notify": swan_pds.notify_registration(&space_uri),
             }),
         )
         .await?;
@@ -2175,7 +2142,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     }
 
     // Gate 10: Admin Bob removes Eve (`200 OK`) -> `ds-b` revokes Eve's credential & fans out
-    // `notifyCredentialRevoked` to BOTH `swan_pds` and `ref_pds`!
+    // `notifyCredentialsRevoked` to BOTH `swan_pds` and `ref_pds`!
     let kick_eve_resp: Value = admin_http
         .post(format!("{}/_test/clean-slate/remove-member", ds_b.base_url))
         .json(&json!({
@@ -2191,22 +2158,22 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     assert_eq!(kick_eve_resp["removed"], true);
     assert!(
         kick_eve_resp["notifiedWriterHosts"].as_u64().unwrap() >= 2,
-        "Gate 10: notifyCredentialRevoked must fan out to both Swan and atproto#5187 PDS hosts"
+        "Gate 10: notifyCredentialsRevoked must fan out to both Swan and atproto#5187 PDS hosts"
     );
 
     // Gate 10: Eve's unexpired 10-minute credential MUST NOW IMMEDIATELY FAIL with `401 CredentialRevoked`
-    // on `ds-b` (`listRepos`), `swan_pds` (`getBlob` & `listRepoOps`), AND `ref_pds` (`getBlob` & `listRepoOps`),
-    // AND re-minting via `getSpaceCredential` MUST return `403 Forbidden`!
+    // on `ds-b` (`listWriters`), `swan_pds` (`getBlob` & `listRepoOps`), AND `ref_pds` (`getBlob` & `listRepoOps`),
+    // AND re-minting via `authorizeSpaceSync` MUST return `403 Forbidden`!
     let eve_ds_b_pop = sign_credential_request(
-        &eve_eph,
         &eve_cred,
+        &eve_proof_key,
         DS_B_DID,
-        Utc::now().timestamp() as u64,
-        &Uuid::new_v4().to_string(),
+        Utc::now().timestamp(),
+        Some(&Uuid::new_v4().to_string()),
     )?;
-    let evicted_list_repos = admin_http
+    let evicted_list_writers = admin_http
         .get(format!(
-            "{}/xrpc/com.atproto.space.listRepos?space={}",
+            "{}/xrpc/com.atproto.space.listWriters?space={}",
             ds_b.base_url,
             urlencoding::encode(&space_uri),
         ))
@@ -2220,35 +2187,27 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .send()
         .await?;
     assert_eq!(
-        evicted_list_repos.status(),
+        evicted_list_writers.status(),
         reqwest::StatusCode::UNAUTHORIZED,
-        "Gate 10: removed member Eve's cached credential must fail with 401 on ds-b listRepos"
+        "Gate 10: removed member Eve's cached credential must fail with 401 on ds-b listWriters"
     );
 
-    let eve_remint_del = mint_space_token(
-        SpaceTokenKind::Delegation,
-        &SpaceSigningKey::P256 {
-            signing_key: eve_p256.clone(),
-            kid: "#atproto".into(),
-        },
-        &SpaceTokenClaims {
-            iss: eve_did.into(),
-            sub: space_uri.clone(),
-            aud: Some(ds_b_pds_aud.clone()),
-            iat: Utc::now().timestamp() as u64,
-            exp: Utc::now().timestamp() as u64 + 60,
-            jti: Uuid::new_v4().to_string(),
-            cnf_kid: None,
-        },
-    )?;
+    let now = Utc::now().timestamp();
+    let eve_remint_del = delegation(
+        &eve_p256,
+        &eve_did,
+        &space_uri,
+        &Uuid::new_v4().to_string(),
+        now as u64,
+    );
     let eve_remint_resp = admin_http
         .post(format!(
-            "{}/xrpc/com.atproto.space.getSpaceCredential",
+            "{}/xrpc/com.atproto.space.authorizeSpaceSync",
             ds_b.base_url
         ))
         .json(&json!({
             "space": space_uri,
-            "credentialKid": eve_cnf,
+            "credentialKey": eve_cnf,
             "delegationToken": eve_remint_del,
         }))
         .send()
@@ -2256,7 +2215,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     assert_eq!(
         eve_remint_resp.status(),
         reqwest::StatusCode::FORBIDDEN,
-        "Gate 10: removed member Eve re-minting getSpaceCredential MUST fail with 403 Forbidden"
+        "Gate 10: removed member Eve re-minting authorizeSpaceSync MUST fail with 403 Forbidden"
     );
 
     for (pds_url, writer, cid) in [
@@ -2268,11 +2227,11 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         (&ref_pds.base_url, eve_did, eve_blob_cid.as_str()),
     ] {
         let h1 = sign_credential_request(
-            &eve_eph,
             &eve_cred,
+            &eve_proof_key,
             writer,
-            Utc::now().timestamp() as u64,
-            &Uuid::new_v4().to_string(),
+            Utc::now().timestamp(),
+            Some(&Uuid::new_v4().to_string()),
         )?;
         let evicted_blob = admin_http
             .get(format!(
@@ -2294,11 +2253,11 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         );
 
         let h2 = sign_credential_request(
-            &eve_eph,
             &eve_cred,
+            &eve_proof_key,
             writer,
-            Utc::now().timestamp() as u64,
-            &Uuid::new_v4().to_string(),
+            Utc::now().timestamp(),
+            Some(&Uuid::new_v4().to_string()),
         )?;
         let evicted_ops = admin_http
             .get(format!(
@@ -2315,14 +2274,14 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         assert_eq!(evicted_ops.status(), reqwest::StatusCode::UNAUTHORIZED);
     }
 
-    // Remaining member Alice reads `listRepos` on `ds-b` AND Eve's historical repo ops + blob on `ref_pds`
+    // Remaining member Alice reads `listWriters` on `ds-b` AND Eve's historical repo ops + blob on `ref_pds`
     // EXCLUSIVELY through her home `ds-a`'s stateless `relaySpaceRead` (`3A` + `D1` firewall)!
-    let list_repos_pop = sign_credential_request(
-        &alice_eph,
+    let list_writers_pop = sign_credential_request(
         &alice_cred,
+        &alice_proof_key,
         DS_B_DID,
-        Utc::now().timestamp() as u64,
-        &Uuid::new_v4().to_string(),
+        Utc::now().timestamp(),
+        Some(&Uuid::new_v4().to_string()),
     )?;
     let lr_jwt = mint_es256_service_jwt(
         &alice_p256,
@@ -2337,12 +2296,12 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             &json!({
                 "actorDeviceId": alice_device_id.to_string(),
                 "targetDid": DS_B_DID,
-                "nsid": "com.atproto.space.listRepos",
+                "nsid": "com.atproto.space.listWriters",
                 "query": format!("space={}", urlencoding::encode(&space_uri)),
                 "credential": alice_cred,
                 "spaceAudience": DS_B_DID,
-                "signatureInput": list_repos_pop.signature_input,
-                "signature": list_repos_pop.signature,
+                "signatureInput": list_writers_pop.signature_input,
+                "signature": list_writers_pop.signature,
             }),
         )
         .await?;
@@ -2352,23 +2311,27 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .as_array()
         .unwrap()
         .iter()
-        .filter_map(|r| r["did"].as_str())
+        .map(|r| {
+            r["repo"]
+                .as_str()
+                .expect("listWriters entry has a repo DID")
+        })
         .collect();
     assert!(
         repo_dids.contains(&eve_did),
-        "Historical writer Eve MUST remain listed in listRepos after removal"
+        "Historical writer Eve MUST remain listed in listWriters after removal"
     );
 
-    // Alice reads Eve's `listRepoOps` on `ref_pds` via `ds-a` `relaySpaceRead` with HPKE `Atproto-Space-Want-Mac`
-    // and cryptographically verifies `Atproto-Space-Mac` + CORS `Access-Control-Expose-Headers`!
+    // Alice reads Eve's `listRepoOps` on `ref_pds` via `ds-a` `relaySpaceRead` with HPKE `Accept-Signature`
+    // and cryptographically verifies the signed commitment + CORS `Access-Control-Expose-Headers`!
     let encap_eve = encapsulate_p256(&eve_kem_did_key)?;
-    let want_mac_eve = format_want_mac_header(&encap_eve.key_share_did_key, COMMIT_MAC_TYPE)?;
+    let accept_signature = format_accept_signature(MacProfile::Commit, &encap_eve.key_share)?;
     let ops_pop = sign_credential_request(
-        &alice_eph,
         &alice_cred,
+        &alice_proof_key,
         eve_did,
-        Utc::now().timestamp() as u64,
-        &Uuid::new_v4().to_string(),
+        Utc::now().timestamp(),
+        Some(&Uuid::new_v4().to_string()),
     )?;
     let ops_jwt = mint_es256_service_jwt(
         &alice_p256,
@@ -2391,7 +2354,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
                 ),
                 "credential": alice_cred,
                 "spaceAudience": eve_did,
-                "wantMac": want_mac_eve,
+                "acceptSignature": accept_signature,
                 "signatureInput": ops_pop.signature_input,
                 "signature": ops_pop.signature,
             }),
@@ -2402,29 +2365,37 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .get("access-control-expose-headers")
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
-    assert!(
-        exposed_hdr.contains("Atproto-Space-Mac"),
-        "3A/Gate 7: relaySpaceRead must expose Atproto-Space-Mac via CORS"
-    );
-    let space_mac_hdr = ops_hdrs
-        .get(SPACE_MAC_HEADER_NAME)
-        .and_then(|v| v.to_str().ok())
-        .expect("Atproto-Space-Mac header preserved by relaySpaceRead");
+    for name in ["atproto-space-commit", "signature-input", "signature"] {
+        assert!(
+            exposed_hdr
+                .split(',')
+                .any(|header| header.trim().eq_ignore_ascii_case(name)),
+            "relay must expose {name}"
+        );
+    }
+    let header = |name: &'static str| {
+        ops_hdrs
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .expect("relay must forward MAC evidence")
+    };
+    let verified = verify_commit_mac(
+        &encap_eve.shared_secret,
+        header("atproto-space-commit"),
+        header("signature-input"),
+        header("signature"),
+    )?;
+    assert_eq!(verified.keyid, encap_eve.key_share);
     let ops_json: Value = serde_json::from_slice(&ops_bytes)?;
     let commit_rev = ops_json["commit"]["rev"].as_str().unwrap();
     let commit_data: [u8; 32] = STANDARD
         .decode(ops_json["commit"]["data"]["$bytes"].as_str().unwrap())?
         .try_into()
         .unwrap();
-    verify_commit_mac(
-        &encap_eve.shared_secret,
-        space_mac_hdr,
-        &space_uri,
-        eve_did,
-        commit_rev,
-        &commit_data,
-    )
-    .expect("Gate 7: end-to-end HPKE Atproto-Space-Mac must verify through relaySpaceRead");
+    assert_eq!(verified.space.as_str(), space_uri);
+    assert_eq!(verified.repo.as_str(), eve_did);
+    assert_eq!(verified.rev.as_str(), commit_rev);
+    assert_eq!(verified.data, commit_data);
 
     // Verify `3A` statelessness: ZERO operational rows added on `ds-a` across `relaySpaceCredential` & `relaySpaceRead`!
     let ds_a_rows_after_relay = count_ds_operational_rows(&ds_a.pool).await?;
@@ -2444,6 +2415,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     // Space-Backed Avatar Pointer, and Automatic Admin Avatar Re-Host on Leave
     // ========================================================================
     let meta_v1 = GroupMetadataV1 {
+        extra: Default::default(),
         version: 1,
         title: "Clean-Slate Federated Group".into(),
         description: String::new(),
@@ -2551,13 +2523,14 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             let eph_bytes = alice_eph.to_bytes();
             let http = admin_http.clone();
             async move {
-                let eph = P256Secret::from_slice(&eph_bytes).unwrap();
+                let proof_key = SigningKeyPair::from_p256_bytes(&eph_bytes)
+                    .map_err(|e| MLSError::Internal(e.to_string()))?;
                 let pop = sign_credential_request(
-                    &eph,
                     &cred,
+                    &proof_key,
                     &setter_did,
-                    Utc::now().timestamp() as u64,
-                    &Uuid::new_v4().to_string(),
+                    Utc::now().timestamp(),
+                    Some(&Uuid::new_v4().to_string()),
                 )
                 .map_err(|e| MLSError::Internal(e.to_string()))?;
                 let bytes = http
@@ -2711,6 +2684,13 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .windows(2)
         .any(|w| w == [0x00, 0x4d]));
     assert!(bird_bot.enrollment_receipt().labyrinth_backup_enabled);
+    // Start the bot before sending the live mention. Its first successful sync
+    // records a watermark so it never replies to a backlog of old messages.
+    assert!(bird_bot.sync_and_reply().await?.is_empty());
+    assert_eq!(
+        bird_bot.conversation_watermark("__cold_start_complete__")?,
+        Some(1)
+    );
 
     // 7a. Live federated group creation on `ds-b` with cross-DS participants (`alice_sdk_did` on `ds-a`, `bob_sdk_did` on `ds-b`)
     let bird_group_id = Uuid::new_v4().to_string();
@@ -2865,75 +2845,100 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         .await?;
     let app_seq = prune_send_out["entry"]["seq"].as_i64().unwrap();
 
-    // Sender ACKs via HTTP, then Recipient ACKs via real `CatbirdMlsClient::acknowledge_entries_up_to`
-    // AND registers push gateway via `CatbirdMlsClient::build_signed_push_gateway_registration`!
+    // The seeded signing devices acknowledge through the shipping endpoint.
+    // Earlier live clients verified and decrypted their MLS conversations.
     {
-        let ack_signed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-        #[derive(serde::Serialize)]
-        struct AckPayload<'a> {
-            #[serde(rename = "keyId")]
-            key_id: &'a str,
-            #[serde(rename = "upToSeq")]
-            up_to_seq: i64,
-            #[serde(rename = "signedAt")]
-            signed_at: &'a str,
-            generation: i64,
-            #[serde(rename = "actorDeviceId")]
-            actor_device_id: String,
-            #[serde(rename = "authGeneration")]
-            auth_generation: i64,
-            #[serde(rename = "conversationId")]
-            conversation_id: String,
-        }
-        let cbor = serde_ipld_dagcbor::to_vec(&AckPayload {
-            key_id: &p_sender_kid,
-            up_to_seq: app_seq,
-            signed_at: &ack_signed_at,
-            generation: 0,
-            actor_device_id: p_sender_dev.to_string(),
-            auth_generation: 1,
-            conversation_id: prune_cid.to_string(),
-        })?;
-        let ack_sig: Ed25519Signature =
-            p_sender_ed.sign(&[b"CATBIRD-CHAT-ACK-ENTRIES\0".as_slice(), &cbor].concat());
-        let ack_jwt = mint_es256_service_jwt(
-            &p_sender_p256,
-            &p_sender_did,
-            &format!("{DS_A_DID}#atproto_mls"),
-            "blue.catbird.chat.acknowledgeEntries",
+        let ack_endpoint = format!(
+            "{}/xrpc/blue.catbird.chat.acknowledgeEntries",
+            ds_a.base_url
         );
-        admin_http
-            .post(format!(
-                "{}/xrpc/blue.catbird.chat.acknowledgeEntries",
-                ds_a.base_url
-            ))
-            .header("authorization", format!("Bearer {ack_jwt}"))
-            .header(CONTENT_TYPE, "application/json")
-            .json(&json!({
-                "conversationId": prune_cid,
-                "generation": 0,
-                "actorDeviceId": p_sender_dev,
-                "keyId": p_sender_kid,
-                "authGeneration": 1,
-                "upToSeq": app_seq,
-                "signedAt": ack_signed_at,
-                "signature": STANDARD.encode(ack_sig.to_bytes()),
-            }))
-            .send()
-            .await?
-            .error_for_status()?;
+        let signed_ack = async |did: &str,
+                                device: Uuid,
+                                key_id: &str,
+                                signer: &Ed25519SigningKey,
+                                pds_key: &P256SigningKey|
+               -> Result<i64> {
+            let ack_signed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+            #[derive(serde::Serialize)]
+            struct AckPayload<'a> {
+                #[serde(rename = "keyId")]
+                key_id: &'a str,
+                #[serde(rename = "upToSeq")]
+                up_to_seq: i64,
+                #[serde(rename = "signedAt")]
+                signed_at: &'a str,
+                generation: i64,
+                #[serde(rename = "actorDeviceId")]
+                actor_device_id: String,
+                #[serde(rename = "authGeneration")]
+                auth_generation: i64,
+                #[serde(rename = "conversationId")]
+                conversation_id: String,
+            }
+            let cbor = serde_ipld_dagcbor::to_vec(&AckPayload {
+                key_id: key_id,
+                up_to_seq: app_seq,
+                signed_at: &ack_signed_at,
+                generation: 0,
+                actor_device_id: device.to_string(),
+                auth_generation: 1,
+                conversation_id: prune_cid.to_string(),
+            })?;
+            let ack_sig: Ed25519Signature =
+                signer.sign(&[b"CATBIRD-CHAT-ACK-ENTRIES\0".as_slice(), &cbor].concat());
+            let ack_jwt = mint_es256_service_jwt(
+                pds_key,
+                did,
+                &format!("{DS_A_DID}#atproto_mls"),
+                "blue.catbird.chat.acknowledgeEntries",
+            );
+            let response: Value = admin_http
+                .post(&ack_endpoint)
+                .header("authorization", format!("Bearer {ack_jwt}"))
+                .header(CONTENT_TYPE, "application/json")
+                .json(&json!({
+                    "conversationId": prune_cid,
+                    "generation": 0,
+                    "actorDeviceId": device,
+                    "keyId": key_id,
+                    "authGeneration": 1,
+                    "upToSeq": app_seq,
+                    "signedAt": ack_signed_at,
+                    "signature": STANDARD.encode(ack_sig.to_bytes()),
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
 
-        // Now drive Recipient (`p_rcpt_did`) through the real `CatbirdMlsClient` SDK!
+            anyhow::ensure!(
+                response["acknowledgedSeq"].as_i64() == Some(app_seq),
+                "server did not acknowledge the entry: {response}"
+            );
+            response["prunedCount"]
+                .as_i64()
+                .context("acknowledgeEntries prunedCount")
+        };
+        assert_eq!(
+            signed_ack(
+                &p_sender_did,
+                p_sender_dev,
+                &p_sender_kid,
+                &p_sender_ed,
+                &p_sender_p256
+            )
+            .await?,
+            0
+        );
+        // The recipient registers its signed push gateway through the native SDK.
         let rcpt_ks = Arc::new(MemoryKeyStore::new());
         let rcpt_hash = account_did_hash_hex(&p_rcpt_did)?;
         rcpt_ks.store_signature_keypair(
             format!("mls-signer:{rcpt_hash}"),
             p_rcpt_ed.to_bytes().to_vec(),
         )?;
-        let rcpt_transport = Arc::new(ClientTransport::new(vec![
-            ds_a.base_url.clone(),
-            swan_pds.base_url.clone(),
-        ]));
+        let rcpt_transport = Arc::new(swan_pds.client_transport(&ds_a.base_url));
         let rcpt_sdk = CatbirdMlsClient::open(
             CatbirdMlsClientConfig {
                 storage_root: temp_root
@@ -2977,18 +2982,73 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
             .await?
             .error_for_status()?;
 
-        let rcpt_ack_jwt = mint_es256_service_jwt(
-            &p_rcpt_p256,
-            &p_rcpt_did,
-            &format!("{DS_A_DID}#atproto_mls"),
-            "blue.catbird.chat.acknowledgeEntries",
+        assert_eq!(
+            signed_ack(
+                &p_rcpt_did,
+                p_rcpt_dev,
+                &p_rcpt_kid,
+                &p_rcpt_ed,
+                &p_rcpt_p256
+            )
+            .await?,
+            0
         );
-        rcpt_transport.set_chat_bearer_token(rcpt_ack_jwt);
-        let prune_cid_str = prune_cid.to_string();
-        tokio::task::spawn_blocking(move || {
-            rcpt_sdk.acknowledge_entries_up_to(&prune_cid_str, app_seq)
-        })
-        .await??;
+
+        let fresh = ds_a
+            .pool
+            .query_one(
+                "SELECT accepted_payload_bytes IS NOT NULL AND payload_pruned_at IS NULL
+                    AND received_at > clock_timestamp() - INTERVAL '72 hours',
+                    (SELECT COUNT(*) FROM chat.device_entry_acks
+                     WHERE conversation_id = $1 AND acked_through_seq >= $2)
+                 FROM chat.entries WHERE conversation_id = $1 AND seq = $2",
+                &[&prune_cid, &app_seq],
+            )
+            .await?;
+        assert!(
+            fresh.get::<_, bool>(0),
+            "acknowledged ciphertext must remain during the 72-hour floor"
+        );
+
+        assert_eq!(
+            fresh.get::<_, i64>(1),
+            2,
+            "both fixture devices acknowledged the entry"
+        );
+
+        // As in the real-database pruning suite, adjust only the receipt time
+        // of this disposable immutable entry, then send another ordinary ACK.
+        let age = ds_a.pool.transaction().await?;
+        age.batch_execute("SET LOCAL session_replication_role = replica")
+            .await?;
+        let aged = age
+            .query_one(
+                "UPDATE chat.entries SET received_at = clock_timestamp() - INTERVAL '73 hours'
+                 WHERE conversation_id = $1 AND seq = $2
+                 RETURNING (EXTRACT(EPOCH FROM (clock_timestamp() - received_at)) / 3600)::int",
+                &[&prune_cid, &app_seq],
+            )
+            .await?;
+        assert_eq!(aged.get::<_, i32>(0), 73);
+        let mapped = age.execute(
+            "UPDATE chat.message_sends send SET received_at = entry.received_at
+             FROM chat.entries entry WHERE entry.conversation_id = $1 AND entry.seq = $2
+             AND send.conversation_id = entry.conversation_id AND send.message_id = entry.message_id",
+            &[&prune_cid, &app_seq]
+        ).await?;
+        assert_eq!(mapped, 1, "keep receipt and entry timestamps identical");
+        age.commit().await?;
+        assert_eq!(
+            signed_ack(
+                &p_sender_did,
+                p_sender_dev,
+                &p_sender_kid,
+                &p_sender_ed,
+                &p_sender_p256
+            )
+            .await?,
+            1
+        );
     }
 
     let prune_row = ds_a
@@ -3003,7 +3063,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     let pruned_at_set: bool = prune_row.get(1);
     assert!(
         pruned_payload_null && pruned_at_set,
-        "I14/G6: applicationEntry ciphertext MUST be pruned immediately once all active leaf devices ACK"
+        "I14/G6: acknowledged applicationEntry ciphertext MUST be pruned after the 72-hour floor"
     );
 
     let seq_rows = ds_a
@@ -3021,7 +3081,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
     );
 
     // Close & wipe `convo_id` on `ds-b`: prove active conversation refuses premature wipe,
-    // `notifySpaceDeleted` fans out (`410 SpaceDeleted`), and operational rows are wiped!
+    // `notifySpaceUpdate#spaceDeleted` fans out (`410 SpaceDeleted`), and operational rows are wiped!
     let wipe_res: Value = admin_http
         .post(format!(
             "{}/_test/clean-slate/close-and-wipe-conversation",
@@ -3050,7 +3110,7 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
         "G6/I14: chat.wipe_closed_conversation_operational_rows must wipe all operational entries"
     );
 
-    // Verify `swan_pds` and `ref_pds` received the authority's `notifySpaceDeleted` and now return
+    // Verify `swan_pds` and `ref_pds` received the authority's `notifySpaceUpdate#spaceDeleted` and now return
     // `410 SpaceDeleted` to their writers (Bob on `swan_pds`, Eve on `ref_pds`)
     for (pds, token) in [(&swan_pds, "bob-pds-oauth"), (&ref_pds, "eve-pds-oauth")] {
         assert!(
@@ -3149,12 +3209,18 @@ async fn federation_spaces_full_cutover_end_to_end() -> Result<()> {
                 &[],
             )
             .await?;
-        let mut lab_tables: Vec<String> = lab_rows.into_iter().map(|r| r.get(0)).collect();
-        lab_tables.sort();
+        let lab_tables: Vec<String> = lab_rows.into_iter().map(|r| r.get(0)).collect();
         assert_eq!(
             lab_tables,
-            vec!["epoch_head_floors", "epoch_heads", "operations"],
-            "G6: labyrinth schema on {} must contain strictly epoch_heads, epoch_head_floors, operations",
+            [
+                "account_erasure_operations",
+                "epoch_head_floors",
+                "epoch_heads",
+                "operations",
+                "recovery_share_events",
+                "recovery_shares",
+            ],
+            "G6: labyrinth schema on {} must contain only epoch, erasure and encrypted recovery-share tables",
             ds.service_did
         );
 

@@ -3050,7 +3050,7 @@ pub(crate) async fn register_conversation_space_if_migrated(
             .filter(|did| !did.is_empty())
             .unwrap_or_else(|| "did:web:localhost".to_owned())
     };
-    let space_uri = atproto_spaces::SpaceUri::conversation(
+    let space_uri = catbird_server::space_host::conversation_space_ref(
         &authority_did,
         &format!("{conversation_id}-{generation}"),
     )

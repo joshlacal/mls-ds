@@ -71,7 +71,7 @@ pub mod federation;
 pub mod handlers;
 pub mod health;
 pub mod identity;
-pub mod jacquard_json;
+pub mod json_extract;
 pub mod labyrinth;
 pub mod metrics;
 pub mod middleware;
@@ -84,19 +84,14 @@ pub mod space_host;
 pub mod storage;
 pub mod util;
 pub mod workers;
-// Re-export shared generated types and common validated types.
-pub use catbird_atproto::generated;
-pub use catbird_atproto::types;
+// Re-export the Petrel-generated Catbird overlay. `generated` is the raw
+// generator layout; `blue_catbird` is the stable per-namespace path that also
+// flattens each namespace's `defs` (see `blue_catbird.rs`).
+pub use petrel_catbird::generated;
+pub mod blue_catbird;
 
-// Re-export jacquard-generated namespaces at the crate root so external crates
-// can depend on a stable, ergonomic path (e.g., `server::blue_catbird`) rather
-// than importing from the internal `generated` module hierarchy. These re-exports
-// are part of the intended public API surface for jacquard-generated types.
-pub use catbird_atproto::blue_catbird;
-pub use catbird_atproto::builder_types;
-
-// sqlx conversion helpers for jacquard-common types
-pub mod sqlx_jacquard;
+// Conversions between storage types (chrono, String) and Petrel ATProto types.
+pub mod atproto_conv;
 
 /// Default HTTP body limit for ordinary XRPC routes (`4 MiB`).
 pub const DEFAULT_REQUEST_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;

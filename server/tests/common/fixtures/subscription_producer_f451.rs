@@ -5,11 +5,10 @@
 // conversation membership and cannot accidentally broaden a historical event.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use catbird_atproto::generated::blue_catbird::chat::{
+use catbird_server::blue_catbird::chat::{
     EventEnvelope, ProtocolEventPayload, SubscriptionMessage,
 };
 use chrono::{DateTime, Utc};
-use jacquard_common::DefaultStr;
 use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Row, Transaction};
 
@@ -18,10 +17,10 @@ use super::ticket::{
     TicketRepositoryError,
 };
 use crate::{
+    atproto_conv::chrono_to_datetime,
     chat_protocol::cursor::{
         mint_capability_token, CursorSealer, OsSecureRandom, SealedCapability, SealerBinding,
     },
-    sqlx_jacquard::chrono_to_datetime,
 };
 
 const MAX_BATCH: i64 = 256;
@@ -29,7 +28,7 @@ const MAX_BATCH: i64 = 256;
 #[derive(Clone, Debug)]
 pub(crate) struct VisibleEvent {
     pub(crate) event_position: i64,
-    pub(crate) payload: ProtocolEventPayload<DefaultStr>,
+    pub(crate) payload: ProtocolEventPayload,
     pub(crate) created_at: DateTime<Utc>,
 }
 
@@ -173,7 +172,7 @@ pub(crate) async fn materialize_envelope(
     previous_cursor: &str,
     previous_cursor_hash: [u8; 32],
     sealer: &CursorSealer,
-) -> Result<(SubscriptionMessage<DefaultStr>, String, [u8; 32]), TicketRepositoryError> {
+) -> Result<(SubscriptionMessage, String, [u8; 32]), TicketRepositoryError> {
     // Same-session streams must share one committed successor. The caller has
     // already revalidated device/protocol authority; lock the retained parent
     // before looking for a receipt, including when that receipt is absent.
